@@ -53,6 +53,12 @@ import {
 } from "@fusion-plugin-examples/omp-runtime";
 
 import {
+  discoverAntigravityProviderModels,
+  probeAntigravityBinary,
+  type AntigravityBinaryStatus,
+} from "@fusion-plugin-examples/antigravity-runtime";
+
+import {
   agentsMe,
   discoverPaperclipCliConfig,
   listCompanies,
@@ -178,6 +184,26 @@ export async function discoverGrokCliModels(opts?: {
   timeoutMs?: number;
 }): Promise<GrokModelDiscoveryResult> {
   return discoverGrokProviderModels(opts) as Promise<GrokModelDiscoveryResult>;
+}
+
+export interface AntigravityModelDiscoveryResult {
+  models: Array<{ id: string; label?: string; reasoning?: boolean; contextWindow?: number }>;
+  source: string;
+  fallbackUsed: boolean;
+  reason?: string;
+}
+
+export async function discoverAntigravityCliModels(opts?: {
+  binaryPath?: string;
+  timeoutMs?: number;
+}): Promise<AntigravityModelDiscoveryResult> {
+  return discoverAntigravityProviderModels(opts) as Promise<AntigravityModelDiscoveryResult>;
+}
+
+export async function probeAntigravityProvider(opts?: {
+  binaryPath?: string;
+}): Promise<AntigravityBinaryStatus> {
+  return probeAntigravityBinary(opts);
 }
 
 /**

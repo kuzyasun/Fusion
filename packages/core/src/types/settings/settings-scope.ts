@@ -713,6 +713,14 @@ export interface GlobalSettings {
    * `omp`/`.cmd`/`.bat` shim. Blank/undefined means PATH auto-detection.
    */
   ompCliBinaryPath?: string;
+  /** When true, enable Antigravity CLI model-provider support (provider ID: `antigravity-cli`)
+   *  through an operator-local `agy` CLI installation. */
+  useAntigravityCli?: boolean;
+  /** Global machine-local Antigravity CLI executable override when PATH discovery resolves the wrong
+   *  `agy`/`.cmd`/`.bat` shim. Blank/undefined means PATH auto-detection. */
+  antigravityCliBinaryPath?: string;
+  /** Permission mode passed to `agy`: "skip" (--dangerously-skip-permissions), "sandbox" (--sandbox), or "prompt" (none). Default: "skip". */
+  antigravityCliPermissionMode?: "skip" | "sandbox" | "prompt";
   /** Global baseline AI model provider for task execution (executor agent).
    *  This is the global lane that project-level `executionProvider` can override.
    *  Must be set together with `executionGlobalModelId`. Falls back to

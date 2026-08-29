@@ -8,6 +8,7 @@ import { getCursorPickerModels, CURSOR_PICKER_PROVIDER_ID } from "../cursor-mode
 import { getGrokPickerModels, GROK_PICKER_PROVIDER_ID } from "../grok-model-cache.js";
 import { getClaudePickerModels, CLAUDE_PICKER_PROVIDER_ID } from "../claude-model-cache.js";
 import { getOmpPickerModels, OMP_PICKER_PROVIDER_ID } from "../omp-model-cache.js";
+import { getAntigravityPickerModels, ANTIGRAVITY_PICKER_PROVIDER_ID } from "../antigravity-model-cache.js";
 import { getHermesPickerModels, HERMES_PICKER_PROVIDER_ID } from "../hermes-model-cache.js";
 import {
   invalidateModelRegistryRefreshCache,
@@ -284,6 +285,8 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     let grokCliBinaryPath: string | undefined;
     let useOmpCli = false;
     let ompCliBinaryPath: string | undefined;
+    let useAntigravityCli = false;
+    let antigravityCliBinaryPath: string | undefined;
     let resolvedPlanningProvider: string | undefined;
     let resolvedPlanningModelId: string | undefined;
     let customProviders: CustomProvider[] = [];
@@ -331,6 +334,10 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         const rawOmpCliBinaryPath = (globalSettings as Record<string, unknown>).ompCliBinaryPath;
         ompCliBinaryPath =
           typeof rawOmpCliBinaryPath === "string" ? rawOmpCliBinaryPath.trim() || undefined : undefined;
+        useAntigravityCli = (globalSettings as Record<string, unknown>).useAntigravityCli === true;
+        const rawAntigravityCliBinaryPath = (globalSettings as Record<string, unknown>).antigravityCliBinaryPath;
+        antigravityCliBinaryPath =
+          typeof rawAntigravityCliBinaryPath === "string" ? rawAntigravityCliBinaryPath.trim() || undefined : undefined;
         customProviders = globalSettings.customProviders ?? [];
 
         const mergedSettings = await store.getSettingsFast();
@@ -442,6 +449,9 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       }
       if (!useOmpCli) {
         models = models.filter((m) => m.provider !== "omp-cli");
+      }
+      if (!useAntigravityCli) {
+        models = models.filter((m) => m.provider !== "antigravity-cli");
       }
 
       /*
@@ -575,6 +585,25 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         }
       }
 
+      /*
+      FNXC:AntigravityCli 2026-07-18-17:15:
+      Surface agy models under antigravity-cli when useAntigravityCli is on.
+      */
+      if (useAntigravityCli) {
+        try {
+          const antigravityModels = await getAntigravityPickerModels({ binaryPath: antigravityCliBinaryPath });
+          for (const antigravityModel of antigravityModels) {
+            const key = `${antigravityModel.provider}/${antigravityModel.id}`;
+            if (seenModelKeys.has(key)) continue;
+            seenModelKeys.add(key);
+            models.push(antigravityModel);
+          }
+        } catch (antigravityErr: unknown) {
+          const message = antigravityErr instanceof Error ? antigravityErr.message : String(antigravityErr);
+          runtimeLogger.child("models").warn(`Failed to load antigravity-cli models: ${message}`);
+        }
+      }
+
       // Filter to only providers the user has explicitly configured in Fusion.
       // getAvailable() checks supplemental credential stores (Codex CLI,
       // Claude Code, env vars) which surface providers the user may not
@@ -612,6 +641,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       if (useGrokCli) configuredProviders.add(GROK_PICKER_PROVIDER_ID);
       // FNXC:OmpAcp 2026-07-13-22:50: allow-list omp-cli when toggle is on.
       if (useOmpCli) configuredProviders.add(OMP_PICKER_PROVIDER_ID);
+      if (useAntigravityCli) configuredProviders.add(ANTIGRAVITY_PICKER_PROVIDER_ID);
       // FNXC:ModelCatalog 2026-07-07-09:05 (FN-7636): only allow-list "hermes"
       // through the final filter when Hermes rows were actually contributed
       // above, mirroring the useClaudeCli/useDroidCli toggle pattern (Hermes

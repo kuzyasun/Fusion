@@ -8,6 +8,7 @@ import { ClaudeCliProviderCard } from "../../ClaudeCliProviderCard";
 import { CursorCliProviderCard } from "../../CursorCliProviderCard";
 import { GrokCliProviderCard } from "../../GrokCliProviderCard";
 import { OmpCliProviderCard } from "../../OmpCliProviderCard";
+import { AntigravityCliProviderCard } from "../../AntigravityCliProviderCard";
 import { LlamaCppProviderCard } from "../../LlamaCppProviderCard";
 import { ProviderIcon } from "../../ProviderIcon";
 import { PluginSlot } from "../../PluginSlot";
@@ -163,6 +164,9 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
         }
         if (provider.id === "omp-cli") {
             return (<OmpCliProviderCard key={provider.id} compact authenticated={provider.authenticated} onToggled={handleCliProviderToggled}/>);
+        }
+        if (provider.id === "antigravity-cli") {
+            return (<AntigravityCliProviderCard key={provider.id} compact authenticated={provider.authenticated} onToggled={handleCliProviderToggled}/>);
         }
         return (<LlamaCppProviderCard key={provider.id} compact authenticated={provider.authenticated} onToggled={handleCliProviderToggled}/>);
     };

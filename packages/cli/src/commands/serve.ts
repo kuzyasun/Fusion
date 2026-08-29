@@ -82,7 +82,7 @@ import {
 import { resolveSelfExtension } from "./self-extension.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
-import { ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledAntigravityRuntimePluginInstalled, ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 import { phaseTime } from "../startup-phase.js";
 
@@ -675,6 +675,17 @@ export async function runServe(
     }
   } catch (err) {
     console.warn(`[plugins] Failed to auto-install bundled Cursor CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
+  }
+
+  try {
+    const installStatus = await ensureBundledAntigravityRuntimePluginInstalled(pluginStore, pluginLoader);
+    if (installStatus === "installed") {
+      console.log("[plugins] Installed bundled Antigravity CLI runtime plugin");
+    } else if (installStatus === "missing-bundle") {
+      console.warn("[plugins] Bundled Antigravity CLI runtime plugin was not found in this build");
+    }
+  } catch (err) {
+    console.warn(`[plugins] Failed to auto-install bundled Antigravity CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
   }
 
   // Lazy-install hook for bundled runtime plugins (Hermes/OpenClaw/Paperclip/Grok).

@@ -936,6 +936,7 @@ export async function createResolvedAgentSession(
     : { options: effectiveRuntimeOptions, dropped: false as const };
   const crossRuntimeFallbackDeferral = !useMockRuntime && !("deferred" in grokFallbackDeferral)
     && effectiveRuntimeHint !== "cursor"
+    && effectiveRuntimeHint !== "antigravity"
     ? deferCrossRuntimeCliFallback(grokFallbackDeferral.options, pluginRunner)
     : { options: grokFallbackDeferral.options, dropped: false as const };
   const droppedCliFallback = dropUnsupportedCliFallback(crossRuntimeFallbackDeferral.options);

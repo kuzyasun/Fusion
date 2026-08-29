@@ -36,12 +36,14 @@ describe("desktop Electron main bundling", () => {
     expect(DASHBOARD_RUNTIME_PLUGIN_PACKAGES).toContain("plugins/fusion-plugin-omp-runtime");
     expect(DASHBOARD_RUNTIME_PLUGIN_PACKAGES).toContain("plugins/fusion-plugin-hermes-runtime");
     expect(DASHBOARD_RUNTIME_PLUGIN_PACKAGES).toContain("plugins/fusion-plugin-grok-runtime");
+    expect(DASHBOARD_RUNTIME_PLUGIN_PACKAGES).toContain("plugins/fusion-plugin-antigravity-runtime");
     expect(DASHBOARD_RUNTIME_PLUGIN_PACKAGES).toContain("plugins/fusion-plugin-cursor-runtime");
 
     const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
     expect(workspaceTools).toContain("buildDashboardRuntimePlugins");
     expect(workspaceTools).toContain("DASHBOARD_RUNTIME_PLUGIN_PACKAGES");
     expect(workspaceTools).toContain("fusion-plugin-omp-runtime");
+    expect(workspaceTools).toContain("fusion-plugin-antigravity-runtime");
   });
 
   it("externalizes production main-process packages so updater CJS deps are not bundled into ESM", async () => {

@@ -28,6 +28,7 @@ const DEPENDENCY_GRAPH_PLUGIN_ID = "fusion-plugin-dependency-graph";
 const CURSOR_RUNTIME_PLUGIN_ID = "fusion-plugin-cursor-runtime";
 const GROK_RUNTIME_PLUGIN_ID = "fusion-plugin-grok-runtime";
 export const CLAUDE_RUNTIME_PLUGIN_ID = "fusion-plugin-claude-runtime";
+export const ANTIGRAVITY_RUNTIME_PLUGIN_ID = "fusion-plugin-antigravity-runtime";
 
 export const BUNDLED_PLUGIN_IDS = [
   "fusion-plugin-dependency-graph",
@@ -43,6 +44,7 @@ export const BUNDLED_PLUGIN_IDS = [
   "fusion-plugin-claude-runtime",
   // FNXC:OmpAcp 2026-07-11-23:35: Oh My Pi ACP runtime available as a staged/bundled install target.
   "fusion-plugin-omp-runtime",
+  "fusion-plugin-antigravity-runtime",
   "fusion-plugin-cli-printing-press",
   "fusion-plugin-compound-engineering",
   "fusion-plugin-linear-import",
@@ -202,4 +204,12 @@ export async function ensureBundledGrokRuntimePluginInstalled(
   getCandidatePluginDirs: BundledPluginDirResolver,
 ): Promise<EnsureBundledResult> {
   return ensureBundledPluginInstalled(pluginStore, pluginLoader, GROK_RUNTIME_PLUGIN_ID, getCandidatePluginDirs);
+}
+
+export async function ensureBundledAntigravityRuntimePluginInstalled(
+  pluginStore: PluginStore,
+  pluginLoader: PluginLoader,
+  getCandidatePluginDirs: BundledPluginDirResolver,
+): Promise<EnsureBundledResult> {
+  return ensureBundledPluginInstalled(pluginStore, pluginLoader, ANTIGRAVITY_RUNTIME_PLUGIN_ID, getCandidatePluginDirs);
 }

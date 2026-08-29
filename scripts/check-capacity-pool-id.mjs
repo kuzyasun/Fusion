@@ -15,7 +15,7 @@ import { findViolations, RESOLVER } from "./lib/capacity-pool-id-check.mjs";
 
 let files;
 try {
-  files = execSync("git ls-files 'packages/*/src/**/*.ts' 'packages/*/src/*.ts'", {
+  files = execSync('git ls-files "packages/*/src/**/*.ts" "packages/*/src/*.ts"', {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   })

@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { GIT_INSTALL_URL, isGhAvailable, isGhAuthenticated, probeGitCliStatus } from "@fusion/core";
 import { probeClaudeCli } from "../claude-cli-probe.js";
 import { probeDroidCli } from "../droid-cli-probe.js";
-import { probeCursorCliProvider, probeGrokCliProvider, probeOmpCliProvider } from "../runtime-provider-probes.js";
+import { probeCursorCliProvider, probeGrokCliProvider, probeOmpCliProvider, probeAntigravityProvider } from "../runtime-provider-probes.js";
 import { probeLlamaCpp } from "../llama-cpp-probe.js";
 import { ApiError, badRequest, conflict } from "../api-error.js";
 import { clearUsageCache } from "../usage.js";
@@ -58,6 +58,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
     "cursor-cli",
     "grok-cli",
     "omp-cli",
+    "antigravity-cli",
     "llama-cpp",
   ]);
 
@@ -122,6 +123,24 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
 
   async function probeOmpCliWithStoredBinary() {
     return probeOmpCliProvider({ binaryPath: await readOmpCliBinaryPath() });
+  }
+
+  /*
+  FNXC:AntigravityCli 2026-07-18-17:25:
+  Antigravity CLI binary path helpers.
+  */
+  function normalizeAntigravityCliBinaryPath(value: unknown): string | undefined {
+    return typeof value === "string" ? value.trim() || undefined : undefined;
+  }
+
+  async function readAntigravityCliBinaryPath(): Promise<string | undefined> {
+    if (!store) return undefined;
+    const globalSettings = await store.getGlobalSettingsStore().getSettings();
+    return normalizeAntigravityCliBinaryPath((globalSettings as Record<string, unknown>).antigravityCliBinaryPath);
+  }
+
+  async function probeAntigravityCliWithStoredBinary() {
+    return probeAntigravityProvider({ binaryPath: await readAntigravityCliBinaryPath() });
   }
 
   /**
@@ -883,6 +902,27 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         });
       }
 
+      /*
+      FNXC:AntigravityCli 2026-07-18-17:30:
+      Inject synthetic "Google — via Antigravity CLI" provider.
+      */
+      if (store) {
+        let antigravityEnabled = false;
+        try {
+          const globalSettings = await store.getGlobalSettingsStore().getSettings();
+          antigravityEnabled = (globalSettings as Record<string, unknown>).useAntigravityCli === true;
+        } catch {
+          // best effort
+        }
+        const antigravityBinary = await probeAntigravityCliWithStoredBinary();
+        providers.push({
+          id: "antigravity-cli",
+          name: "Google — via Antigravity CLI",
+          authenticated: antigravityEnabled && antigravityBinary.available,
+          type: "cli" as const,
+        });
+      }
+
       // Inject synthetic llama.cpp provider.
       if (store) {
         let llamaEnabled = false;
@@ -1483,6 +1523,101 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         }
       }
       res.json({ binary, enabled, binaryPath, extension: null, ready: enabled && binary.available });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      rethrowAsApiError(err);
+    }
+  });
+
+  /*
+  FNXC:AntigravityCli 2026-07-18-17:35:
+  POST /auth/antigravity-cli enable/disable + binaryPath + permissionMode contract.
+  */
+  router.post("/auth/antigravity-cli", async (req, res) => {
+    try {
+      if (!store) {
+        throw new ApiError(500, "Settings store unavailable");
+      }
+      const requestedEnabled = req.body?.enabled;
+      const hasEnabledPatch = Object.prototype.hasOwnProperty.call(req.body ?? {}, "enabled");
+      const requestedBinaryPath = req.body?.binaryPath;
+      const hasBinaryPathPatch = Object.prototype.hasOwnProperty.call(req.body ?? {}, "binaryPath");
+      const requestedPermissionMode = req.body?.permissionMode;
+      const hasPermissionModePatch = Object.prototype.hasOwnProperty.call(req.body ?? {}, "permissionMode");
+      if (!hasEnabledPatch && !hasBinaryPathPatch && !hasPermissionModePatch) {
+        throw badRequest("enabled, binaryPath, or permissionMode is required");
+      }
+      if (hasEnabledPatch && typeof requestedEnabled !== "boolean") {
+        throw badRequest("enabled must be a boolean");
+      }
+      if (hasBinaryPathPatch && requestedBinaryPath !== null && typeof requestedBinaryPath !== "string") {
+        throw badRequest("binaryPath must be a string or null");
+      }
+      if (hasPermissionModePatch && requestedPermissionMode !== null && !["skip", "sandbox", "prompt"].includes(requestedPermissionMode)) {
+        throw badRequest("permissionMode must be 'skip', 'sandbox', 'prompt', or null");
+      }
+
+      const currentSettings = await store.getGlobalSettingsStore().getSettings();
+      const enabled = hasEnabledPatch ? requestedEnabled : (currentSettings as Record<string, unknown>).useAntigravityCli === true;
+      const currentBinaryPath = normalizeAntigravityCliBinaryPath((currentSettings as Record<string, unknown>).antigravityCliBinaryPath);
+      const nextBinaryPath = hasBinaryPathPatch
+        ? normalizeAntigravityCliBinaryPath(requestedBinaryPath)
+        : currentBinaryPath;
+
+      if (hasBinaryPathPatch && nextBinaryPath) {
+        const binary = await probeAntigravityProvider({ binaryPath: nextBinaryPath });
+        if (!binary.available || !binary.usingConfiguredBinaryPath) {
+          throw new ApiError(400, `Cannot save Antigravity CLI binary path: ${binary.reason ?? "configured binary not available"}`);
+        }
+      }
+
+      if (enabled) {
+        const binary = await probeAntigravityProvider({ binaryPath: nextBinaryPath });
+        if (!binary.available) {
+          throw new ApiError(400, `Cannot enable Antigravity CLI routing: ${binary.reason ?? "agy binary not available"}`);
+        }
+      }
+
+      const patch: Record<string, unknown> = {};
+      if (hasEnabledPatch) {
+        patch.useAntigravityCli = enabled;
+      }
+      if (hasBinaryPathPatch) {
+        patch.antigravityCliBinaryPath = nextBinaryPath ?? null;
+      }
+      if (hasPermissionModePatch) {
+        patch.antigravityCliPermissionMode = requestedPermissionMode ?? null;
+      }
+      const settings = await store.updateGlobalSettings(patch);
+      invalidateAllGlobalSettingsCaches();
+      res.json({
+        enabled: (settings as Record<string, unknown>).useAntigravityCli === true,
+        binaryPath: normalizeAntigravityCliBinaryPath((settings as Record<string, unknown>).antigravityCliBinaryPath),
+        permissionMode: (settings as Record<string, unknown>).antigravityCliPermissionMode,
+        restartRequired: false,
+      });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.get("/providers/antigravity-cli/status", async (_req, res) => {
+    try {
+      const binaryPath = await readAntigravityCliBinaryPath();
+      const binary = await probeAntigravityProvider({ binaryPath });
+      let enabled = false;
+      let permissionMode: string | undefined;
+      if (store) {
+        try {
+          const globalSettings = await store.getGlobalSettingsStore().getSettings();
+          enabled = (globalSettings as Record<string, unknown>).useAntigravityCli === true;
+          permissionMode = (globalSettings as Record<string, unknown>).antigravityCliPermissionMode as string | undefined;
+        } catch {
+          // best effort
+        }
+      }
+      res.json({ binary, enabled, binaryPath, permissionMode, extension: null, ready: enabled && binary.available });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
       rethrowAsApiError(err);

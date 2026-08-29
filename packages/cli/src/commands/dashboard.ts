@@ -156,7 +156,7 @@ import {
 } from "./llama-cpp-extension.js";
 import { getCachedUpdateStatus, isUpdateCheckEnabled } from "../update-cache.js";
 import { resolveSelfExtension } from "./self-extension.js";
-import { ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledAntigravityRuntimePluginInstalled, ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { DashboardTUI, DashboardLogSink, isTTYAvailable, type SystemInfo, type GitStatus, type GitCommit, type GitCommitDetail, type GitBranch, type GitWorktree, type FileEntry, type FileReadResult, type TaskStep as TUITaskStep, type TaskLogEntry as TUITaskLogEntry, type TaskDetailData, type TaskEvent } from "./dashboard-tui/index.js";
@@ -1615,6 +1615,20 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     } catch (err) {
       logSink.log(
         `Failed to auto-install bundled Cursor CLI runtime plugin: ${err instanceof Error ? err.message : err}`,
+        "plugins",
+      );
+    }
+
+    try {
+      const installStatus = await ensureBundledAntigravityRuntimePluginInstalled(pluginStore, pluginLoader);
+      if (installStatus === "installed") {
+        logSink.log("Installed bundled Antigravity CLI runtime plugin", "plugins");
+      } else if (installStatus === "missing-bundle") {
+        logSink.log("Bundled Antigravity CLI runtime plugin was not found in this build", "plugins");
+      }
+    } catch (err) {
+      logSink.log(
+        `Failed to auto-install bundled Antigravity CLI runtime plugin: ${err instanceof Error ? err.message : err}`,
         "plugins",
       );
     }

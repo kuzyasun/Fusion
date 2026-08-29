@@ -120,6 +120,7 @@ const cpuCount = (() => {
 })();
 export const STATIC_CHECK_PARALLEL_LIMIT = Math.max(2, Math.min(8, cpuCount - 1));
 export const TYPECHECK_PARALLEL_LIMIT = Math.max(1, Math.min(4, Math.floor(cpuCount / 2)));
+export const PNPM_BIN = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 
 /**
  * Build the scoped typecheck step for a package. Prefers the package's own
@@ -138,7 +139,7 @@ export function buildTypecheckStep(pkg, meta = {}) {
      script writing only its own tsbuildinfo), so sibling packages cannot collide.
      They are the dominant cost of a multi-package run — grouping them lets the wall
      clock be the slowest package rather than their sum. */
-  return { id: `typecheck:${pkg}`, kind: "typecheck", pkg, label: `typecheck ${pkg}`, command: "pnpm", args, klass: "changed", parallelGroup: "typecheck", parallelLimit: TYPECHECK_PARALLEL_LIMIT };
+  return { id: `typecheck:${pkg}`, kind: "typecheck", pkg, label: `typecheck ${pkg}`, command: PNPM_BIN, args, klass: "changed", parallelGroup: "typecheck", parallelLimit: TYPECHECK_PARALLEL_LIMIT };
 }
 
 /**
@@ -148,7 +149,7 @@ export function buildTypecheckStep(pkg, meta = {}) {
  * @returns {{ id: string, kind: string, pkg: string, label: string, command: string, args: string[], klass: string }}
  */
 export function buildBuildStep(pkg) {
-  return { id: `build:${pkg}`, kind: "build", pkg, label: `build ${pkg}`, command: "pnpm", args: ["--filter", pkg, "build"], klass: "changed" };
+  return { id: `build:${pkg}`, kind: "build", pkg, label: `build ${pkg}`, command: PNPM_BIN, args: ["--filter", pkg, "build"], klass: "changed" };
 }
 
 /**

@@ -191,6 +191,25 @@ export interface OmpCliStatus {
   ready: boolean;
 }
 
+export interface AntigravityCliStatus {
+  binary: {
+    available: boolean;
+    authenticated?: boolean;
+    version?: string;
+    binaryPath?: string;
+    configuredBinaryPath?: string;
+    usingConfiguredBinaryPath?: boolean;
+    diagnostics?: string[];
+    reason?: string;
+    probeDurationMs: number;
+  };
+  enabled: boolean;
+  binaryPath?: string;
+  permissionMode?: "skip" | "sandbox" | "prompt";
+  extension: null;
+  ready: boolean;
+}
+
 export interface LlamaCppStatus {
   enabled: boolean;
   extension: {
@@ -269,6 +288,10 @@ export function fetchGrokCliStatus(): Promise<GrokCliStatus> {
 
 export function fetchOmpCliStatus(): Promise<OmpCliStatus> {
   return api<OmpCliStatus>("/providers/omp-cli/status");
+}
+
+export function fetchAntigravityCliStatus(): Promise<AntigravityCliStatus> {
+  return api<AntigravityCliStatus>("/providers/antigravity-cli/status");
 }
 
 /** Probe llama.cpp server + setting + extension state. */
@@ -590,6 +613,37 @@ export function setOmpCliBinaryPath(
   return api<{ enabled: boolean; binaryPath?: string; restartRequired: boolean }>("/auth/omp-cli", {
     method: "POST",
     body: JSON.stringify({ binaryPath }),
+  });
+}
+
+/*
+FNXC:AntigravityCli 2026-07-18-17:40:
+Client helpers for Antigravity CLI enable, binary path, and permission mode.
+*/
+export function setAntigravityCliEnabled(
+  enabled: boolean,
+): Promise<{ enabled: boolean; binaryPath?: string; permissionMode?: "skip" | "sandbox" | "prompt"; restartRequired: boolean }> {
+  return api<{ enabled: boolean; binaryPath?: string; permissionMode?: "skip" | "sandbox" | "prompt"; restartRequired: boolean }>("/auth/antigravity-cli", {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function setAntigravityCliBinaryPath(
+  binaryPath: string | null,
+): Promise<{ enabled: boolean; binaryPath?: string; permissionMode?: "skip" | "sandbox" | "prompt"; restartRequired: boolean }> {
+  return api<{ enabled: boolean; binaryPath?: string; permissionMode?: "skip" | "sandbox" | "prompt"; restartRequired: boolean }>("/auth/antigravity-cli", {
+    method: "POST",
+    body: JSON.stringify({ binaryPath }),
+  });
+}
+
+export function setAntigravityCliPermissionMode(
+  permissionMode: "skip" | "sandbox" | "prompt",
+): Promise<{ enabled: boolean; binaryPath?: string; permissionMode?: "skip" | "sandbox" | "prompt"; restartRequired: boolean }> {
+  return api<{ enabled: boolean; binaryPath?: string; permissionMode?: "skip" | "sandbox" | "prompt"; restartRequired: boolean }>("/auth/antigravity-cli", {
+    method: "POST",
+    body: JSON.stringify({ permissionMode }),
   });
 }
 

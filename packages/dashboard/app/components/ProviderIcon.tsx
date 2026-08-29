@@ -867,6 +867,7 @@ const providerConfig: Record<
 
   google: { component: GeminiIcon, color: "var(--provider-gemini)" },
   gemini: { component: GeminiIcon, color: "var(--provider-gemini)" }, // Gemini alias family
+  "antigravity-cli": { component: GeminiIcon, color: "var(--provider-gemini)", label: "Google — via Antigravity CLI" },
   // Deprecated upstream in pi-coding-agent 0.71+, retained for legacy usage/auth history rendering.
   "google-antigravity": { component: GeminiIcon, color: "var(--provider-gemini)", label: "Google Gemini" },
   antigravity: { component: GeminiIcon, color: "var(--provider-gemini)", label: "Google Gemini" },

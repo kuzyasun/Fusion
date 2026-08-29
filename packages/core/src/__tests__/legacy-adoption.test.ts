@@ -40,7 +40,7 @@ function listSourceFiles(root: string): string[] {
   for (const entry of readdirSync(root, { withFileTypes: true, recursive: true })) {
     if (!entry.isFile()) continue;
     const parent = entry.parentPath ?? root;
-    if (/(^|\/)(__tests__|dist|node_modules)(\/|$)/.test(parent)) continue;
+    if (/(^|[/\\])(__tests__|dist|node_modules)([/\\]|$)/.test(parent)) continue;
     if (!entry.name.endsWith(".ts") || entry.name.endsWith(".d.ts") || /\.test\.ts$/.test(entry.name)) continue;
     out.push(join(parent, entry.name));
   }

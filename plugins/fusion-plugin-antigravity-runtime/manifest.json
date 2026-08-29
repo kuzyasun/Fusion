@@ -1,0 +1,14 @@
+{
+  "id": "fusion-plugin-antigravity-runtime",
+  "name": "Antigravity Runtime Plugin",
+  "version": "0.1.0",
+  "description": "Antigravity AI runtime plugin for Fusion - drives the local `agy` CLI (Antigravity subscription) as an execution runtime",
+  "author": "Fusion Team",
+  "homepage": "https://antigravity.google",
+  "runtime": {
+    "runtimeId": "antigravity",
+    "name": "Antigravity Runtime",
+    "description": "Antigravity CLI runtime driving the local `agy` binary in headless print mode over a PTY",
+    "version": "0.1.0"
+  }
+}

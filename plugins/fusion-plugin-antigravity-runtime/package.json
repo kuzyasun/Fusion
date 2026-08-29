@@ -1,0 +1,46 @@
+{
+  "name": "@fusion-plugin-examples/antigravity-runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Antigravity CLI runtime plugin for Fusion - drives the local `agy` CLI as a subprocess",
+  "keywords": [
+    "fusion-plugin",
+    "antigravity",
+    "runtime",
+    "ai",
+    "cli"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "source": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./probe": {
+      "types": "./src/probe.ts",
+      "source": "./src/probe.ts",
+      "import": "./dist/probe.js"
+    },
+    "./probes-entry": {
+      "types": "./src/probes-entry.ts",
+      "source": "./src/probes-entry.ts",
+      "import": "./dist/probes-entry.js"
+    }
+  },
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "pretest": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --silent=passed-only --reporter=dot"
+  },
+  "dependencies": {
+    "@fusion/plugin-sdk": "workspace:*",
+    "node-pty": "npm:@homebridge/node-pty-prebuilt-multiarch@^0.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.0"
+  }
+}

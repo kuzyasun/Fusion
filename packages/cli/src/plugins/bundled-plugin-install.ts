@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import {
   ensureBundledCursorRuntimePluginInstalled as coreEnsureBundledCursorRuntimePluginInstalled,
   ensureBundledGrokRuntimePluginInstalled as coreEnsureBundledGrokRuntimePluginInstalled,
+  ensureBundledAntigravityRuntimePluginInstalled as coreEnsureBundledAntigravityRuntimePluginInstalled,
   ensureBundledDependencyGraphPluginInstalled as coreEnsureBundledDependencyGraphPluginInstalled,
   ensureBundledPluginInstalled as coreEnsureBundledPluginInstalled,
   type EnsureBundledResult,
@@ -96,4 +97,11 @@ export async function ensureBundledGrokRuntimePluginInstalled(
   pluginLoader: PluginLoader,
 ): Promise<EnsureBundledResult> {
   return coreEnsureBundledGrokRuntimePluginInstalled(pluginStore, pluginLoader, getCandidatePluginDirs);
+}
+
+export async function ensureBundledAntigravityRuntimePluginInstalled(
+  pluginStore: PluginStore,
+  pluginLoader: PluginLoader,
+): Promise<EnsureBundledResult> {
+  return coreEnsureBundledAntigravityRuntimePluginInstalled(pluginStore, pluginLoader, getCandidatePluginDirs);
 }

@@ -305,6 +305,13 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   */
   useOmpCli: undefined,
   ompCliBinaryPath: undefined,
+  /*
+  FNXC:AntigravityCli 2026-07-18-18:10:
+  Antigravity CLI enable + binary override + permission mode are global operator settings (machine-local).
+  */
+  useAntigravityCli: undefined,
+  antigravityCliBinaryPath: undefined,
+  antigravityCliPermissionMode: undefined,
   // Global baseline lanes for per-role model selection
   executionGlobalProvider: undefined,
   executionGlobalCredentialInstanceId: undefined,

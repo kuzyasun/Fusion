@@ -1,0 +1,73 @@
+.antigravity-cli-provider-card .auth-provider-cli-actions,
+.antigravity-cli-provider-card .onboarding-provider-card__actions {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+}
+
+/*
+FNXC:AntigravityCli 2026-07-18-17:05:
+Compact card body inset to match `.auth-provider-header` padding (mirrors Grok/Cursor cards).
+*/
+.antigravity-cli-provider-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: 0 var(--space-md) var(--space-sm);
+}
+
+.antigravity-cli-provider-card__key-hint {
+  opacity: 0.75;
+}
+
+.antigravity-cli-binary-path-control {
+  display: grid;
+  gap: var(--space-xs);
+  margin-top: var(--space-sm);
+}
+
+.antigravity-cli-binary-path-label {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.antigravity-cli-binary-path-row {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+}
+
+.antigravity-cli-binary-path-input,
+.antigravity-cli-permission-mode-select {
+  min-width: 0;
+  flex: 1 1 18rem;
+  height: 2rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+  padding: 0 var(--space-sm);
+}
+
+.antigravity-cli-permission-mode-select {
+  width: 100%;
+  flex: none;
+}
+
+@media (max-width: 768px) {
+  .antigravity-cli-provider-card .auth-provider-cli-actions,
+  .antigravity-cli-provider-card .onboarding-provider-card__actions,
+  .antigravity-cli-binary-path-row {
+    flex-wrap: wrap;
+  }
+
+  .antigravity-cli-binary-path-row .btn,
+  .antigravity-cli-binary-path-input {
+    width: 100%;
+  }
+
+  .antigravity-cli-provider-card__body {
+    padding: 0 var(--space-sm) var(--space-sm);
+  }
+}

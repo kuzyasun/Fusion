@@ -1699,11 +1699,13 @@ export type { PluginStoreEvents, PluginRegistrationInput, PluginUpdateInput } fr
 export { PluginLoader, resolvePluginEntryPath } from "./plugins/plugin-loader.js";
 export {
   BUNDLED_PLUGIN_IDS,
+  ANTIGRAVITY_RUNTIME_PLUGIN_ID,
   isBundledPluginId,
   ensureBundledPluginInstalled,
   ensureBundledDependencyGraphPluginInstalled,
   ensureBundledCursorRuntimePluginInstalled,
   ensureBundledGrokRuntimePluginInstalled,
+  ensureBundledAntigravityRuntimePluginInstalled,
 } from "./plugins/bundled-plugin-install.js";
 export type { BundledPluginId, EnsureBundledResult, BundledPluginDirResolver } from "./plugins/bundled-plugin-install.js";
 export { scanPluginSecurity } from "./plugins/plugin-security-scan.js";

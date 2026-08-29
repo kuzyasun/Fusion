@@ -1066,7 +1066,7 @@ describe("GET /auth/status", () => {
     expect(res.status).toBe(200);
     // Filter out synthetic CLI providers — they have dedicated route tests.
     // Structural assertions here are about OAuth + API-key paths only.
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "grok-cli" && p.id !== "omp-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "grok-cli" && p.id !== "omp-cli" && p.id !== "antigravity-cli" && p.id !== "llama-cpp");
     /*
     FN-7625: the static catalog (anthropic-subscription/github-copilot/openai-codex
     OAuth + the full API-key catalog) is always present, unioned with whatever the
@@ -1185,7 +1185,7 @@ describe("GET /auth/status", () => {
     const res = await GET(app, "/api/auth/status");
 
     expect(res.status).toBe(200);
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "grok-cli" && p.id !== "omp-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "grok-cli" && p.id !== "omp-cli" && p.id !== "antigravity-cli" && p.id !== "llama-cpp");
     /*
     FN-7625: catalog ids remain present even though storage only reported a
     narrow subset, and a storage-reported id NOT in the catalog ("acme-extension")
@@ -1680,7 +1680,7 @@ describe("GET /auth/status", () => {
 
     function nonCliProviderIds(res: any): string[] {
       return res.body.providers
-        .filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "grok-cli" && p.id !== "omp-cli" && p.id !== "llama-cpp")
+        .filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "grok-cli" && p.id !== "omp-cli" && p.id !== "antigravity-cli" && p.id !== "llama-cpp")
         .map((p: any) => p.id);
     }
 
@@ -2692,6 +2692,105 @@ describe("Droid CLI auth routes", () => {
 
     expect(res.status).toBe(200);
     expect(onUseDroidCliToggled).toHaveBeenCalledWith(false, true);
+  });
+
+  /*
+  FNXC:AntigravityCli 2026-07-18-18:20:
+  Auth route coverage mirroring Grok CLI: enable requires `agy`, binaryPath save validates
+  configured path, permissionMode patches skip/sandbox/prompt, status returns ready + permissionMode.
+  */
+  it("POST /auth/antigravity-cli enables when agy binary is available", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeAntigravityProvider").mockResolvedValue({
+      available: true,
+      authenticated: true,
+      version: "1.1.4",
+      probeDurationMs: 8,
+    });
+    store.updateGlobalSettings = vi.fn().mockResolvedValue({ useAntigravityCli: true, antigravityCliPermissionMode: "skip" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/antigravity-cli", JSON.stringify({ enabled: true }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ enabled: true, permissionMode: "skip", restartRequired: false });
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ useAntigravityCli: true });
+  });
+
+  it("POST /auth/antigravity-cli saves permissionMode without toggling", async () => {
+    store.getGlobalSettingsStore = vi.fn().mockReturnValue({
+      ...createMockGlobalSettingsStore(),
+      getSettings: vi.fn().mockResolvedValue({ useAntigravityCli: true }),
+    });
+    store.updateGlobalSettings = vi.fn().mockResolvedValue({
+      useAntigravityCli: true,
+      antigravityCliPermissionMode: "sandbox",
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/auth/antigravity-cli",
+      JSON.stringify({ permissionMode: "sandbox" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ enabled: true, permissionMode: "sandbox", restartRequired: false });
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ antigravityCliPermissionMode: "sandbox" });
+  });
+
+  it("POST /auth/antigravity-cli rejects invalid permissionMode values", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/auth/antigravity-cli",
+      JSON.stringify({ permissionMode: "yolo" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("permissionMode must be 'skip', 'sandbox', 'prompt', or null");
+  });
+
+  it("POST /auth/antigravity-cli returns 400 when enabling without binary", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeAntigravityProvider").mockResolvedValue({
+      available: false,
+      reason: "`agy` not found on PATH",
+      probeDurationMs: 8,
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/antigravity-cli", JSON.stringify({ enabled: true }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Cannot enable Antigravity CLI routing");
+  });
+
+  it("GET /providers/antigravity-cli/status returns readiness and permissionMode", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeAntigravityProvider").mockResolvedValue({
+      available: true,
+      authenticated: true,
+      version: "1.1.4",
+      probeDurationMs: 8,
+    });
+    store.getGlobalSettingsStore = vi.fn().mockReturnValue({
+      ...createMockGlobalSettingsStore(),
+      getSettings: vi.fn().mockResolvedValue({
+        useAntigravityCli: true,
+        antigravityCliBinaryPath: "/opt/agy",
+        antigravityCliPermissionMode: "sandbox",
+      }),
+    });
+
+    const res = await GET(buildApp(), "/api/providers/antigravity-cli/status");
+    expect(res.status).toBe(200);
+    expect(runtimeProviderProbesModule.probeAntigravityProvider).toHaveBeenCalledWith({ binaryPath: "/opt/agy" });
+    expect(res.body.ready).toBe(true);
+    expect(res.body.enabled).toBe(true);
+    expect(res.body.binaryPath).toBe("/opt/agy");
+    expect(res.body.permissionMode).toBe("sandbox");
   });
 });
 

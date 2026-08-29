@@ -75,3 +75,4 @@ packages:
   - "plugins/fusion-plugin-compound-engineering"
   - "plugins/fusion-plugin-quality"
   - "plugins/fusion-plugin-linear-import"
+  - "plugins/fusion-plugin-antigravity-runtime"

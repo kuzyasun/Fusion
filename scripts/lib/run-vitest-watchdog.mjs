@@ -214,8 +214,10 @@ export function runWithWatchdog({
 
     // process-supervisor-allowlist: foreground wrapper signals the whole vitest
     // process group on death/timeout; not a background daemon.
+    const isWindows = process.platform === "win32";
     const child = spawn(command, args, {
-      detached: true,
+      detached: !isWindows,
+      shell: isWindows,
       stdio: "inherit",
       env,
       ...(cwd ? { cwd } : {}),
