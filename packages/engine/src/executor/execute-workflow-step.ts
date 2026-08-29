@@ -769,15 +769,6 @@ CRITICAL SCOPING RULES — read before doing anything else:
         settings,
         taskEnv: stepEnv,
         mcpServers: await deps.resolveMcpServers(undefined),
-        onText: (delta: string) => {
-          if (streamOutputFromOnText) {
-            output += delta;
-          }
-          agentLogger.onText(delta);
-        },
-        onThinking: agentLogger.onThinking,
-        onToolStart: agentLogger.onToolStart,
-        onToolEnd: agentLogger.onToolEnd,
         // FNXC:SessionRouting 2026-06-24-11:20:
         // #1675: propagate task id so workflow-step requests carry the same
         // X-Session-Id/X-Session-Affinity as the primary session.
@@ -835,40 +826,51 @@ CRITICAL SCOPING RULES — read before doing anything else:
       }
 
       let output = "";
-      let streamOutputFromOnText = false;
       const deltaNormalizer = createStreamingDeltaNormalizer();
       let detectedQuestion: string | null = null;
       let resolveQuestion: ((value: "await-input") => void) | undefined;
       const questionPromise = new Promise<"await-input">((resolve) => {
         resolveQuestion = resolve;
       });
-      if (typeof session.subscribe === "function") {
-        session.subscribe((event) => {
-          if (event.type === "message_update") {
-            const msgEvent = event.assistantMessageEvent;
-            if (msgEvent.type === "text_delta") {
-              // Repair dropped sentence-boundary spaces at the shared engine delta chokepoint,
-              // including tool-call cross-message boundaries (see streaming-delta.ts).
-              const delta = deltaNormalizer.normalize(msgEvent.partial, msgEvent.contentIndex, msgEvent.delta, "text");
-              output += delta;
+      /*
+      FNXC:AntigravityCli 2026-07-19-03:25:
+      All non-Pi runtimes (including Antigravity CLI) receive a synthetic .subscribe()
+      via createPluginSessionSubscribeCompatibility in agent-session-helpers.ts, so this
+      subscriber path is the universal output/logging channel for every runtime.
+      */
+      session.subscribe((event) => {
+        if (event.type === "message_update") {
+          const msgEvent = event.assistantMessageEvent;
+          if (msgEvent.type === "text_delta") {
+            // Repair dropped sentence-boundary spaces at the shared engine delta chokepoint,
+            // including tool-call cross-message boundaries (see streaming-delta.ts).
+            const delta = deltaNormalizer.normalize(msgEvent.partial, msgEvent.contentIndex, msgEvent.delta, "text");
+            output += delta;
+            agentLogger.onText(delta);
+          } else if (msgEvent.type === "thinking_delta") {
+            // Repair dropped sentence-boundary spaces at the shared engine delta chokepoint,
+            // including tool-call cross-message boundaries (see streaming-delta.ts).
+            const delta = deltaNormalizer.normalize(msgEvent.partial, msgEvent.contentIndex, msgEvent.delta, "thinking");
+            agentLogger.onThinking(delta);
+          }
+        }
+        if (event.type === "tool_execution_start") {
+          agentLogger.onToolStart(event.toolName, event.args as Record<string, unknown> | undefined);
+          if (!unattended && detectedQuestion === null) {
+            const question = parseAwaitInputQuestionToolCall(
+              event.toolName,
+              event.args as Record<string, unknown> | undefined,
+            );
+            if (question) {
+              detectedQuestion = question;
+              resolveQuestion?.("await-input");
             }
           }
-          if (event.type === "tool_execution_start") {
-            if (!unattended && detectedQuestion === null) {
-              const question = parseAwaitInputQuestionToolCall(
-                event.toolName,
-                event.args as Record<string, unknown> | undefined,
-              );
-              if (question) {
-                detectedQuestion = question;
-                resolveQuestion?.("await-input");
-              }
-            }
-          }
-        });
-      } else {
-        streamOutputFromOnText = true;
-      }
+        }
+        if (event.type === "tool_execution_end") {
+          agentLogger.onToolEnd(event.toolName, event.isError, event.result);
+        }
+      });
 
       let timedOut = false;
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;

@@ -492,7 +492,7 @@ describe("invokeAgyPrint", () => {
       expect(result.body).toBe("windows cmd output");
       expect(spawnPty).toHaveBeenCalledWith(
         process.env.ComSpec || "cmd.exe",
-        ["/c", "C:\\tools\\agy.cmd", "--dangerously-skip-permissions", "-p", "hello"],
+        ["/d", "/c", "C:\\tools\\agy.cmd", "--dangerously-skip-permissions", "-p", "hello"],
         expect.any(Object),
       );
     } finally {

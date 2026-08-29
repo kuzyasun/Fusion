@@ -26,9 +26,9 @@ Compact card body inset to match `.auth-provider-header` padding (mirrors Grok/C
   margin-top: var(--space-sm);
 }
 
-.antigravity-cli-binary-path-label {
+.antigravity-cli-field-label {
   color: var(--text-muted);
-  font-size: 0.78rem;
+  font-size: var(--font-size-xs);
   font-weight: 600;
 }
 

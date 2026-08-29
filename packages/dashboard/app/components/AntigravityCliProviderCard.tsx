@@ -148,7 +148,7 @@ export function AntigravityCliProviderCard({
 
   const binaryPathControl = compact ? (
     <div className="antigravity-cli-binary-path-control">
-      <label className="antigravity-cli-binary-path-label" htmlFor="antigravity-cli-binary-path">
+      <label className="antigravity-cli-field-label" htmlFor="antigravity-cli-binary-path">
         {t("setup.antigravityCli.binaryPathLabel", "Antigravity CLI binary path")}
       </label>
       <div className="antigravity-cli-binary-path-row">
@@ -178,7 +178,7 @@ export function AntigravityCliProviderCard({
       {pathMessage ? (
         <small className={pathMessage.tone === "error" ? "form-error" : "text-muted"}>{pathMessage.text}</small>
       ) : null}
-      <label className="antigravity-cli-binary-path-label" htmlFor="antigravity-cli-permission-mode">
+      <label className="antigravity-cli-field-label" htmlFor="antigravity-cli-permission-mode">
         {t("setup.antigravityCli.permissionModeLabel", "Permission mode")}
       </label>
       <select

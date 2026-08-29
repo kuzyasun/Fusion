@@ -470,8 +470,13 @@ export async function invokeAgyPrint(
       let ptyFile = binary;
       let ptyArgs = args;
       if (process.platform === "win32" && /\.(cmd|bat)$/i.test(binary)) {
+        /*
+        FNXC:AntigravityCli 2026-07-19-01:40:
+        Use /d /c for cmd.exe invocation: disables AutoRun registry commands (/d)
+        without /s so cmd.exe preserves inner quotes across array-joined arguments.
+        */
         ptyFile = process.env.ComSpec || "cmd.exe";
-        ptyArgs = ["/c", binary, ...args];
+        ptyArgs = ["/d", "/c", binary, ...args];
       }
       child = ptyModule.spawn(ptyFile, ptyArgs, {
         name: "xterm-color",
@@ -501,21 +506,24 @@ export async function invokeAgyPrint(
 
     /*
     FNXC:AntigravityCli 2026-07-18-18:25:
-    Strip ANSI on the cumulative PTY buffer, then emit only the cleaned delta.
-    Hold back a trailing incomplete CSI (`ESC[`…) so a split escape sequence cannot
-    leak ESC crumbs into onChunk — that used to make adapter dedupe re-emit the full body.
+    Incremental ANSI strip: only process the new raw data since the last emission,
+    keeping a small holdback buffer for incomplete CSI sequences at chunk boundaries.
+    Previous approach re-ran stripAnsi on the entire accumulated output per chunk,
+    which was O(N²) for large responses.
     */
-    let emittedCleanLen = 0;
+    let pendingRaw = "";
     child.onData((data: string) => {
       output += data;
       if (opts?.onChunk) {
-        const holdMatch = output.match(INCOMPLETE_CSI_RE);
-        const stable = holdMatch ? output.slice(0, -holdMatch[0].length) : output;
-        const cleaned = stripAnsi(stable);
-        if (cleaned.length > emittedCleanLen) {
-          const delta = cleaned.slice(emittedCleanLen);
-          emittedCleanLen = cleaned.length;
-          if (delta) opts.onChunk(delta);
+        pendingRaw += data;
+        // Hold back a trailing incomplete CSI so a split escape sequence cannot
+        // leak ESC crumbs into onChunk.
+        const holdMatch = pendingRaw.match(INCOMPLETE_CSI_RE);
+        const stable = holdMatch ? pendingRaw.slice(0, -holdMatch[0].length) : pendingRaw;
+        if (stable.length > 0) {
+          const cleaned = stripAnsi(stable);
+          pendingRaw = holdMatch ? holdMatch[0] : "";
+          if (cleaned) opts.onChunk(cleaned);
         }
       }
     });
@@ -596,22 +604,22 @@ async function invokeAgyPrintViaSpawn(
       ctx.signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    let emittedCleanLen = 0;
+    let pendingRaw = "";
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf-8");
       stdout += text;
       if (ctx.onChunk) {
         /*
         FNXC:AntigravityCli 2026-07-18-18:25:
-        Same cumulative ANSI strip + incomplete-CSI holdback as the PTY path.
+        Same incremental ANSI strip + incomplete-CSI holdback as the PTY path.
         */
-        const holdMatch = stdout.match(INCOMPLETE_CSI_RE);
-        const stable = holdMatch ? stdout.slice(0, -holdMatch[0].length) : stdout;
-        const cleaned = stripAnsi(stable);
-        if (cleaned.length > emittedCleanLen) {
-          const delta = cleaned.slice(emittedCleanLen);
-          emittedCleanLen = cleaned.length;
-          if (delta) ctx.onChunk(delta);
+        pendingRaw += text;
+        const holdMatch = pendingRaw.match(INCOMPLETE_CSI_RE);
+        const stable = holdMatch ? pendingRaw.slice(0, -holdMatch[0].length) : pendingRaw;
+        if (stable.length > 0) {
+          const cleaned = stripAnsi(stable);
+          pendingRaw = holdMatch ? holdMatch[0] : "";
+          if (cleaned) ctx.onChunk(cleaned);
         }
       }
     });
