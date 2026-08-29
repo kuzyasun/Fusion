@@ -109,8 +109,8 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
     const visibleAuthProviders = hasSeparatedAnthropicProvider
         ? authProviders.filter((p) => p.id !== "anthropic")
         : authProviders;
-    // FNXC:OmpAcp 2026-07-13-22:50: include omp-cli among supported CLI auth cards.
-    const isSupportedCliProvider = (provider: AuthProvider) => provider.id === "claude-cli" || provider.id === "cursor-cli" || provider.id === "grok-cli" || provider.id === "omp-cli" || provider.id === "llama-cpp";
+    // FNXC:AntigravityCli 2026-07-18-18:25: include antigravity-cli among supported CLI auth cards.
+    const isSupportedCliProvider = (provider: AuthProvider) => provider.id === "claude-cli" || provider.id === "cursor-cli" || provider.id === "grok-cli" || provider.id === "omp-cli" || provider.id === "antigravity-cli" || provider.id === "llama-cpp";
     /*
     FNXC:ProviderAuth 2026-07-02-12:20:
     Authentication ordering must sort supported CLI and non-CLI provider cards in one list so Cursor CLI or llama.cpp cannot split Claude CLI from Anthropic subscription/API-key entries.

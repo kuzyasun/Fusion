@@ -89,6 +89,7 @@ export class AntigravityRuntimeAdapter implements AgentRuntime {
     AntigravityRuntimeAdapter.dispose(). Wire session.dispose to abort in-flight print-mode
     turns so agy is killed instead of hanging until CLI exit or the print timeout.
     */
+    const sessionAbortControllers = new Set<AbortController>();
     const session: AntigravityStreamSession = {
       model,
       systemPrompt,
@@ -107,8 +108,16 @@ export class AntigravityRuntimeAdapter implements AgentRuntime {
       fusedSystemPrompt: [systemPrompt.trim(), buildRuntimeContextSection(options).trim()]
         .filter((part) => part.length > 0)
         .join("\n\n"),
+      sessionAbortControllers,
       dispose: () => {
-        this.abortInFlightTurns();
+        for (const controller of sessionAbortControllers) {
+          try {
+            controller.abort();
+          } catch {
+            // best effort
+          }
+        }
+        sessionAbortControllers.clear();
       },
     };
 
@@ -136,6 +145,7 @@ export class AntigravityRuntimeAdapter implements AgentRuntime {
 
     const externalSignal = extractAbortSignal(options);
     const localController = new AbortController();
+    session.sessionAbortControllers?.add(localController);
     this.abortControllers.add(localController);
 
     const onExternalAbort = (): void => {
@@ -167,6 +177,7 @@ export class AntigravityRuntimeAdapter implements AgentRuntime {
       session.state.errorMessage = err instanceof Error ? err.message : String(err);
       throw err;
     } finally {
+      session.sessionAbortControllers?.delete(localController);
       this.abortControllers.delete(localController);
       externalSignal?.removeEventListener("abort", onExternalAbort);
     }

@@ -203,6 +203,21 @@ function formatSpawnError(error: Error & { code?: unknown }): string {
   return `spawn error: ${code}${error.message}`.trim();
 }
 
+export function killProcessTree(child: { pid?: number; kill?: (...args: any[]) => void | boolean }): void {
+  try {
+    child.kill?.("SIGKILL");
+  } catch {
+    // best effort
+  }
+  if (process.platform === "win32" && typeof child.pid === "number" && child.pid > 0) {
+    try {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {
+      // best effort
+    }
+  }
+}
+
 export async function runAgyCommand(
   binary: string,
   args: string[],
@@ -231,11 +246,7 @@ export async function runAgyCommand(
     });
 
     timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // best effort
-      }
+      killProcessTree(child);
       finish({ code: 124, stdout, stderr });
     }, timeoutMs);
 
@@ -443,11 +454,7 @@ export async function invokeAgyPrint(
       if (settled) return;
       settled = true;
       cleanup();
-      try {
-        child.kill();
-      } catch {
-        // already gone
-      }
+      killProcessTree(child);
       reject(new Error(`agy: print-mode process timed out after ${timeoutMs}ms (PTY)`));
     }, timeoutMs);
 
@@ -455,16 +462,18 @@ export async function invokeAgyPrint(
       if (settled) return;
       settled = true;
       cleanup();
-      try {
-        child.kill();
-      } catch {
-        // already gone
-      }
+      killProcessTree(child);
       reject(new Error("agy: invocation aborted"));
     };
 
     try {
-      child = ptyModule.spawn(binary, args, {
+      let ptyFile = binary;
+      let ptyArgs = args;
+      if (process.platform === "win32" && /\.(cmd|bat)$/i.test(binary)) {
+        ptyFile = process.env.ComSpec || "cmd.exe";
+        ptyArgs = ["/c", binary, ...args];
+      }
+      child = ptyModule.spawn(ptyFile, ptyArgs, {
         name: "xterm-color",
         cols: 120,
         rows: 40,
@@ -567,11 +576,7 @@ async function invokeAgyPrintViaSpawn(
       if (settled) return;
       settled = true;
       cleanup();
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // already gone
-      }
+      killProcessTree(child);
       reject(new Error(`agy: print-mode process timed out after ${ctx.timeoutMs}ms. ${ptyNote}`));
     }, ctx.timeoutMs);
 
@@ -579,11 +584,7 @@ async function invokeAgyPrintViaSpawn(
       if (settled) return;
       settled = true;
       cleanup();
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // already gone
-      }
+      killProcessTree(child);
       reject(new Error("agy: invocation aborted"));
     };
 

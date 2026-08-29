@@ -105,6 +105,33 @@ describe("AntigravityRuntimeAdapter", () => {
     expect(seenSignal?.aborted).toBe(true);
   });
 
+  it("isolates session disposal so disposing session A does not abort concurrent session B", async () => {
+    const invoke = vi.fn<InvokeAgyPrintFn>(async (prompt, _settings, opts) => {
+      if (prompt === "session-a") {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (opts?.signal?.aborted) throw new Error("agy: invocation aborted");
+        return { body: "a-done", exitCode: 0, usedFallback: false };
+      }
+      // session-b finishes successfully after session-a is disposed
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      if (opts?.signal?.aborted) throw new Error("agy: invocation aborted");
+      return { body: "b-done", exitCode: 0, usedFallback: false };
+    });
+    const adapter = makeAdapter(invoke);
+    const { session: sessionA } = await adapter.createSession({ systemPrompt: "SYS A" });
+    const { session: sessionB } = await adapter.createSession({ systemPrompt: "SYS B" });
+
+    const turnA = adapter.promptWithFallback(sessionA, "session-a");
+    const turnB = adapter.promptWithFallback(sessionB, "session-b");
+
+    // Dispose session A while both are in-flight
+    sessionA.dispose();
+
+    await expect(turnA).rejects.toThrow(/aborted/);
+    await expect(turnB).resolves.toBeUndefined();
+    expect(sessionB.messages).toContainEqual({ role: "assistant", content: "b-done" });
+  });
+
   it("uses --continue and re-sends a context-light prompt on later turns", async () => {
     const invoke = vi.fn<InvokeAgyPrintFn>(async () => ({ body: "ok", exitCode: 0, usedFallback: false }));
     const adapter = makeAdapter(invoke);

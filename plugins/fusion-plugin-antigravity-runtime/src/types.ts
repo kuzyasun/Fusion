@@ -50,6 +50,7 @@ export interface AntigravityStreamSession {
   runtimeContext?: AntigravityRuntimeContext;
   fusedSystemPrompt: string;
   cwd: string;
+  sessionAbortControllers?: Set<AbortController>;
   dispose(): void;
 }
 

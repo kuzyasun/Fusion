@@ -16,6 +16,8 @@ const SYNTHETIC_FIRST_CLASS_PROVIDER_IDS = [
   "cursor-cli",
   "grok-cli",
   "omp-cli",
+  "antigravity-cli",
+  "antigravity",
   "llama-cpp",
   "llama-server",
   "hermes",

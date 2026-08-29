@@ -470,4 +470,33 @@ describe("invokeAgyPrint", () => {
 
     await expect(promise).rejects.toThrow(/node-pty unavailable \(boom\)/);
   });
+
+  it("wraps .cmd and .bat shims with cmd.exe /c for PTY spawn on Windows", async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      const spawnPty = vi.fn(() => ({
+        onData: (cb: (d: string) => void) => {
+          cb("windows cmd output");
+        },
+        onExit: (cb: (e: { exitCode: number }) => void) => {
+          cb({ exitCode: 0 });
+        },
+        kill: vi.fn(),
+      }));
+
+      const result = await invokeAgyPrint("hello", { ...BASE_SETTINGS, binaryPath: "C:\\tools\\agy.cmd" }, {
+        loadPtyModule: async () => ({ spawn: spawnPty as never }),
+      });
+
+      expect(result.body).toBe("windows cmd output");
+      expect(spawnPty).toHaveBeenCalledWith(
+        process.env.ComSpec || "cmd.exe",
+        ["/c", "C:\\tools\\agy.cmd", "--dangerously-skip-permissions", "-p", "hello"],
+        expect.any(Object),
+      );
+    } finally {
+      Object.defineProperty(process, "platform", { value: origPlatform });
+    }
+  });
 });
