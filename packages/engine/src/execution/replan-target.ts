@@ -1,7 +1,14 @@
 import type { Task, TaskStore } from "@fusion/core";
-import { resolveLifecycleColumns, resolveWorkflowIrForTask, workflowHasColumn } from "@fusion/core";
+import {
+  classifyLifecycleRole,
+  resolveColumnFlags,
+  resolveLifecycleColumns,
+  resolveWorkflowIrForTask,
+  workflowHasColumn,
+} from "@fusion/core";
 import type { WorkflowIr } from "@fusion/core";
 import { schedulerLog } from "../logger.js";
+import { moveTaskWithLifecycleReason } from "./lifecycle-move.js";
 
 /*
 FNXC:WorkflowReplan 2026-07-12-23:15:
@@ -245,20 +252,12 @@ export function hasAdvancedPastPlanning(
   `resolvePlannerLanesForTaskAsync` and passes the answer in.
 
   The default is `LEGACY_PLANNER_LANES`, which populates all four roles, so a caller that passes
-  nothing is byte-identical to the four literals this replaces. A workflow that declares columns but
-  no archive lane leaves that arm undefined and it cannot match — the board has no such lane.
+  nothing preserves the built-in planning vocabulary.
   */
-  roles: { mergedPlanningColumn?: string; lanes?: PlannerLanes; archivedColumn?: string } = { mergedPlanningColumn: "todo" },
+  roles: { mergedPlanningColumn?: string; lanes?: PlannerLanes } = { mergedPlanningColumn: "todo" },
 ): boolean {
   const lanes = roles.lanes ?? LEGACY_PLANNER_LANES;
-  /*
-  `archivedColumn` is a SEPARATE argument rather than a fifth `PlannerLanes` role, and that is a
-  deliberate scope choice. Adding the field surfaced a real divergence between the sync and async
-  planner-lane twins — the shared `_workflow-vocabulary-fixture` models no archive lane, so the two
-  disagree there — and that fixture backs 37 test files. The divergence is worth its own change;
-  it is not this conversion's to force. Absent, the legacy id keeps the previous answer.
-  */
-  const advanced = [lanes.wip, lanes.review, lanes.complete, roles.archivedColumn ?? (roles.lanes ? undefined : "archived")];
+  const advanced = [lanes.wip, lanes.review, lanes.complete];
   if (advanced.some((column) => column !== undefined && column === task.column)) {
     return true;
   }
@@ -462,11 +461,10 @@ export async function resolveReplanTargetColumn(store: TaskStore, taskId: string
  * reopen-to-todo/triage block clears `task.worktree` but deliberately leaves `task.branch`
  * intact, so an unguarded replan move produced a split-brain row: no worktree pointer, but
  * still owning `fusion/<id>`, which is still checked out in the worktree that was just
- * orphaned. The next planning entry (`ensureTaskWorktreeForPlanning` ->
- * `ensureGraphCustomNodeWorktree` -> `acquireTaskWorktree`) therefore skipped its resume
- * branch (gated on `task.worktree`), tried to create the SAME branch fresh, collided, and
- * fell into `cleanupConflictingWorktree` — force-removing the previous worktree and
- * `git branch -D`-ing `fusion/<id>` before re-cutting it off the integration branch.
+ * orphaned. Planning now preserves this metadata without acquiring or touching the checkout;
+ * the next write-capable execution node resumes through `ensureGraphCustomNodeWorktree` ->
+ * `acquireTaskWorktree`. Clearing the pointer would make that execution entry skip its resume
+ * branch, collide with the still-checked-out task branch, and destructively recreate the checkout.
  * Observed on FN-8603: two Plan Review REVISE bounces burned two full teardown +
  * `git worktree add` + init-command cycles (~10s each) and two branch delete/recreate rounds
  * for zero benefit — planning writes its spec to the task store, not the worktree, so the
@@ -478,12 +476,44 @@ export async function resolveReplanTargetColumn(store: TaskStore, taskId: string
  * the replan contract (steps reset to pending, status/error cleared, `executionStartedAt`
  * dropped) is unchanged — only the checkout survives.
  */
+export type ReplanMoveContainedResult = {
+  moved: false;
+  reason: "review-lane-source";
+  column: string;
+};
+
 export async function moveTaskToReplanColumn(
   store: TaskStore,
   task: Pick<Task, "id" | "column">,
+  reason: "plan-review-revise-replan",
   target?: string,
   options?: { workflowMoveSource?: string },
-): Promise<string | undefined> {
+): Promise<string | undefined | ReplanMoveContainedResult> {
+  const liveTask = typeof store.getTask === "function"
+    ? await Promise.resolve(store.getTask(task.id)).catch(() => task as Task)
+    : task;
+  const liveColumn = liveTask.column;
+  const workflowIr = await resolveWorkflowIrForTask(store, task.id).catch(() => undefined);
+  const sourceColumn = workflowIr?.version === "v2"
+    ? workflowIr.columns.find((column) => column.id === liveColumn)
+    : undefined;
+
+  /*
+  FNXC:LifecycleContainment 2026-08-28-01:53:
+  FN-207 contains replanning inside its owning stage. A live review card cannot jump to Planning;
+  Code Review repairs route through WIP, while review-convergence and blocked-exit callers keep their
+  human-visible park in review. The live row is re-read here so a stale caller snapshot cannot bypass
+  containment. Legal WIP-to-hold replans are explicitly engine-sourced and carry a registered reason.
+  */
+  if (sourceColumn && classifyLifecycleRole(resolveColumnFlags(sourceColumn)) === "review") {
+    const message = `Replan requested while in '${liveColumn}' — contained in place; the review lane repairs forward through the implementation lane`;
+    schedulerLog.warn(`${task.id}: ${message}`);
+    if (typeof store.logEntry === "function") {
+      await store.logEntry(task.id, message).catch(() => undefined);
+    }
+    return { moved: false, reason: "review-lane-source", column: liveColumn };
+  }
+
   const replanColumn = target ?? await resolveReplanTargetColumn(store, task.id);
   /*
   FNXC:ReplanTargetR7 2026-07-31-15:35 (PR #2598):
@@ -494,15 +524,17 @@ export async function moveTaskToReplanColumn(
   if (!replanColumn) {
     schedulerLog.warn(
       `${task.id}: replan rebound skipped — the task's workflow declares no intake or hold `
-      + `column to replan in; card left in ${task.column}`,
+      + `column to replan in; card left in ${liveColumn}`,
     );
     return undefined;
   }
-  if (task.column !== replanColumn) {
-    await store.moveTask(task.id, replanColumn as Task["column"], {
+  if (liveColumn !== replanColumn) {
+    const result = await moveTaskWithLifecycleReason(store, task.id, replanColumn as Task["column"], reason, {
       preserveWorktree: true,
+      moveSource: "engine",
       ...(options?.workflowMoveSource ? { workflowMoveSource: options.workflowMoveSource } : {}),
     });
+    if (!result.moved) return undefined;
   }
   return replanColumn;
 }

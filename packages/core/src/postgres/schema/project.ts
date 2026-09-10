@@ -39,7 +39,7 @@ import {
   check,
   index,
 } from "drizzle-orm/pg-core";
-import { sql } from "drizzle-orm";
+import { desc, sql } from "drizzle-orm";
 import { PROJECT_SCHEMA, bytea, tsvector } from "./_shared.js";
 
 /**
@@ -173,6 +173,12 @@ export const tasks = projectSchema.table("tasks", {
   is not enough for Gate boot-smoke before health reconciliation runs.
   */
   sessionAdvisorEnabled: integer("session_advisor_enabled"),
+  /*
+  FNXC:PlanApproval 2026-08-28-17:16:
+  FN-234 retired this task column from reads and writes. Keep it in the append-only schema because
+  migration 0070 and PostgreSQL health repair still materialize it for upgrade compatibility.
+  */
+  requirePlanApproval: integer("require_plan_approval"),
   tokenUsageInputTokens: bigint("token_usage_input_tokens", { mode: "number" }),
   tokenUsageOutputTokens: bigint("token_usage_output_tokens", { mode: "number" }),
   tokenUsageCachedTokens: bigint("token_usage_cached_tokens", { mode: "number" }),
@@ -208,6 +214,7 @@ export const tasks = projectSchema.table("tasks", {
   executionCompletedAt: text("execution_completed_at"),
   dependencies: jsonb("dependencies").default([]),
   steps: jsonb("steps").default([]),
+  stepReports: jsonb("step_reports").default([]),
   log: jsonb("log").default([]),
   attachments: jsonb("attachments").default([]),
   steeringComments: jsonb("steering_comments").default([]),
@@ -235,6 +242,9 @@ export const tasks = projectSchema.table("tasks", {
   workspaceWorktrees: jsonb("workspace_worktrees"),
   // FNXC:RepositoryScope 2026-08-20-23:07: explicit task intent must survive PostgreSQL reads independently of acquired worktrees.
   repositoryScope: jsonb("repository_scope"),
+  // FNXC:ExternalBlock 2026-08-28-03:48: obstacle origin and exact resume coordinates survive process restarts.
+  externalBlock: jsonb("external_block"),
+  planningFailure: jsonb("planning_failure"),
   noCommitsExpected: integer("no_commits_expected").default(0),
   enabledWorkflowSteps: jsonb("enabled_workflow_steps").default([]),
   modifiedFiles: jsonb("modified_files").default([]),
@@ -361,6 +371,37 @@ export const tasks = projectSchema.table("tasks", {
 ]);
 
 /* FNXC:SpecLock 2026-08-09-07:06: plan locks, evidence, and reports omit task FKs so immutable history survives archive cleanup and task tombstones. */
+/*
+FNXC:OverlapWaitSynchronization 2026-09-09-23:53:
+The display blocker is transient, but each observed predecessor edge remains project-scoped until
+freshness, delta analysis, optional revalidation, and context delivery have all been acknowledged.
+Only the waiting task is foreign-keyed; predecessor identity survives its archival or deletion.
+*/
+export const taskOverlapWaits = projectSchema.table("task_overlap_waits", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  taskId: text("task_id").notNull(),
+  episodeId: text("episode_id").notNull().default(sql`md5(random()::text || clock_timestamp()::text)`),
+  blockerTaskId: text("blocker_task_id").notNull(),
+  taskLineageId: text("task_lineage_id"),
+  blockerLineageId: text("blocker_lineage_id"),
+  observedAt: text("observed_at").notNull(),
+  planFingerprint: text("plan_fingerprint"),
+  phase: text("phase").notNull().default("observed"),
+  revision: integer("revision").notNull().default(1),
+  owner: text("owner"),
+  attempt: integer("attempt").notNull().default(0),
+  checkoutEpoch: text("checkout_epoch"),
+  observation: jsonb("observation").notNull().default({}),
+  receipt: jsonb("receipt"),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.taskId, t.episodeId] }),
+  foreignKey({ columns: [t.projectId, t.taskId], foreignColumns: [tasks.projectId, tasks.id], name: "fk_task_overlap_wait_owner" }).onUpdate("cascade").onDelete("cascade"),
+  check("ck_task_overlap_wait_phase", sql`${t.phase} IN ('observed','analyzing','freshness-pending','revalidation-pending','ready','delivered','cancelled')`),
+  uniqueIndex("uq_task_overlap_wait_open_blocker").on(t.projectId, t.taskId, t.blockerTaskId).where(sql`${t.phase} NOT IN ('delivered', 'cancelled')`),
+  index("idx_task_overlap_wait_unconsumed").on(t.projectId, t.taskId, t.observedAt).where(sql`${t.phase} NOT IN ('delivered', 'cancelled')`),
+]);
+
 export const specLocks = projectSchema.table("spec_locks", {
   projectId: text("project_id").notNull(), taskId: text("task_id").notNull(), version: integer("version").notNull(),
   acceptedAt: text("accepted_at").notNull(), approvalFingerprint: text("approval_fingerprint").notNull(), currentPlanVersion: integer("current_plan_version").notNull(), currentPlanHash: text("current_plan_hash").notNull(),
@@ -672,6 +713,31 @@ export const memoryRecallRecords = projectSchema.table("memory_recall_records", 
   source: jsonb("source").notNull(), tags: jsonb("tags").notNull().default(sql`'[]'::jsonb`), graphNodeIds: jsonb("graph_node_ids").notNull().default(sql`'[]'::jsonb`),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 }, (t) => [primaryKey({ columns: [t.projectId, t.id] }), unique("memory_recall_records_project_kind_hash_key").on(t.projectId, t.kind, t.contentHash), index("idxMemoryRecallRecordsKindCreated").on(t.projectId, t.kind, t.createdAt), index("idxMemoryRecallRecordsCreated").on(t.projectId, t.createdAt)]);
+
+/*
+FNXC:PatchnodeLedger 2026-08-28-12:16:
+Patchnode deliberately does not follow this schema's task foreign-key convention. Archive cleanup hard-deletes task rows to fire sibling cascades, while this self-contained delivery ledger must remain readable after that deletion.
+*/
+export const patchnodeEntries = projectSchema.table("patchnode_entries", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  entryId: text("entry_id").notNull(),
+  taskId: text("task_id").notNull(),
+  kind: text("kind").notNull(),
+  occurrenceKey: text("occurrence_key").notNull(),
+  day: text("day").notNull(),
+  occurredAt: text("occurred_at").notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull(),
+  revertsEntryId: text("reverts_entry_id"),
+  revertedAt: text("reverted_at"),
+  revertedCommitSha: text("reverted_commit_sha"),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.entryId] }),
+  check("patchnode_entries_kind_check", sql`${t.kind} IN ('completed', 'reverted')`),
+  index("idxPatchnodeEntriesFeed").on(t.projectId, t.day, t.occurredAt),
+  index("idxPatchnodeEntriesTaskKind").on(t.projectId, t.taskId, t.kind, t.occurredAt),
+]);
 
 export const agentActivityEventSeq = projectSchema.table("agent_activity_event_seq", {
   projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`), lastSeq: bigint("last_seq", { mode: "bigint" }).notNull().default(sql`0`),
@@ -1603,6 +1669,54 @@ export const goals = projectSchema.table("goals", {
   index("idxGoalsStatus").on(t.status),
 ]);
 
+/*
+FNXC:ProjectNotes 2026-09-09-17:08:
+Personal notes use a project-local composite identity and revision counter. Duplicate titles are valid; identity and conflict detection never depend on title text.
+*/
+export const notes = projectSchema.table("notes", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  id: text("id").notNull(),
+  title: text("title").notNull(),
+  content: text("content").notNull().default(""),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id] }),
+  index("idxNotesProjectUpdatedAt").on(t.projectId, t.updatedAt),
+  check("notes_title_length", sql`char_length(${t.title}) BETWEEN 1 AND 200`),
+  check("notes_content_length", sql`octet_length(${t.content}) <= 1048576`),
+  check("notes_revision_positive", sql`${t.revision} >= 1`),
+]);
+
+/*
+FNXC:WhiteboardAlpha 2026-09-10-05:42:
+Whiteboard heads and immutable snapshots share composite project identity. The current row advances only with its matching revision while the child FK cascades deletion without permitting cross-project history joins.
+*/
+export const whiteboards = projectSchema.table("whiteboards", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  id: text("id").notNull(), title: text("title").notNull(), document: jsonb("document").notNull(),
+  revision: integer("revision").notNull().default(1), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id] }),
+  index("idxWhiteboardsProjectUpdatedAt").on(t.projectId, t.updatedAt),
+  index("idxWhiteboardsProjectTitle").on(t.projectId, t.title),
+  check("whiteboards_title_length", sql`char_length(${t.title}) BETWEEN 1 AND 200`),
+  check("whiteboards_document_length", sql`octet_length(${t.document}::text) <= 5242880`),
+  check("whiteboards_revision_positive", sql`${t.revision} >= 1`),
+]);
+export const whiteboardRevisions = projectSchema.table("whiteboard_revisions", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  whiteboardId: text("whiteboard_id").notNull(), revision: integer("revision").notNull(), title: text("title").notNull(),
+  document: jsonb("document").notNull(), createdAt: text("created_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.whiteboardId, t.revision] }),
+  foreignKey({ columns: [t.projectId, t.whiteboardId], foreignColumns: [whiteboards.projectId, whiteboards.id] }).onUpdate("cascade").onDelete("cascade"),
+  index("idxWhiteboardRevisionsRecent").on(t.projectId, t.whiteboardId, t.revision),
+  check("whiteboard_revisions_document_length", sql`octet_length(${t.document}::text) <= 5242880`),
+  check("whiteboard_revisions_revision_positive", sql`${t.revision} >= 1`),
+]);
+
 export const missionGoals = projectSchema.table("mission_goals", {
   projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
   missionId: text("mission_id").notNull(),
@@ -2281,6 +2395,7 @@ export const chatMessages = projectSchema.table("chat_messages", {
   primaryKey({ columns: [t.projectId, t.id] }),
   index("idxChatMessagesSessionId").on(t.sessionId),
   index("idxChatMessagesCreatedAt").on(t.createdAt),
+  index("idxChatMessagesSessionCreatedAtId").on(t.sessionId, desc(t.createdAt), desc(t.id)),
 ]);
 
 /*
@@ -2610,7 +2725,7 @@ export const projectTableNames = [
   "research_exports", "research_run_events", "experiment_sessions",
   "experiment_session_records", "eval_runs", "eval_task_results", "eval_run_events",
   "secrets", "__meta", "missions", "branch_groups", "pull_requests",
-  "pull_request_thread_state", "goals", "mission_goals", "goal_citations",
+  "pull_request_thread_state", "goals", "notes", "whiteboards", "whiteboard_revisions", "mission_goals", "goal_citations",
   "milestones", "slices", "mission_features", "ideation_sessions", "ideation_candidates", "mission_events", "plugins",
   "routines", "project_insights", "project_insight_runs", "project_insight_run_events",
   "todo_lists", "todo_items", "usage_events", "plugin_activations",
@@ -2620,7 +2735,7 @@ export const projectTableNames = [
   "mission_validator_runs", "mission_validator_failures",
   "mission_fix_feature_lineage", "verification_cache", "import_translation_cache",
   "approval_requests",
-  "approval_request_audit_events", "agent_activity_events", "agent_activity_event_seq", "memory_recall_records", "chat_rooms", "chat_room_members",
+  "approval_request_audit_events", "agent_activity_events", "agent_activity_event_seq", "patchnode_entries", "memory_recall_records", "chat_rooms", "chat_room_members",
   "chat_room_messages", "chat_token_usage",
   /*
   FNXC:WorkspaceCoordination 2026-08-23-20:05:
@@ -2644,5 +2759,5 @@ export const projectTableNames = [
   "task_lifecycle_consumer_cursors", "task_lifecycle_consumer_dead_letters",
   "task_lifecycle_consumer_receipts", "task_lifecycle_consumer_registrations",
   "task_lifecycle_event_seq", "task_lifecycle_events", "task_verification_requests",
-  "unplanned_execution_blocks", "workflow_agent_capacity_leases",
+  "unplanned_execution_blocks", "workflow_agent_capacity_leases", "task_overlap_waits",
 ] as const;

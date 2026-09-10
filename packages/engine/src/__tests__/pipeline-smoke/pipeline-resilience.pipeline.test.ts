@@ -22,7 +22,7 @@ function executableVariants(ids: readonly string[]): Array<{ scenario: PipelineS
   return ids.flatMap((id) => {
     const selected = scenario(id);
     const workflows = selected.id === "S19"
-      ? (["builtin:coding-ideas", "builtin:coding"] as const)
+      ? (["builtin:coding-ideas-v2", "builtin:coding"] as const)
       : selected.workflows.filter((workflowId) => workflowId !== "renamed-clone");
     return workflows.flatMap((workflowId) => (selected.variants ?? [undefined]).map((variant) => ({ scenario: selected, workflowId, variant })));
   });
@@ -51,7 +51,7 @@ describeIfReady("pipeline smoke: resilience scenarios", () => {
   });
   afterAll(pg.afterAll);
 
-  it.each(executableVariants(["S17", "S18", "S19", "S20"]))(
+  it.each(executableVariants(["S17", "S18", "S19", "S20", "S21"]))(
     "$scenario.id runs $workflowId $variant",
     async ({ scenario: selected, workflowId, variant }) => {
       const context = { harness, workflowId, variant };

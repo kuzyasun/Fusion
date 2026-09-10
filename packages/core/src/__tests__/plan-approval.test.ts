@@ -22,6 +22,13 @@ describe("resolvePlanApprovalRequired", () => {
     expect(resolvePlanApprovalRequired({ planApprovalMode: "require-all", requirePlanApproval })).toBe(true);
   });
 
+  it("accepts only settings and resolves each project policy from that single input", () => {
+    expect(resolvePlanApprovalRequired).toHaveLength(1);
+    expect(resolvePlanApprovalRequired({ planApprovalMode: "auto-approve-all", requirePlanApproval: false })).toBe(false);
+    expect(resolvePlanApprovalRequired({ planApprovalMode: "workflow", requirePlanApproval: true })).toBe(true);
+    expect(resolvePlanApprovalRequired({ planApprovalMode: "require-all" })).toBe(true);
+  });
+
   it("falls back to workflow behavior for unknown persisted modes", () => {
     expect(
       resolvePlanApprovalRequired({
@@ -140,6 +147,15 @@ describe("computePlanApprovalFingerprint", () => {
       computePlanApprovalFingerprint(plannerText),
     );
     expect(computePlanApprovalFingerprint(withAllHygiene)).toBe(
+      computePlanApprovalFingerprint(plannerText),
+    );
+  });
+
+  it("ignores a tracked operator heading when What This Delivers follows the generated region", () => {
+    const plannerText = "# Task: FN-1\n\n## What This Delivers\n\n- Deliver the interface.\n\n## Mission\n\nBuild the interface.\n";
+    const description = "Operator context.\n\n## Do NOT\n\nOperator-owned constraint.";
+
+    expect(computePlanApprovalFingerprint(applyOriginalDescription(plannerText, description))).toBe(
       computePlanApprovalFingerprint(plannerText),
     );
   });

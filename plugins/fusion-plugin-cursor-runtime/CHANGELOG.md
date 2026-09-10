@@ -1,5 +1,75 @@
 # @fusion-plugin-examples/cursor-runtime
 
+## 0.1.56-beta.4
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.4
+- @fusion/plugin-sdk@0.78.0-beta.4
+
+## 0.1.56-beta.3
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.3
+- @fusion/plugin-sdk@0.78.0-beta.3
+
+## 0.1.56-beta.2
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.2
+- @fusion/plugin-sdk@0.78.0-beta.2
+
+## 0.1.56-beta.1
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.1
+- @fusion/plugin-sdk@0.78.0-beta.1
+
+## 0.1.56-beta.0
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.0
+- @fusion/plugin-sdk@0.78.0-beta.0
+
+## 0.1.55
+
+### Patch Changes
+
+- @fusion/core@0.77.0
+- @fusion/plugin-sdk@0.77.0
+
+## 0.1.55-beta.14
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.14
+- @fusion/plugin-sdk@0.77.0-beta.14
+
+## 0.1.55-beta.13
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.13
+- @fusion/plugin-sdk@0.77.0-beta.13
+
+## 0.1.55-beta.12
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.12
+- @fusion/plugin-sdk@0.77.0-beta.12
+
+## 0.1.55-beta.11
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.11
+- @fusion/plugin-sdk@0.77.0-beta.11
+
 ## 0.1.55-beta.10
 
 ### Patch Changes

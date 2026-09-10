@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   choosePreferredStoredCredential,
+  computeStoredCredentialAccountFingerprint,
   extractClaudeCliStoredCredential,
+  isSameStoredCredentialMaterial,
+  mergeStoredCredentialPreservingMetadata,
   extractCodexCliStoredCredential,
   getClaudeCodeCredentialPaths,
   readStoredCredentialsFromAuthFile,
@@ -24,6 +27,57 @@ function createJwt(payload: Record<string, unknown>): string {
 }
 
 describe("oauth credential interop", () => {
+  describe("mergeStoredCredentialPreservingMetadata", () => {
+    it("returns the minted credential unchanged for a first login", () => {
+      const next = { type: "oauth", access: "new-access", refresh: "new-refresh", expires: 2_000 };
+
+      expect(mergeStoredCredentialPreservingMetadata(undefined, next)).toBe(next);
+    });
+
+    it("preserves metadata while replacing all credential material and identity", () => {
+      const existing = {
+        type: "oauth",
+        access: "old-access",
+        refresh: "old-refresh",
+        expires: 1_000,
+        scopes: ["old-scope"],
+        accountId: "old-account",
+        accountFingerprint: "old-fingerprint",
+        label: "Work",
+        customMetadata: "retained",
+      };
+      const next = { type: "oauth", access: "new-access", refresh: "new-refresh", expires: 2_000, scopes: ["new-scope"] };
+
+      expect(mergeStoredCredentialPreservingMetadata(existing, next)).toEqual({
+        ...next,
+        label: "Work",
+        customMetadata: "retained",
+      });
+    });
+
+    it("does not retain an API key or stale identity for an OAuth login", () => {
+      const merged = mergeStoredCredentialPreservingMetadata(
+        { type: "api_key", key: "old-key", accountId: "old-account", accountFingerprint: "old-fingerprint", label: "Work" },
+        { type: "oauth", access: "new-access", refresh: "new-refresh", expires: 2_000 },
+      );
+
+      expect(merged).toEqual({ type: "oauth", access: "new-access", refresh: "new-refresh", expires: 2_000, label: "Work" });
+      expect(merged).not.toHaveProperty("key");
+      expect(merged).not.toHaveProperty("accountId");
+      expect(merged).not.toHaveProperty("accountFingerprint");
+    });
+
+    it("does not add undefined metadata properties absent from both rows", () => {
+      const merged = mergeStoredCredentialPreservingMetadata(
+        { type: "oauth", access: "old-access", refresh: "old-refresh" },
+        { type: "oauth", access: "new-access", refresh: "new-refresh", expires: 2_000 },
+      );
+
+      expect(merged).not.toHaveProperty("label");
+      expect(merged).not.toHaveProperty("accountId");
+    });
+  });
+
   it("extracts Codex CLI OAuth credentials from auth.json token payload", () => {
     const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600;
     const accessToken = createJwt({
@@ -67,6 +121,41 @@ describe("oauth credential interop", () => {
     expect(credential?.type).toBe("oauth");
     expect(credential?.accountId).toBe("acct_from_token");
     expect(credential?.expires).toBe(Date.parse(lastRefresh) + 55 * 60 * 1000);
+  });
+
+  it("identifies credential material without exposing it", () => {
+    const credential = {
+      type: "oauth",
+      access: "access-material",
+      refresh: "refresh-material",
+      expires: Date.now() + 60_000,
+      label: "Account A",
+      scopes: ["profile"],
+      accountId: "provider-account",
+      accountFingerprint: "old-fingerprint",
+    } as const;
+    const metadataOnlyChange = {
+      ...credential,
+      expires: credential.expires + 1,
+      label: "Renamed account",
+      scopes: ["other"],
+      accountId: "other-account",
+      accountFingerprint: "another-fingerprint",
+    };
+    const differentRefresh = { ...credential, refresh: "different-refresh" };
+
+    const fingerprint = computeStoredCredentialAccountFingerprint(credential);
+    expect(fingerprint).toMatch(/^[0-9a-f]{16}$/);
+    expect(fingerprint).not.toContain("refresh-material");
+    expect(fingerprint).toBe(computeStoredCredentialAccountFingerprint(metadataOnlyChange));
+    expect(isSameStoredCredentialMaterial(credential, metadataOnlyChange)).toBe(true);
+    expect(isSameStoredCredentialMaterial(credential, differentRefresh)).toBe(false);
+    expect(fingerprint).not.toBe(computeStoredCredentialAccountFingerprint(differentRefresh));
+    expect(isSameStoredCredentialMaterial(credential, { type: "api_key", key: "refresh-material" })).toBe(false);
+    expect(isSameStoredCredentialMaterial(credential, undefined)).toBe(false);
+    expect(isSameStoredCredentialMaterial(undefined, credential)).toBe(false);
+    expect(computeStoredCredentialAccountFingerprint(undefined)).toBeUndefined();
+    expect(computeStoredCredentialAccountFingerprint({ type: "oauth" })).toBeUndefined();
   });
 
   it("prefers a valid OAuth credential over an expired one and hydrates only when better", () => {

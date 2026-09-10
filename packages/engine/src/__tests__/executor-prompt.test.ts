@@ -10,9 +10,7 @@ import { reviewStep as mockedReviewStepFn } from "../execution/reviewer.js";
 import { execSync } from "node:child_process";
 import { writeFile, rm } from "node:fs/promises";
 import { findWorktreeUser, aiMergeTask } from "../merger.js";
-import { WorktreePool } from "../worktree/worktree-pool.js";
-import { generateWorktreeName, slugify } from "../worktree/worktree-names.js";
-import type { Task, TaskDetail } from "@fusion/core";
+import { resolveWorktreesDirLayout, type Task, type TaskDetail } from "@fusion/core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import { executingTaskLock } from "../agents/active-session-registry.js";
@@ -24,7 +22,6 @@ import {
   createWorkflowRoutingAgentStore,
   mockedCreateFnAgent,
   mockedSessionManager,
-  mockedGenerateWorktreeName,
   mockedFindWorktreeUser,
   mockedStepSessionExecutor,
   mockedWithRateLimitRetry,
@@ -66,6 +63,23 @@ function createMockTaskDetail(overrides: Partial<TaskDetail> = {}): TaskDetail {
 }
 
 describe("buildExecutionPrompt", () => {
+  it("uses the compact original-request prompt for Fast execution", () => {
+    const task = createMockTaskDetail({
+      executionMode: "fast",
+      description: "Change the primary button to red.",
+      prompt: "# FN-001\n\nChange the primary button to red.",
+      attachments: [{ filename: "button.png", originalName: "button.png", mimeType: "image/png", size: 1, createdAt: new Date().toISOString() }],
+    });
+    const result = buildExecutionPrompt(task, "/home/user/project", { testCommand: "pnpm test" } as any, "/home/user/project/.worktrees/fast");
+
+    expect(result).toContain("Change the primary button to red.");
+    expect(result).toContain("button.png");
+    expect(result).toContain("fix(FN-001): <short summary>");
+    expect(result).not.toContain("Work through each step in order");
+    expect(result).not.toContain("## Review level:");
+    expect(result).not.toContain("## Step Content");
+  });
+
   it("includes attachment section with absolute paths for image attachments", () => {
     const task = createMockTaskDetail({
       attachments: [
@@ -187,6 +201,18 @@ describe("buildExecutionPrompt", () => {
     expect(result).not.toContain("Before implementing each step");
     expect(result).not.toContain("After implementing + committing each step");
     expect(result).not.toContain("fn_review_step");
+  });
+
+  it("routes missing capabilities through the non-blocking repair ladder", () => {
+    const result = buildExecutionPrompt(createMockTaskDetail(), "/home/user/project");
+
+    expect(result).toContain("unavailable command, interpreter, optional service, or unrunnable test is never a blocked exit");
+    expect(result).toContain("resolve it");
+    expect(result).toContain("substitute a runnable automated check");
+    expect(result).toContain("complete the achievable work and record the deferred verification");
+    expect(result).toContain("## Environment Constraints");
+    expect(result).toContain("host-resource, network, model-provider, and credential failures");
+    expect(result).not.toContain("provider, credential, or third-party failures");
   });
 
   it("includes Custom fields section listing id/name/type, enum options, required, and current value", () => {
@@ -728,35 +754,37 @@ describe("summarizeToolArgs", () => {
     summarizeToolArgs = mod.summarizeToolArgs;
   });
 
-  it("returns command for bash tool", () => {
+  it("preserves a sole command or path byte-for-byte", () => {
     expect(summarizeToolArgs("Bash", { command: "ls -la" })).toBe("ls -la");
-    expect(summarizeToolArgs("bash", { command: "echo hello" })).toBe("echo hello");
-  });
-
-  it("returns long bash commands in full without truncation", () => {
-    const longCmd = "a".repeat(100);
-    const result = summarizeToolArgs("Bash", { command: longCmd });
-    expect(result).toBe(longCmd);
-  });
-
-  it("returns path for read/edit/write tools", () => {
     expect(summarizeToolArgs("Read", { path: "src/types.ts" })).toBe("src/types.ts");
-    expect(summarizeToolArgs("edit", { path: "src/store.ts" })).toBe("src/store.ts");
-    expect(summarizeToolArgs("Write", { path: "out.txt", content: "data" })).toBe("out.txt");
+    expect(summarizeToolArgs("Bash", { command: "a".repeat(1_300) })).toBe("a".repeat(1_300));
   });
 
-  it("returns first string arg for unknown tools", () => {
-    expect(summarizeToolArgs("fn_task_update", { step: 1, status: "done" })).toBe("done");
+  it("renders all fn_run_verification arguments with command first", () => {
+    expect(summarizeToolArgs("fn_run_verification", {
+      allowFullSuite: false,
+      command: "pnpm lint",
+    })).toBe("command=pnpm lint, allowFullSuite=false");
   });
 
-  it("returns undefined when no args provided", () => {
+  it("renders all fn_task_update arguments with the string value first", () => {
+    expect(summarizeToolArgs("fn_task_update", { step: 1, status: "done" })).toBe("status=done, step=1");
+  });
+
+  it("renders compact JSON values and clips oversized multi-argument payloads", () => {
+    expect(summarizeToolArgs("Write", { path: "out.txt", content: { value: "data" } })).toBe('path=out.txt, content={"value":"data"}');
+    const result = summarizeToolArgs("fn_run_verification", {
+      command: "a".repeat(1_300),
+      allowFullSuite: false,
+      description: "x".repeat(400),
+    });
+    expect(result!.length).toBeLessThanOrEqual(1_200);
+    expect(result).toMatch(/…#[0-9a-f]{12}$/);
+  });
+
+  it("returns undefined when no args are provided", () => {
     expect(summarizeToolArgs("Bash")).toBeUndefined();
     expect(summarizeToolArgs("Bash", {})).toBeUndefined();
-  });
-
-  it("returns compact JSON when only non-string args are present", () => {
-    // FNXC:StuckDetector 2026-07-22-20:20: structured custom-tool args need a distinct summary.
-    expect(summarizeToolArgs("unknown", { count: 42, flag: true })).toBe('{"count":42,"flag":true}');
   });
 });
 
@@ -1331,9 +1359,9 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // Should use SessionManager.create for fresh execution
+    // FNXC:WorktreeLayout 2026-09-04-04:35: FN-268 moved new task worktrees beneath .fusion/worktrees; derive the expected root from the production resolver so this assertion tracks the authoritative layout contract.
     expect(mockedSessionManager.create).toHaveBeenCalledWith(
-      expect.stringContaining(".worktrees"),
+      `${resolveWorktreesDirLayout("/tmp/test", undefined)}/fn-001`,
     );
     expect(mockedSessionManager.open).not.toHaveBeenCalled();
 
@@ -1548,11 +1576,17 @@ describe("swallowed async store failure observability", () => {
     mockedWithRateLimitRetry.mockImplementation((fn: () => Promise<unknown>) => fn());
   });
 
+  afterEach(settleLeakedBackgroundRuns);
+
   /*
    * FNXC:StepLifecycle 2026-07-22-10:30:
    * A legacy inversion leaves the target in-progress even when the predecessor guard rejects
    * its restart. The executor must consume the atomic verdict instead of inferring acceptance
    * from that unchanged target status.
+   *
+   * FNXC:StepLifecycle 2026-09-04-04:35:
+   * FN-217 and FN-231 prohibit automatic backward moves from the WIP lane. A rejected start
+   * terminalizes in place after recording the graph-failure containment decision.
    */
   it("turns a blocked corrupted in-progress start into a failed step-session result", async () => {
     const store = createMockStore();
@@ -1621,10 +1655,12 @@ describe("swallowed async store failure observability", () => {
         ([taskId, stepIndex, status]) => taskId === "FN-8490" && stepIndex === 0 && status === "done",
       ),
     ).toBe(false);
-    expect(store.moveTask).toHaveBeenCalledWith(
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-8490", "todo", expect.anything());
+    expect(store.logEntry).toHaveBeenCalledWith(
       "FN-8490",
-      "todo",
-      expect.objectContaining({ preserveProgress: true, recoveryRehome: true }),
+      "Workflow graph failed at node 'steps#0:step-execute' (step-failed) — automatic recovery cannot move 'in-progress' backward; card remains in place",
+      undefined,
+      undefined,
     );
     expect(onError).toHaveBeenCalledWith(
       expect.objectContaining({ id: "FN-8490" }),
@@ -2244,6 +2280,8 @@ describe("TaskExecutor global pause behavior", () => {
     resetExecutorMocks();
     mockedExistsSync.mockReturnValue(true);
   });
+
+  afterEach(settleLeakedBackgroundRuns);
 
   it("disposes all active sessions when settings:updated fires with globalPause: true", async () => {
     const store = createMockStore();

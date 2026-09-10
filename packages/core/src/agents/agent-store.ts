@@ -104,6 +104,7 @@ import {
   clearLastBlockedState as clearLastBlockedStateAsync,
 } from "../async-stores/async-agent-store.js";
 import { createLogger } from "../process/logger.js";
+import { truncateAgentLogDetail } from "./agent-log-constants.js";
 import { FsWatchPollController } from "../process/fs-watch-poll-controller.js";
 import {
   BUILTIN_WORKFLOW_AGENT_BUNDLE_CONFIG,
@@ -278,8 +279,8 @@ export function formatCurrentTaskLine(taskId: string, linkedTask: Pick<Task, "co
   A pure formatter over `Pick<Task, "column">` — no store, no task id, and its output PRINTS the column
   name for a human reader. Same class as `github-tracking-comments.ts:165` and
   `in-process-runtime`'s duration helpers: threading a resolution into a string builder to pick a word is
-  the wrong trade, and the line degrades gracefully (it says "(not active — <column>)" only for the two
-  legacy ids; on a renamed board it falls through to "(<column>)", which is still accurate, just less
+  the wrong trade, and the line degrades gracefully (it says "(not active — <column>)" only for the
+  built-in completion id; on a renamed board it falls through to "(<column>)", which is still accurate, just
   specific).
   */
   /*
@@ -292,7 +293,7 @@ export function formatCurrentTaskLine(taskId: string, linkedTask: Pick<Task, "co
   this same conclusion. An unmarked correct site costs a fleet cycle every time the census points
   at it.
   */
-  if (linkedTask.column === "done" || linkedTask.column === "archived") {
+  if (linkedTask.column === "done") {
     return `Current Task: ${taskId} (not active — ${linkedTask.column})`;
   }
   return `Current Task: ${taskId} (${linkedTask.column})`;
@@ -1614,7 +1615,7 @@ export class AgentStore extends EventEmitter {
    *
    * Guards:
    * - task must exist and not be paused
-   * - task must not be in terminal columns (done/archived)
+   * - task must not be in its workflow's Complete column
    * - task must not already be assigned to another agent
    * - task checkout must be unheld or already held by this agent
    *
@@ -1669,10 +1670,7 @@ export class AgentStore extends EventEmitter {
     already in hand two lines up, so this costs one resolution on a path that already does a task read.
     */
     const claimLifecycle = await resolveTaskLifecycleColumns(this.taskStore, taskId);
-    if (
-      task.column === (claimLifecycle?.complete ?? "done")
-      || task.column === (claimLifecycle?.archived ?? "archived")
-    ) {
+    if (task.column === (claimLifecycle?.complete ?? "done")) {
       return { ok: false, reason: "terminal", task };
     }
 
@@ -2810,13 +2808,20 @@ export class AgentStore extends EventEmitter {
    * @param runId - The run ID
    * @param entry - The log entry to append
    */
+  /*
+  FNXC:AgentLogging 2026-08-29-05:06:
+  FN-253 makes tool detail default-persisted and dual-sunk by heartbeat loggers. Run logs previously
+  bypassed the shared task-log detail bound, so normalize tool detail before the existing 64 KB outer
+  guard while writing and emitting the same safe entry for reconnect-safe live viewers.
+  */
   async appendRunLog(agentId: string, runId: string, entry: AgentLogEntry): Promise<void> {
     const cap = AgentStore.RUN_LOG_ENTRY_MAX_BYTES;
+    const normalizedDetail = truncateAgentLogDetail(entry.detail, entry.type);
     const safeEntry: AgentLogEntry = {
       ...entry,
       text: entry.text.length > cap ? `${entry.text.slice(0, cap)}\n\n... (truncated, ${entry.text.length} chars)` : entry.text,
-      ...(entry.detail !== undefined && {
-        detail: entry.detail.length > cap ? `${entry.detail.slice(0, cap)}\n\n... (truncated, ${entry.detail.length} chars)` : entry.detail,
+      ...(normalizedDetail !== undefined && {
+        detail: normalizedDetail.length > cap ? `${normalizedDetail.slice(0, cap)}\n\n... (truncated, ${normalizedDetail.length} chars)` : normalizedDetail,
       }),
     };
     const line = JSON.stringify(safeEntry) + "\n";

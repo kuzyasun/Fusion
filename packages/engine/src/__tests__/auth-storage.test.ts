@@ -127,6 +127,48 @@ describe("createFusionAuthStorage", () => {
       expect(answer).toBe("browser");
     });
 
+    it("keeps select off hanging prompt channels and forwards device-code notifications intact", async () => {
+      const authStorage = createFusionAuthStorage();
+      const onSelect = vi.fn(async () => "device_code");
+      const onPrompt = vi.fn(async () => new Promise<string>(() => {}));
+      const onManualCodeInput = vi.fn(async () => new Promise<string>(() => {}));
+      const onDeviceCode = vi.fn();
+      const onAuth = vi.fn();
+      authStorage.setModelRuntime({
+        login: async (_provider: string, _type: string, interaction: {
+          prompt: (prompt: unknown) => Promise<string>;
+          notify: (event: unknown) => void;
+        }) => {
+          await interaction.prompt({
+            type: "select",
+            message: "Select OpenAI Codex login method:",
+            options: [{ id: "browser" }, { id: "device_code" }],
+          });
+          interaction.notify({
+            type: "device_code",
+            userCode: "ABCD-1234",
+            verificationUri: "https://auth.openai.com/codex/device",
+            intervalSeconds: 5,
+            expiresInSeconds: 900,
+          });
+        },
+      } as never);
+
+      await authStorage.login("openai-codex", { onSelect, onPrompt, onManualCodeInput, onDeviceCode, onAuth });
+
+      expect(onSelect).toHaveBeenCalledOnce();
+      expect(onPrompt).not.toHaveBeenCalled();
+      expect(onManualCodeInput).not.toHaveBeenCalled();
+      expect(onAuth).not.toHaveBeenCalled();
+      expect(onDeviceCode).toHaveBeenCalledWith({
+        type: "device_code",
+        userCode: "ABCD-1234",
+        verificationUri: "https://auth.openai.com/codex/device",
+        intervalSeconds: 5,
+        expiresInSeconds: 900,
+      });
+    });
+
     it("routes a manual_code prompt to the dedicated manual-code channel", async () => {
       const onManualCodeInput = vi.fn(async () => "code=abc&state=xyz");
       const onPrompt = vi.fn(async () => "wrong-channel");
@@ -448,6 +490,27 @@ describe("createFusionAuthStorage", () => {
       expect(await authStorage.getApiKey("anthropic-subscription")).toBe("subscription-access-token");
       expect(authStorage.hasAuth("anthropic")).toBe(true);
       expect(authStorage.list()).toEqual(expect.arrayContaining(["anthropic", "anthropic-subscription"]));
+    });
+
+    it("uses stored Anthropic subscription OAuth before a legacy OAuth shadow row", async () => {
+      writeFusionAuth(homeDir, {
+        anthropic: {
+          type: "oauth",
+          access: "legacy-shadow-access-token",
+          refresh: "legacy-shadow-refresh-token",
+          expires: Date.now() + 24 * 60 * 60_000,
+        },
+        "anthropic-subscription": {
+          type: "oauth",
+          access: "selected-subscription-access-token",
+          refresh: "selected-subscription-refresh-token",
+          expires: Date.now() + 3_600_000,
+        },
+      });
+
+      const authStorage = createFusionAuthStorage();
+
+      expect(await authStorage.getApiKey("anthropic")).toBe("selected-subscription-access-token");
     });
 
     it("exposes legacy Anthropic OAuth through the subscription provider without raw direct auth", async () => {
@@ -1140,6 +1203,57 @@ describe("createFusionAuthStorage", () => {
       refresh: "fresh-login-refresh-token",
       expires: expect.any(Number),
     });
+  });
+
+  it("renews expired Codex OAuth through the attached pi runtime and persists its later expiry", async () => {
+    const expired = Date.now() - 60_000;
+    writeFusionAuth(homeDir, {
+      "openai-codex": { type: "oauth", access: "old-access", refresh: "refresh-token", expires: expired },
+    });
+    const authStorage = createFusionAuthStorage();
+    const getAuth = vi.fn(async (providerId: string) => {
+      expect(providerId).toBe("openai-codex");
+      await authStorage.set("openai-codex", {
+        type: "oauth", access: "new-access", refresh: "rotated-refresh", expires: Date.now() + 3_600_000,
+      });
+      return {};
+    });
+    authStorage.setModelRuntime({ getAuth } as never);
+
+    await expect(authStorage.getApiKey("openai-codex")).resolves.toBe("new-access");
+    expect(getAuth).toHaveBeenCalledTimes(1);
+    expect(authStorage.get("openai-codex")).toMatchObject({ access: "new-access", expires: expect.any(Number) });
+  });
+
+  it("does not invoke pi for unrefreshable or malformed non-Anthropic OAuth credentials", async () => {
+    const getAuth = vi.fn();
+    writeFusionAuth(homeDir, {
+      "openai-codex": { type: "oauth", access: "old-access", expires: Date.now() - 60_000 },
+    });
+    const authStorage = createFusionAuthStorage();
+    authStorage.setModelRuntime({ getAuth } as never);
+    await expect(authStorage.getApiKey("openai-codex")).resolves.toBeUndefined();
+    await authStorage.set("openai-codex", { type: "oauth", access: "old-access", refresh: "refresh", expires: "invalid" as never });
+    await expect(authStorage.getApiKey("openai-codex")).resolves.toBeUndefined();
+    expect(getAuth).not.toHaveBeenCalled();
+  });
+
+  it("single-flights failed Codex runtime renewal and keeps Anthropic on its dedicated path", async () => {
+    writeFusionAuth(homeDir, {
+      "openai-codex": { type: "oauth", access: "old-access", refresh: "refresh", expires: Date.now() - 60_000 },
+      "anthropic-subscription": { type: "oauth", access: "old-anthropic", refresh: "refresh", expires: Date.now() - 60_000 },
+    });
+    const authStorage = createFusionAuthStorage();
+    const getAuth = vi.fn(async () => { throw new Error("refresh failed"); });
+    authStorage.setModelRuntime({ getAuth } as never);
+    await Promise.all([
+      authStorage.getApiKey("openai-codex"),
+      authStorage.getApiKey("openai-codex"),
+    ]);
+    await authStorage.getApiKey("openai-codex");
+    expect(getAuth).toHaveBeenCalledTimes(1);
+    await authStorage.getApiKey("anthropic-subscription");
+    expect(getAuth).toHaveBeenCalledTimes(1);
   });
 
   it("hydrates newer Codex CLI OAuth credentials into Fusion auth on reload", async () => {

@@ -11,6 +11,7 @@ vi.mock("../../../api", () => ({ getAgentActivity }));
 vi.mock("../../../sse-bus", () => ({ subscribeSse }));
 
 import { AgentActivityPanel } from "../AgentActivityPanel";
+import { resolveAgentActivityPresentation } from "../agentActivityPresentation";
 
 const range = { from: null, to: null, preset: "all" };
 const event = (seq: string, overrides: Partial<AgentActivityEvent> = {}): AgentActivityEvent => ({
@@ -33,6 +34,27 @@ describe("AgentActivityPanel", () => {
   beforeEach(() => {
     getAgentActivity.mockReset().mockResolvedValue({ events: [event("2")], nextCursor: null });
     subscribeSse.mockReset().mockReturnValue(vi.fn());
+  });
+
+  it("resolves and renders a not-run gate distinctly from a passed gate", async () => {
+    expect(resolveAgentActivityPresentation("workflow:gate-passed", { notRun: true })).toMatchObject({
+      labelKey: "commandCenter.agentActivity.workflowGateNotRun",
+      fallbackLabel: "Workflow gate not executed",
+      color: "var(--text-muted)",
+    });
+    getAgentActivity.mockResolvedValueOnce({
+      events: [event("2", {
+        type: "workflow:gate-passed",
+        summary: "Verification did not run",
+        metadata: { stepId: "custom", status: "skipped", attempt: 0, notRun: true },
+      })],
+      nextCursor: null,
+    });
+
+    render(<AgentActivityPanel projectId="project" range={range} />);
+
+    await screen.findByText("Workflow gate not executed");
+    expect(screen.queryByText("Workflow gate passed")).not.toBeInTheDocument();
   });
 
   it("renders a seeded live row and prepends an SSE row without refetching", async () => {
@@ -98,7 +120,7 @@ describe("AgentActivityPanel", () => {
     await screen.findByTestId("cc-area-agent-activity-empty");
     fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
     expect(screen.getByTestId("cc-area-agent-activity-empty")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Load older" })).toBeInTheDocument();
+    expect(screen.getByTestId("agent-activity-auto-pagination-sentinel")).toBeInTheDocument();
   });
 
   it("opens a task from its timeline row and retains a separate agent target", async () => {
@@ -136,12 +158,12 @@ describe("AgentActivityPanel", () => {
 
     await screen.findByText("Completed work 4");
     fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
-    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+    fireEvent.scroll(screen.getByTestId("agent-activity-auto-pagination-sentinel").closest("section")!);
 
     await waitFor(() => expect(getAgentActivity).toHaveBeenLastCalledWith(expect.objectContaining({ before: "3", limit: 50 })));
     await screen.findByText("Completed work 2");
     expect(screen.getAllByText("Completed work 3")).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: "Load older" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("agent-activity-auto-pagination-sentinel")).not.toBeInTheDocument();
   });
 
   it("refetches with each timeline filter and omits inactive filters", async () => {

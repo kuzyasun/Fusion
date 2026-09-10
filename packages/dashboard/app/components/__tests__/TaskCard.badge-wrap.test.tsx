@@ -22,6 +22,7 @@ vi.mock("lucide-react", () => ({
   Trash2: () => null,
   RotateCw: () => null,
   Zap: () => null,
+  ShieldCheck: () => null,
   AlertTriangle: () => null,
   ArrowDown: ({ style }: { style?: React.CSSProperties }) => <svg className="lucide-arrow-down" style={style} />,
   Flag: ({ style }: { style?: React.CSSProperties }) => <svg className="lucide-flag" style={style} />,
@@ -361,7 +362,6 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         })}
         onOpenDetail={noop}
         addToast={noop}
-        onArchiveTask={async () => makeTask()}
         workflowBadge={{ workflowId: "wf-fast-size", workflowName: "Fast size workflow" }}
       />,
     );
@@ -406,6 +406,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -461,6 +462,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -470,7 +472,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
 
     /*
      * FNXC:BoardCardActions 2026-07-16-02:24:
-     * FN-8080 preserves the FN-8035 done-card contract: Archive/Revert live in the three-dot
+     * FN-8080 preserves the done-card contract: Revert lives in the three-dot
      * card-menu-btn TaskContextMenu, so the trailing header actions expose the menu only.
      */
     const { container: doneContainer } = render(
@@ -480,10 +482,11 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
           column: "done",
           status: "done" as Task["status"],
           size: "S",
+          mergeDetails: { commitSha: "abc123" } as Task["mergeDetails"],
         })}
         onOpenDetail={noop}
+        onRevertTask={async () => ({ mode: "git", clean: true, revertCommitSha: "deadbeef" }) as any}
         addToast={noop}
-        onArchiveTask={async () => makeTask()}
       />,
     );
 
@@ -538,6 +541,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -557,6 +561,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetailWithTab={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -846,6 +851,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
         workflowBadge={{ workflowId: "wf-narrow", workflowName: "A workflow badge with an intentionally long name" }}
       />,
     );

@@ -58,7 +58,7 @@ export interface OverflowViewFeatureState {
 export interface OverflowViewRenderProps {
   projectId?: string;
   /** Per-task resolved column traits, threaded from App via useRightDockController. */
-  columnFlagsByTaskId?: ReadonlyMap<string, { complete?: boolean; archived?: boolean; countsTowardWip?: boolean; mergeBlocker?: boolean; humanReview?: boolean; intake?: boolean; hold?: boolean }>;
+  columnFlagsByTaskId?: ReadonlyMap<string, { complete?: boolean; countsTowardWip?: boolean; mergeBlocker?: boolean; humanReview?: boolean; intake?: boolean; hold?: boolean }>;
   /*
   FNXC:RightDockFiles 2026-06-22-15:00:
   `surface` tells a registry render function which host it is mounting into so it can pick a deterministic layout instead of relying on a fragile CSS container query.
@@ -85,6 +85,7 @@ export interface OverflowViewRenderProps {
   onReviseTask?: (task: Task | TaskDetail) => void;
   onUpdateTask?: (id: string, updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean; githubTracking?: { enabled?: boolean } }) => Promise<Task>;
   onDeleteTask?: (id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; githubIssueAction?: GithubIssueAction; allowResurrection?: boolean }) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
   onOpenDetail?: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
   onSendSelectionToTask?: (description: string) => void;
   onCreateTaskFromInsight?: (payload: { insightId: string; title: string; description: string }) => Promise<void> | void;
@@ -166,6 +167,7 @@ export const STATIC_OVERFLOW_VIEW_ENTRIES: readonly OverflowViewEntry[] = [
         onReviseTask={props.onReviseTask}
         onUpdateTask={props.onUpdateTask}
         onDeleteTask={props.onDeleteTask}
+        onOpenChatWithPrefill={props.onOpenChatWithPrefill}
         addToast={props.addToast}
         prAuthAvailable={false}
         autoMergeEnabled={false}

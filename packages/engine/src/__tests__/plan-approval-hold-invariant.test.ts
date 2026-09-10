@@ -30,8 +30,11 @@ automated surface that can advance a held card, and where each is covered:
      the scheduler's `reserveSlot` guard) — guarded there rather than inside
      `isUnplannedForExecution`, because an approval-held card is not "unplanned".
      Guarded again inside the `moveTaskIf` predicate so a park landing mid-sweep
-     cannot lose the race. Operator force-promote (`allowUnplanned`) deliberately
-     still passes: that IS a human decision about this card.   [describe #1]
+     cannot lose the race.
+
+FNXC:WorkflowScheduling 2026-08-29-00:24:
+     FN-245 removes the former operator waiver. Approval-held cards now remain
+     refused on every release surface, including explicit promote. [describe #1]
   2. continuation seed — `seedPreReleasePlanReviewContinuation` (normal
      completion) and `evaluateStrandedHoldContinuation` (FN-8592 self-healing
      re-seed). Both seeders, not just the one on the reported path. [describe #2]
@@ -85,6 +88,12 @@ import {
   type DuePlanningContinuationDrainDeps,
 } from "../runtimes/in-process-runtime.js";
 import { schedulerLog } from "../logger.js";
+import { flushAsyncHandlers } from "./_flush-async-handlers.js";
+import {
+  createPlanReviewApprovedState,
+  createPlanReviewRevisedState,
+  createSupersededPlanReviewApproval,
+} from "./_plan-review-outcome-states.js";
 
 const WF = "custom:planning-lane";
 
@@ -686,11 +695,15 @@ describe("#4b an approval decision removes the human-wait delay", () => {
     expect(kick).toHaveBeenCalledOnce();
   });
 
-  it("wires an approval task update through the runtime to the deferred continuation", async () => {
+  it("wires every durable approval disjunct through one runtime without an approval-held pre-event", async () => {
     const retryAfter = new Date(Date.now() + PARKED_CONTINUATION_DEFER_MS).toISOString();
     const transitionWorkflowWorkItem = vi.fn().mockResolvedValue(undefined);
     const store = Object.assign(new EventEmitter(), {
-      listWorkflowWorkItemsForTask: vi.fn().mockResolvedValue([dueItem({ retryAfter })]),
+      listWorkflowWorkItemsForTask: vi.fn(async (taskId: string) => [dueItem({
+        id: taskId === "FN-1" ? "wi-1" : `wi-${taskId}`,
+        taskId,
+        retryAfter,
+      })]),
       transitionWorkflowWorkItem,
     });
     const runtime = new InProcessRuntime({
@@ -703,8 +716,11 @@ describe("#4b an approval decision removes the human-wait delay", () => {
     const kick = vi.spyOn(runtime as any, "kickWorkflowContinuationProcessor").mockImplementation(() => undefined);
     (runtime as any).setupEventForwarding();
 
-    store.emit("task:updated", task({ status: "awaiting-approval" }));
-    store.emit("task:updated", task({ status: null, approvedPlanFingerprint: "approved" }));
+    const ordinaryApproval = createPlanReviewApprovedState({
+      id: "FN-1",
+      approvedPlanFingerprint: undefined,
+    });
+    store.emit("task:updated", ordinaryApproval);
 
     await vi.waitFor(() => expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
       "wi-1",
@@ -712,6 +728,48 @@ describe("#4b an approval decision removes the human-wait delay", () => {
       { expectedState: "runnable", retryAfter: null },
     ));
     expect(kick).toHaveBeenCalledOnce();
+
+    store.emit("task:updated", ordinaryApproval);
+    await flushAsyncHandlers();
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledTimes(1);
+    expect(kick).toHaveBeenCalledOnce();
+
+    store.emit("task:updated", createPlanReviewApprovedState({
+      id: "FN-FINGERPRINT",
+      approvedPlanFingerprint: "approved",
+      workflowStepResults: [],
+    }));
+    await vi.waitFor(() => expect(transitionWorkflowWorkItem).toHaveBeenCalledTimes(2));
+    expect(transitionWorkflowWorkItem).toHaveBeenLastCalledWith(
+      "wi-FN-FINGERPRINT",
+      "runnable",
+      { expectedState: "runnable", retryAfter: null },
+    );
+    expect(kick).toHaveBeenCalledTimes(2);
+
+    const negativeStates = [
+      createPlanReviewRevisedState({ id: "FN-REVISED", status: null }),
+      createSupersededPlanReviewApproval({ id: "FN-SUPERSEDED" }),
+      createPlanReviewApprovedState({ id: "FN-REPLANNING", status: "needs-replan" }),
+      createPlanReviewApprovedState({ id: "FN-PAUSED", paused: true }),
+      createPlanReviewApprovedState({ id: "FN-USER-PAUSED", userPaused: true }),
+      createPlanReviewApprovedState({ id: "FN-NO-PROOF", workflowStepResults: [] }),
+    ];
+    for (const candidate of negativeStates) store.emit("task:updated", candidate);
+    await flushAsyncHandlers();
+
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledTimes(2);
+    expect(kick).toHaveBeenCalledTimes(2);
+
+    store.emit("task:updated", task({ id: "FN-HELD", status: "awaiting-approval" }));
+    store.emit("task:updated", task({ id: "FN-HELD", status: null }));
+    await vi.waitFor(() => expect(transitionWorkflowWorkItem).toHaveBeenCalledTimes(3));
+    expect(transitionWorkflowWorkItem).toHaveBeenLastCalledWith(
+      "wi-FN-HELD",
+      "runnable",
+      { expectedState: "runnable", retryAfter: null },
+    );
+    expect(kick).toHaveBeenCalledTimes(3);
   });
 });
 

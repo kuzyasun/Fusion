@@ -1,8 +1,23 @@
 export { AgentLogger, type AgentLoggerOptions, summarizeToolArgs } from "./agents/agent-logger.js";
-export { PlanningResetFence, PLANNING_RESET_HOLD_MS } from "./planning-reset-fence.js";
-export { removeTaskResetWorktree, ResetWorktreeForeignSessionError } from "./worktree/remove-reset-worktree.js";
+export { isPlanningResetHoldClearingUpdate, PlanningResetFence, PLANNING_RESET_HOLD_MS } from "./planning-reset-fence.js";
+export { reconcileTaskResetSessionRoot, removeTaskResetWorktree, ResetWorktreeForeignSessionError } from "./worktree/remove-reset-worktree.js";
+export {
+  deleteTaskResetBranches,
+  planTaskResetBranchCleanup,
+  type TaskResetBlockedBranch,
+  type TaskResetBranchCleanupInput,
+  type TaskResetBranchCleanupOutcome,
+  type TaskResetDeletedBranch,
+  type TaskResetRetainedBranch,
+} from "./worktree/reset-branch-cleanup.js";
 export { ActiveSessionWorktreeRemovalError } from "./worktree/worktree-backend.js";
 export { planningLivenessRegistry, registerPlanningLivenessProbe, isPlanningLive } from "./agents/planning-liveness.js";
+export {
+  getTaskPlanningOrExecutionLivenessSignal,
+  isTaskPlanningOrExecutionLive,
+  type PlanningExecutionLivenessDeps,
+  type TaskLivenessSignal,
+} from "./agents/planning-execution-liveness.js";
 export {
   classifyReportHealth,
   type ReportHealthBucket,
@@ -18,6 +33,11 @@ export {
   setLocalDashboardPort,
   resetLocalDashboardPortForTests,
 } from "./local-dashboard-port.js";
+export {
+  CloudLinkPresence,
+  startCloudLinkPresence,
+  stopCloudLinkPresence,
+} from "./cloud-link-presence.js";
 export {
   DEFAULT_MODEL_REGISTRY_REFRESH_TIMEOUT_MS,
   boundExistingModelRegistryRefresh,
@@ -52,6 +72,7 @@ export {
   createTaskListTool,
   createTaskShowTool,
   createTaskSearchTool,
+  createHistoryReadTool,
   createTaskReadTools,
   createListAgentsTool,
   createDelegateTaskTool,
@@ -74,6 +95,8 @@ export {
   createTaskLogTool,
   createTaskLogsReadTool,
   normalizeAgentLogPaging,
+  AGENT_LOG_READ_DETAIL_PREVIEW_MAX,
+  buildTaskAgentLogReadText,
   renderAgentLogEntries,
   createSendMessageTool,
   createReadMessagesTool,
@@ -86,8 +109,6 @@ export {
   createWorkflowDeleteTool,
   createWorkflowSettingsTool,
   createTraitListTool,
-  createTaskArchiveTool,
-  createTaskUnarchiveTool,
   createTaskDeleteTool,
   createTaskRetryTool,
   createTaskPauseTool,
@@ -181,9 +202,15 @@ export {
 } from "./project/postgres-migration-notice.js";
 export { AgentSemaphore, PRIORITY_MERGE, PRIORITY_EXECUTE, PRIORITY_SPECIFY } from "./concurrency/concurrency.js";
 export { TriageProcessor, type TriageProcessorOptions } from "./triage.js";
+/* FNXC:WorkflowRevisionBudget 2026-09-05-23:30: the dashboard retry route stamps the ledger reset, so the marker helper is part of the engine's public surface. */
+export {
+  optionalStepRevisionResetOutcome,
+  OPTIONAL_STEP_REVISION_RESET_MARKER,
+} from "./executor/optional-step-revision.js";
 export { TaskExecutor, type TaskExecutorOptions } from "./executor.js";
 export {
   WorkflowGraphExecutor,
+  resolveColumnResumeNode,
   type WorkflowGraphExecutorDeps,
   type WorkflowGraphExecutorResult,
 } from "./workflows/workflow-graph-executor.js";
@@ -671,10 +698,10 @@ export {
 } from "./providers/index.js";
 export { activeSessionRegistry } from "./agents/active-session-registry.js";
 export {
-  WorktreePool,
   scanIdleWorktrees,
   cleanupOrphanedWorktrees,
   reapOrphanWorktrees,
+  getRegisteredWorktreePaths,
   getRegisteredWorktreeBranches,
 } from "./worktree/worktree-pool.js";
 export { removeWorktree, RemovalReason, type RemovalReason as WorktreeRemovalReason, type WorktreeRemoveOutcome } from "./worktree/worktree-backend.js";
@@ -696,7 +723,7 @@ export {
   type BranchConflictInspectionResult,
   type InspectBranchConflictInput,
 } from "./execution/branch-conflicts.js";
-export { generateReservedWorktreeName, generateWorktreeName, planTaskWorktreePath, slugify } from "./worktree/worktree-names.js";
+export { planTaskWorktreePath } from "./worktree/worktree-names.js";
 export { deriveJiraBranchName, normalizeJiraIssueKey } from "./worktree/jira-branch-name.js";
 export type { JiraBranchNameResult } from "./worktree/jira-branch-name.js";
 export { createLogger, type Logger } from "./logger.js";
@@ -1062,8 +1089,18 @@ export { applyUnavailableNodePolicy, type PolicyDecision } from "./project/node-
 export { PeerExchangeService, type PeerExchangeServiceOptions, type SyncResult } from "./project/peer-exchange-service.js";
 export {
   TunnelProcessManager,
+  RemoteTunnelService,
+  getRemoteTunnelService,
+  peekRemoteTunnelService,
+  remoteTunnelScopeKey,
+  shutdownRemoteTunnelService,
+  shutdownAllRemoteTunnels,
+  preserveRemoteTunnelForSupervisedRestart,
+  preserveAllRemoteTunnelsForSupervisedRestart,
+  __resetRemoteTunnelServicesForTests,
   getTunnelProviderAdapter,
   redactTunnelText,
+  type RemoteLifecycleEvaluation,
   type TunnelProcessManagerOptions,
   type CloudflareProviderConfig,
   type ManagedTunnelProcess,
@@ -1138,6 +1175,8 @@ export {
   findStagedNativeDir,
   findInstalledNodePtyNativeDir,
   getNativePrebuildName,
+  nodePtyPlatformPackageName,
+  describePtyLoadFailure,
   resetPtyModuleCacheForTests,
 } from "./cli-runtime/pty-native.js";
 // CLI agent executor — session manager (U2), telemetry hub (U3), state machine (U3),
@@ -1239,7 +1278,6 @@ export {
   genericCliAdapter,
   type CliAdapterDescriptor,
 } from "./cli-agent/adapters/index.js";
-export { installBaselineArchiveWorktreeDisposer } from "./healing/archive-worktree-disposer-install.js";
 export { MemoryConsolidationService, resolveMemoryConsolidationPorts } from "./memory/index.js";
 
 // CLI Agent Executor — task ↔ session orchestration (U7).

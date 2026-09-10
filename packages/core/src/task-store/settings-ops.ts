@@ -12,13 +12,13 @@ import { CONFIG_CHANGED_BY_SYSTEM } from "../types.js";
 import {DEFAULT_SETTINGS, isGlobalOnlySettingsKey} from "../types.js";
 import {MOVED_SETTINGS_KEYS, stripMovedSettingsKeys, patchContainsMovedKey} from "../config/moved-settings.js";
 import "../builtin-traits.js";
-import {validateLocale, assertWorktreeNamingRecycleExclusive} from "../config/settings-validation.js";
+import {validateLocale} from "../config/settings-validation.js";
 import { isTaskOutputLanguage } from "../ai/ai-output-language.js";
 import {hasSyncPassphraseConfigured} from "../secrets/secrets-sync-passphrase.js";
 import {ensureMemoryFileWithBackend} from "../memory/project-memory.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {canonicalizeSettings, isPlainObject, deepMergeWithNullDelete} from "../task-store/settings-helpers.js";
-import {readProjectConfig as readProjectConfigAsync, writeProjectConfig as writeProjectConfigAsync} from "../task-store/async/async-settings.js";
+import {acquireProjectConfigurationMutationLock, readProjectConfig as readProjectConfigAsync, writeProjectConfig as writeProjectConfigAsync} from "../task-store/async/async-settings.js";
 import {appendConfigurationRevision, createConfigurationRevision} from "../async-stores/async-configuration-revision-store.js";
 import {isValidProviderInstanceId} from "../provider-instance.js";
 import {applyWorkspaceModeToggle, withWorkspaceModeLock, type WorkspaceModeToggleOps} from "../git/git-repository.js";
@@ -57,6 +57,12 @@ filesystem failure. Keep this test-only ops seam at the universal publish bounda
 mocking applyWorkspaceModeToggle, which would bypass mirror, removal, re-read, and compensation.
 */
 let workspaceModeOpsForTesting: Partial<WorkspaceModeToggleOps> | undefined;
+let afterProjectConfigurationLockForTesting: (() => void | Promise<void>) | undefined;
+
+/** @internal Test-only concurrency barrier after the project configuration lock is held. */
+export function __setAfterProjectConfigurationLockForTesting(callback: (() => void | Promise<void>) | undefined): void {
+  afterProjectConfigurationLockForTesting = callback;
+}
 
 /** @internal Test-only workspace filesystem override for production-shaped settings writers. */
 export function __setWorkspaceModeOpsForTesting(ops: Partial<WorkspaceModeToggleOps> | undefined): void {
@@ -234,6 +240,8 @@ export async function updateSettingsImpl(store: TaskStore, patch: Partial<Settin
       */
       const layer = store.asyncLayer!;
       const transactionResult = await layer.transactionImmediate(async (tx) => {
+        await acquireProjectConfigurationMutationLock(tx, layer.projectId);
+        await afterProjectConfigurationLockForTesting?.();
         const projectConfig = await readProjectConfigAsync(layer, tx);
         const config: BoardConfig = {
           nextId: projectConfig.nextId ?? 1,
@@ -292,9 +300,6 @@ export async function updateSettingsImpl(store: TaskStore, patch: Partial<Settin
         keeps malformed enablement lists atomic across dashboard, CLI, and import writers.
         */
         await assertValidEnabledBuiltinWorkflowIds(store, updatedProjectSettings.enabledBuiltinWorkflowIds);
-        // FNXC:TaskPinnedWorktrees 2026-07-16-00:00: reject recycleWorktrees + worktreeNaming:"task-id"
-        // (mutually exclusive) against the resolved next state BEFORE persisting the invalid combination.
-        assertWorktreeNamingRecycleExclusive({ ...DEFAULT_SETTINGS, ...globalSettings, ...updatedProjectSettings } as Settings);
         /*
         FNXC:ConfigVersioning 2026-07-18-00:00:
         The project settings write and immutable revision share this existing

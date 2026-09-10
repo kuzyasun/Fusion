@@ -22,7 +22,7 @@ interface WorktreeGroupProps {
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
   workflowId?: string | null;
   onOpenRefine?: (task: Task | TaskDetail) => void;
-  onMoveTask?: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
+  onMoveTask?: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
   addToast: (message: string, type?: ToastType) => void;
   globalPaused?: boolean;
   onUpdateTask?: (
@@ -31,13 +31,11 @@ interface WorktreeGroupProps {
   ) => Promise<Task>;
   onPauseTask?: (id: string) => Promise<Task>;
   onRetryTask?: (id: string) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
   onUnpauseTask?: (id: string) => Promise<Task>;
-  onResetTask?: (id: string) => Promise<Task>;
-  onDuplicateTask?: (id: string) => Promise<Task>;
+  onResetTask?: (id: string, options?: { description?: string }) => Promise<Task>;
+  onDuplicateTask?: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   onMergeTask?: (id: string) => Promise<MergeResult>;
-  onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  onUnarchiveTask?: (id: string) => Promise<Task>;
-  /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside onArchiveTask/onUnarchiveTask. */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   onDeleteTask?: (id: string, options?: {
     removeDependencyReferences?: boolean;
@@ -85,12 +83,11 @@ function WorktreeGroupComponent({
   onUpdateTask,
   onPauseTask,
   onRetryTask,
+  onOpenChatWithPrefill,
   onUnpauseTask,
   onResetTask,
-  onDuplicateTask,
+    onDuplicateTask,
   onMergeTask,
-  onArchiveTask,
-  onUnarchiveTask,
   onRevertTask,
   onDeleteTask,
   onOpenDetailWithTab,
@@ -157,12 +154,11 @@ function WorktreeGroupComponent({
           onUpdateTask={onUpdateTask}
           onPauseTask={onPauseTask}
           onRetryTask={onRetryTask}
+          onOpenChatWithPrefill={onOpenChatWithPrefill}
           onUnpauseTask={onUnpauseTask}
-          onResetTask={onResetTask}
+                  onResetTask={onResetTask}
           onDuplicateTask={onDuplicateTask}
           onMergeTask={onMergeTask}
-          onArchiveTask={onArchiveTask}
-          onUnarchiveTask={onUnarchiveTask}
           onRevertTask={onRevertTask}
           onDeleteTask={onDeleteTask}
           onOpenDetailWithTab={onOpenDetailWithTab}
@@ -195,12 +191,11 @@ function WorktreeGroupComponent({
           onUpdateTask={onUpdateTask}
           onPauseTask={onPauseTask}
           onRetryTask={onRetryTask}
+          onOpenChatWithPrefill={onOpenChatWithPrefill}
           onUnpauseTask={onUnpauseTask}
-          onResetTask={onResetTask}
+                  onResetTask={onResetTask}
           onDuplicateTask={onDuplicateTask}
           onMergeTask={onMergeTask}
-          onArchiveTask={onArchiveTask}
-          onUnarchiveTask={onUnarchiveTask}
           onRevertTask={onRevertTask}
           onDeleteTask={onDeleteTask}
           onOpenDetailWithTab={onOpenDetailWithTab}

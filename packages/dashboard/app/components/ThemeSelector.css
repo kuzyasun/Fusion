@@ -342,6 +342,14 @@
   --swatch-sample-4: var(--flexoki-swatch-sample-4);
 }
 
+/* FNXC:DashboardTheming 2026-08-28-07:45: Cozy Cartoon maps only its global mode-specific cream, coral, and lavender samples so the pastel preview remains accurate before selection and stays synchronized with the persisted theme registry. */
+.theme-swatch-cozy-cartoon {
+  --swatch-sample-1: var(--cozy-cartoon-swatch-sample-1);
+  --swatch-sample-2: var(--cozy-cartoon-swatch-sample-2);
+  --swatch-sample-3: var(--cozy-cartoon-swatch-sample-3);
+  --swatch-sample-4: var(--cozy-cartoon-swatch-sample-4);
+}
+
 .theme-swatch-aurora {
   --swatch-sample-1: var(--aurora-swatch-sample-1);
   --swatch-sample-2: var(--aurora-swatch-sample-2);
@@ -725,6 +733,14 @@
   --swatch-sample-4: #9ca6b4;
 }
 
+/* FNXC:LiquidGlassTheme 2026-09-09-15:50: The shared four-sample swatch previews Liquid Glass depth and blue/cyan functional accents without depending on the currently active theme tokens. */
+.theme-swatch-liquid-glass {
+  --swatch-sample-1: oklch(0.18 0.025 255);
+  --swatch-sample-2: oklch(0.32 0.045 250);
+  --swatch-sample-3: oklch(0.72 0.16 245);
+  --swatch-sample-4: oklch(0.78 0.14 205);
+}
+
 .theme-swatch-horizon {
   --swatch-sample-1: #1c1e26;
   --swatch-sample-2: #16161c;
@@ -1092,6 +1108,13 @@
   --swatch-sample-4: #747f8c;
 }
 
+[data-theme="light"] .theme-swatch-liquid-glass {
+  --swatch-sample-1: oklch(0.955 0.012 245);
+  --swatch-sample-2: oklch(0.985 0.01 245);
+  --swatch-sample-3: oklch(0.55 0.19 250);
+  --swatch-sample-4: oklch(0.55 0.15 215);
+}
+
 [data-theme="light"] .theme-swatch-slate {
   --swatch-sample-1: #f1f5f9;
   --swatch-sample-2: #e2e8f0;
@@ -1244,6 +1267,14 @@
   --swatch-sample-2: var(--flexoki-swatch-sample-2);
   --swatch-sample-3: var(--flexoki-swatch-sample-3);
   --swatch-sample-4: var(--flexoki-swatch-sample-4);
+}
+
+/* FNXC:DashboardTheming 2026-08-28-07:45: The light selector chip resolves the Cozy Cartoon flagship pastel samples globally instead of borrowing active-theme colors. */
+[data-theme="light"] .theme-swatch-cozy-cartoon {
+  --swatch-sample-1: var(--cozy-cartoon-swatch-sample-1);
+  --swatch-sample-2: var(--cozy-cartoon-swatch-sample-2);
+  --swatch-sample-3: var(--cozy-cartoon-swatch-sample-3);
+  --swatch-sample-4: var(--cozy-cartoon-swatch-sample-4);
 }
 
 [data-theme="light"] .theme-swatch-aurora {

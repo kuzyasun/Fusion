@@ -56,7 +56,7 @@ Show full details for a task including steps, progress, and log entries.
 
 ### fn_task_logs_read
 
-Read a task's full persisted agent log with pagination and optional type filtering.
+Read a task's persisted agent log with pagination and optional type filtering. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response remains bounded.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -64,6 +64,7 @@ Read a task's full persisted agent log with pagination and optional type filteri
 | `limit` | number | — | Maximum matching entries to return (default 100). |
 | `offset` | number | — | Number of matching entries to skip from newest (default 0). |
 | `type` | union | — | Only return entries of this agent-log type. |
+| `detail` | union | — | Tool-detail mode. Preview (default) bounds each detail row; full lifts that row preview while the whole response remains bounded. |
 
 ### fn_task_attach
 
@@ -123,23 +124,6 @@ Request a refinement of a completed or in-review task. Creates a new follow-up t
 |-----------|------|----------|-------------|
 | `id` | string | ✓ | Task ID to refine (e.g. FN-001). Must be in 'done' or 'in-review' column. |
 | `feedback` | string | ✓ | Description of what needs to be refined or improved |
-
-### fn_task_archive
-
-Archive a task from any live column (move to archived). Archived tasks are preserved for historical reference but moved out of the main board view. If the task is still referenced as a lineage parent by another task, archiving is rejected unless removeLineageReferences:true is passed.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string | ✓ | Task ID to archive from any live column (e.g. FN-001). |
-| `removeLineageReferences` | boolean | — | When true, clear incoming lineage-parent references (child sourceParentTaskId) before archiving, so a task still referenced as a lineage parent can be archived. |
-
-### fn_task_unarchive
-
-Unarchive an archived task (move from archived → its restore column). Restores to the pre-archive column when available, with active execution columns downgraded to todo.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string | ✓ | Task ID to unarchive (e.g. FN-001). Must be in 'archived' column. |
 
 ### fn_task_delete
 
@@ -520,7 +504,7 @@ Activate a pending slice for implementation. Sets status to 'active' and enables
 
 ### fn_feature_link_task
 
-Link a feature to a fn task for implementation. Updates the feature status to 'triaged' and associates it with the task. If the target task is not on the active board (for example archived, deleted, or never created), the tool returns a clear validation error indicating that only active tasks can be linked.
+Link a feature to a fn task for implementation. Updates the feature status to 'triaged' and associates it with the task. If the target task is not on the active board (for example deleted, historical, or never created), the tool returns a clear validation error indicating that only active tasks can be linked.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

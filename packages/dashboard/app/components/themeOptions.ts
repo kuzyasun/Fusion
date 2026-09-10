@@ -54,6 +54,8 @@ export const COLOR_THEMES: { value: ColorTheme; label: string; className: string
   { value: "terminal", label: "Terminal", className: "theme-swatch-terminal" },
   { value: "glass", label: "Glass", className: "theme-swatch-glass" },
   { value: "glass-silver", label: "Glass Silver", className: "theme-swatch-glass-silver" },
+  // FNXC:LiquidGlassTheme 2026-09-09-15:50: Both Settings and Command Center discover Liquid Glass through this shared metadata entry, preserving one selectable affordance and the canonical persisted order.
+  { value: "liquid-glass", label: "Liquid Glass", className: "theme-swatch-liquid-glass" },
   { value: "horizon", label: "Horizon", className: "theme-swatch-horizon" },
   { value: "vitesse", label: "Vitesse", className: "theme-swatch-vitesse" },
   { value: "outrun", label: "Outrun", className: "theme-swatch-outrun" },
@@ -86,6 +88,7 @@ export const COLOR_THEMES: { value: ColorTheme; label: string; className: string
   { value: "iceberg", label: "Iceberg", className: "theme-swatch-iceberg" },
   // FNXC:DashboardTheming 2026-08-27-04:23: Flexoki follows Iceberg in this shared selector source so Settings and Command Center preserve the persisted registry order and swatch mapping.
   { value: "flexoki", label: "Flexoki", className: "theme-swatch-flexoki" },
+  { value: "cozy-cartoon", label: "Cozy Cartoon", className: "theme-swatch-cozy-cartoon" },
   { value: "factory-dark", label: "Factory Dark", className: "theme-swatch-factory-dark" },
   { value: "factory-light", label: "Factory Light", className: "theme-swatch-factory-light" },
   { value: "shadcn", label: "Shadcn", className: "theme-swatch-shadcn" },

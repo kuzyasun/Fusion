@@ -3,6 +3,12 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { FusionAuthStorage } from "../auth/auth-storage.js";
 import { wrapAuthStorageWithApiKeyProviders } from "../auth/provider-auth.js";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
 function storageFixture() {
   const credential = { type: "api_key" as const, key: "secret", label: "Second account" };
   return {
@@ -70,6 +76,282 @@ describe("DashboardAuthStorage instance facade", () => {
   storage row. Passing the storage row id to the runtime login fails with
   `Unknown provider: anthropic-subscription` because pi never registers that id as a provider.
   */
+  it("refuses an Anthropic second account when consent re-authorizes the stored account", async () => {
+    const subscriptionRows = new Map([["acct-a", { type: "oauth", access: "A-access", refresh: "A-refresh", expires: Date.now() + 60_000, label: "Account A" }]]);
+    let defaultId = "acct-a";
+    const rawRows = new Map<string, { type: string; access?: string; refresh?: string; expires?: number }>();
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn((providerId: string) => providerId === "anthropic-subscription"
+        ? { providerId, instanceId: defaultId }
+        : undefined),
+      listInstances: vi.fn((providerId: string) => providerId === "anthropic-subscription"
+        ? Array.from(subscriptionRows.keys(), (instanceId) => ({ providerId, instanceId }))
+        : []),
+      getInstance: vi.fn((ref: { instanceId: string }) => subscriptionRows.get(ref.instanceId)),
+      get: vi.fn((providerId: string) => rawRows.get(providerId)),
+      login: vi.fn(async () => {
+        // The provider wrote the already-authorized account through its bare upstream slot.
+        rawRows.set("anthropic", { type: "oauth", access: "A-access", refresh: "A-refresh", expires: Date.now() + 60_000 });
+      }),
+      set: vi.fn(async (_providerId: string, credential: { type: string; access?: string; refresh?: string; expires?: number }) => {
+        subscriptionRows.set(defaultId, credential);
+      }),
+      remove: vi.fn(async (providerId: string) => { rawRows.delete(providerId); }),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: typeof subscriptionRows extends Map<string, infer Value> ? Value : never) => {
+        subscriptionRows.set(ref.instanceId, credential);
+      }),
+    };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+
+    await expect(facade.loginInstance?.({ providerId: "anthropic", instanceId: "acct-b" }, {} as never, "Second account"))
+      .rejects.toThrow("Account A");
+    expect(subscriptionRows.has("acct-b")).toBe(false);
+    expect(subscriptionRows.get("acct-a")?.refresh).toBe("A-refresh");
+    expect(defaultId).toBe("acct-a");
+  });
+
+  it("keeps an expired Anthropic instance label and metadata when reauthorizing without a label", async () => {
+    const oldExpires = Date.now() - 60_000;
+    const newExpires = Date.now() + 60_000;
+    const subscriptionRows = new Map<string, Record<string, unknown>>([
+      ["acct-work", {
+        type: "oauth", access: "old-access", refresh: "old-refresh", expires: oldExpires,
+        scopes: ["old-scope"], accountFingerprint: "old-fingerprint", label: "Work", customMetadata: "retained",
+      }],
+      ["acct-personal", { type: "oauth", access: "personal-access", refresh: "personal-refresh", expires: newExpires, label: "Personal" }],
+    ]);
+    let defaultId = "acct-work";
+    const rawRows = new Map<string, Record<string, unknown>>();
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn((providerId: string) => providerId === "anthropic-subscription"
+        ? { providerId, instanceId: defaultId }
+        : undefined),
+      listInstances: vi.fn((providerId: string) => providerId === "anthropic-subscription"
+        ? Array.from(subscriptionRows.keys(), (instanceId) => ({ providerId, instanceId }))
+        : []),
+      getInstance: vi.fn((ref: { instanceId: string }) => subscriptionRows.get(ref.instanceId)),
+      get: vi.fn((providerId: string) => rawRows.get(providerId) ?? subscriptionRows.get(defaultId)),
+      login: vi.fn(async () => {
+        rawRows.set("anthropic", { type: "oauth", access: "new-access", refresh: "new-refresh", expires: newExpires, scopes: ["new-scope"] });
+      }),
+      set: vi.fn(async (providerId: string, credential: Record<string, unknown>) => {
+        if (providerId === "anthropic-subscription") subscriptionRows.set(defaultId, credential);
+        else rawRows.set(providerId, credential);
+      }),
+      remove: vi.fn(async (providerId: string) => { rawRows.delete(providerId); }),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: Record<string, unknown>) => subscriptionRows.set(ref.instanceId, credential)),
+    };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+
+    await facade.loginInstance?.({ providerId: "anthropic", instanceId: "acct-work" }, {} as never);
+
+    expect(subscriptionRows.get("acct-work")).toEqual({
+      type: "oauth", access: "new-access", refresh: "new-refresh", expires: newExpires, scopes: ["new-scope"],
+      label: "Work", customMetadata: "retained", accountFingerprint: expect.any(String),
+    });
+    expect(subscriptionRows.get("acct-work")?.access).not.toBe("old-access");
+    expect(subscriptionRows.get("acct-personal")?.label).toBe("Personal");
+
+    await facade.login?.("anthropic", {} as never);
+    expect(subscriptionRows.get("acct-work")?.label).toBe("Work");
+    expect(subscriptionRows.get("acct-work")?.customMetadata).toBe("retained");
+  });
+
+  it("preserves metadata and replaces stale material across non-Anthropic login surfaces", async () => {
+    const newExpires = Date.now() + 60_000;
+    const providerRows = new Map<string, Record<string, unknown>>([
+      ["openai-codex", { type: "api_key", key: "old-key", label: "Bare", customMetadata: "bare-extra", accountFingerprint: "old-fingerprint" }],
+    ]);
+    const instanceRows = new Map<string, Record<string, unknown>>([
+      ["acct-work", { type: "api_key", key: "old-key", label: "Work", customMetadata: "instance-extra", accountId: "old-account" }],
+    ]);
+    let defaultId: string | undefined = "acct-work";
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn((providerId: string) => defaultId ? { providerId, instanceId: defaultId } : undefined),
+      listInstances: vi.fn((providerId: string) => providerId === "openai-codex"
+        ? Array.from(instanceRows.keys(), (instanceId) => ({ providerId, instanceId }))
+        : []),
+      getInstance: vi.fn((ref: { instanceId: string }) => instanceRows.get(ref.instanceId)),
+      get: vi.fn((providerId: string) => providerRows.get(providerId)),
+      login: vi.fn(async (providerId: string) => {
+        if (providerId === "openai-codex") {
+          providerRows.set(providerId, { type: "oauth", access: "new-instance-access", refresh: "new-instance-refresh", expires: newExpires });
+        }
+      }),
+      set: vi.fn(async (providerId: string, credential: Record<string, unknown>) => providerRows.set(providerId, credential)),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: Record<string, unknown>) => instanceRows.set(ref.instanceId, credential)),
+      setDefaultInstance: vi.fn(async (ref: { instanceId: string }) => { defaultId = ref.instanceId; }),
+    };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+
+    await facade.loginInstance?.({ providerId: "openai-codex", instanceId: "acct-work" }, {} as never, "Renamed Work");
+    expect(instanceRows.get("acct-work")).toEqual({
+      type: "oauth", access: "new-instance-access", refresh: "new-instance-refresh", expires: newExpires,
+      label: "Renamed Work", customMetadata: "instance-extra", accountFingerprint: expect.any(String),
+    });
+    expect(instanceRows.get("acct-work")).not.toHaveProperty("key");
+    expect(instanceRows.get("acct-work")).not.toHaveProperty("accountId");
+
+    defaultId = "acct-work";
+    await facade.login?.("openai-codex", {} as never);
+    expect(providerRows.get("openai-codex")).toEqual({
+      type: "oauth", access: "new-instance-access", refresh: "new-instance-refresh", expires: newExpires,
+      label: "Bare", customMetadata: "bare-extra", accountFingerprint: expect.any(String),
+    });
+
+    instanceRows.clear();
+    defaultId = undefined;
+    await facade.loginInstance?.({ providerId: "openai-codex", instanceId: "first-login" }, {} as never);
+    expect(instanceRows.get("first-login")).toEqual({
+      type: "oauth", access: "new-instance-access", refresh: "new-instance-refresh", expires: newExpires,
+      accountFingerprint: expect.any(String),
+    });
+  });
+
+  it("accepts first named login and removes the adapter ghost default", async () => {
+    const credentials = new Map<string, { type: "oauth"; access: string; refresh: string; expires: number }>();
+    let defaultId: string | undefined;
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn((providerId: string) => defaultId ? { providerId, instanceId: defaultId } : undefined),
+      listInstances: vi.fn((providerId: string) => Array.from(credentials.keys(), (instanceId) => ({ providerId, instanceId }))),
+      getInstance: vi.fn((ref: { instanceId: string }) => credentials.get(ref.instanceId)),
+      get: vi.fn((_providerId: string) => defaultId ? credentials.get(defaultId) : undefined),
+      login: vi.fn(async () => {
+        defaultId = "default";
+        credentials.set("default", { type: "oauth", access: "first-access", refresh: "first-refresh", expires: Date.now() + 60_000 });
+      }),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: { type: "oauth"; access: string; refresh: string; expires: number }) => credentials.set(ref.instanceId, credential)),
+      removeInstance: vi.fn(async (ref: { instanceId: string }) => { credentials.delete(ref.instanceId); if (defaultId === ref.instanceId) defaultId = undefined; }),
+      setDefaultInstance: vi.fn(async (ref: { instanceId: string }) => { defaultId = ref.instanceId; }),
+    };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+    await expect(facade.loginInstance?.({ providerId: "openai-codex", instanceId: "acct-first" }, {} as never)).resolves.toBeUndefined();
+    expect(credentials.get("acct-first")?.refresh).toBe("first-refresh");
+    expect(credentials.has("default")).toBe(false);
+    expect(defaultId).toBe("acct-first");
+  });
+
+  it("uses the minted credential and restores the overwritten previous default", async () => {
+    const credentials = new Map<string, { type: "oauth"; access: string; refresh: string; expires: number }>([
+      ["acct-a", { type: "oauth", access: "A-access", refresh: "A-refresh", expires: Date.now() + 60_000 }],
+    ]);
+    let defaultId = "acct-a";
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn((providerId: string) => ({ providerId, instanceId: defaultId })),
+      listInstances: vi.fn((providerId: string) => Array.from(credentials.keys(), (instanceId) => ({ providerId, instanceId }))),
+      getInstance: vi.fn((ref: { instanceId: string }) => credentials.get(ref.instanceId)),
+      get: vi.fn((_providerId: string) => credentials.get(defaultId)),
+      login: vi.fn(async () => credentials.set(defaultId, { type: "oauth", access: "B-access", refresh: "B-refresh", expires: Date.now() + 60_000 })),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: { type: "oauth"; access: string; refresh: string; expires: number }) => credentials.set(ref.instanceId, credential)),
+    };
+    const fallback = { reload: vi.fn(), hasAuth: vi.fn(() => true), getApiKey: vi.fn(), get: vi.fn(() => ({ type: "oauth", access: "fallback-access", refresh: "fallback-refresh", expires: Date.now() + 120_000 })), getAll: vi.fn(() => ({})), list: vi.fn(() => []) };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry, [fallback]);
+    await facade.loginInstance?.({ providerId: "openai-codex", instanceId: "acct-b" }, {} as never);
+    expect(credentials.get("acct-b")?.refresh).toBe("B-refresh");
+    expect(credentials.get("acct-a")?.refresh).toBe("A-refresh");
+  });
+
+  it("allows same-instance reauthorization but refuses a different pre-existing account", async () => {
+    const credentials = new Map<string, { type: "oauth"; access: string; refresh: string; expires: number; label?: string }>([
+      ["acct-a", { type: "oauth", access: "A", refresh: "A-refresh", expires: Date.now() + 60_000 }],
+      ["acct-c", { type: "oauth", access: "C", refresh: "C-refresh", expires: Date.now() + 60_000, label: "Account C" }],
+    ]);
+    let defaultId = "acct-a";
+    let reauthorizeAsC = false;
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn((providerId: string) => ({ providerId, instanceId: defaultId })),
+      listInstances: vi.fn((providerId: string) => Array.from(credentials.keys(), (instanceId) => ({ providerId, instanceId }))),
+      getInstance: vi.fn((ref: { instanceId: string }) => credentials.get(ref.instanceId)),
+      get: vi.fn(() => credentials.get(defaultId)),
+      login: vi.fn(async () => {
+        if (!reauthorizeAsC) return;
+        credentials.set(defaultId, { type: "oauth", access: "C", refresh: "C-refresh", expires: Date.now() + 60_000 });
+      }),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: { type: "oauth"; access: string; refresh: string; expires: number; label?: string }) => credentials.set(ref.instanceId, credential)),
+    };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+    await expect(facade.loginInstance?.({ providerId: "openai-codex", instanceId: "acct-a" }, {} as never)).resolves.toBeUndefined();
+    reauthorizeAsC = true;
+    await expect(facade.loginInstance?.({ providerId: "openai-codex", instanceId: "acct-a" }, {} as never))
+      .rejects.toThrow("Account C");
+    expect(credentials.get("acct-a")?.refresh).toBe("A-refresh");
+  });
+
+  it("does nothing when login yields no credential and skips unreadable or API-key rows", async () => {
+    const oauth = { type: "oauth", access: "new-access", refresh: "new-refresh", expires: Date.now() + 60_000 } as const;
+    const credentials = new Map<string, typeof oauth>([["acct-a", oauth]]);
+    const storage = {
+      ...storageFixture(),
+      getDefaultInstance: vi.fn(() => ({ providerId: "openai-codex", instanceId: "acct-a" })),
+      listInstances: vi.fn(() => [
+        { providerId: "openai-codex", instanceId: "acct-a" },
+        { providerId: "openai-codex", instanceId: "unreadable" },
+        { providerId: "openai-codex", instanceId: "api-key" },
+      ]),
+      getInstance: vi.fn((ref: { instanceId: string }) => ref.instanceId === "unreadable"
+        ? undefined
+        : ref.instanceId === "api-key"
+          ? { type: "api_key", key: "secret" }
+          : credentials.get(ref.instanceId)),
+      get: vi.fn(() => undefined),
+      login: vi.fn(async () => {}),
+      setInstance: vi.fn(async (ref: { instanceId: string }, credential: typeof oauth) => credentials.set(ref.instanceId, credential)),
+    };
+    const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+    await expect(facade.loginInstance?.({ providerId: "openai-codex", instanceId: "acct-b" }, {} as never)).resolves.toBeUndefined();
+    expect(credentials.has("acct-b")).toBe(false);
+  });
+
+  it("serializes concurrent instance logins per provider in either request order", async () => {
+    for (const [firstId, secondId] of [["acct-b", "acct-c"], ["acct-c", "acct-b"]]) {
+      const credentials = new Map<string, { type: "oauth"; access: string; refresh: string; expires: number }>([
+        ["acct-a", { type: "oauth", access: "A-access", refresh: "A-refresh", expires: Date.now() + 60_000 }],
+      ]);
+      let defaultId = "acct-a";
+      const gates = [
+        deferred<{ type: "oauth"; access: string; refresh: string; expires: number }>(),
+        deferred<{ type: "oauth"; access: string; refresh: string; expires: number }>(),
+      ];
+      let loginCount = 0;
+      const storage = {
+        ...storageFixture(),
+        getDefaultInstance: vi.fn((providerId: string) => ({ providerId, instanceId: defaultId })),
+        listInstances: vi.fn((providerId: string) => Array.from(credentials.keys(), (instanceId) => ({ providerId, instanceId }))),
+        getInstance: vi.fn((ref: { instanceId: string }) => credentials.get(ref.instanceId)),
+        get: vi.fn(() => credentials.get(defaultId)),
+        login: vi.fn(async () => {
+          const gate = gates[loginCount++];
+          const credential = await gate!.promise;
+          credentials.set(defaultId, credential);
+        }),
+        setInstance: vi.fn(async (ref: { instanceId: string }, credential: { type: "oauth"; access: string; refresh: string; expires: number }) => credentials.set(ref.instanceId, credential)),
+      };
+      const facade = wrapAuthStorageWithApiKeyProviders(storage as unknown as FusionAuthStorage, {} as ModelRegistry);
+      const firstLogin = facade.loginInstance?.({ providerId: "openai-codex", instanceId: firstId }, {} as never);
+      await Promise.resolve();
+      const secondLogin = facade.loginInstance?.({ providerId: "openai-codex", instanceId: secondId }, {} as never);
+      await Promise.resolve();
+      expect(storage.login).toHaveBeenCalledTimes(1);
+
+      gates[0]!.resolve({ type: "oauth", access: "B-access", refresh: "B-refresh", expires: Date.now() + 60_000 });
+      await firstLogin;
+      await Promise.resolve();
+      expect(storage.login).toHaveBeenCalledTimes(2);
+
+      gates[1]!.resolve({ type: "oauth", access: "C-access", refresh: "C-refresh", expires: Date.now() + 60_000 });
+      await secondLogin;
+      expect(credentials.get(firstId)?.refresh).toBe("B-refresh");
+      expect(credentials.get(secondId)?.refresh).toBe("C-refresh");
+      expect(credentials.get("acct-a")?.refresh).toBe("A-refresh");
+    }
+  });
+
   it("routes Anthropic subscription instance login through the upstream anthropic provider", async () => {
     const rows = new Map<string, { type: string; key?: string; expires?: number }>();
     const storage = {

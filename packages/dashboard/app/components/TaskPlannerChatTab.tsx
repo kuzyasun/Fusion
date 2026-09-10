@@ -1,4 +1,4 @@
-import type { ChatInFlightGenerationState, ChatMessage, ResolvedModelSelection, Settings, Task, TaskDetail } from "@fusion/core";
+import type { ChatInFlightGenerationState, ChatMessage, ChatSnippet, ResolvedModelSelection, Settings, Task, TaskDetail } from "@fusion/core";
 import { isWipColumnRole } from "../utils/columnRoles";
 import { getErrorMessage, isExperimentalFeatureEnabled, CHAT_FOCUS_FLAG } from "@fusion/core";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -6,6 +6,7 @@ import { Loader2, Maximize2, Minimize2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ToastType } from "../hooks/useToast";
 import { useComposerDictation } from "../hooks/useComposerDictation";
+import { useVirtualizedChatTranscript } from "../hooks/useVirtualizedChatTranscript";
 import { getPersistedPendingChatMessages, setPersistedPendingChatMessages } from "../hooks/chatPendingMessageStorage";
 import { MicButton } from "./MicButton";
 import type { ChatMessageInfo, ToolCallInfo } from "../hooks/chatTypes";
@@ -15,10 +16,13 @@ import { ChatQuestionResponse } from "./ChatQuestionResponse";
 import { PendingChatMessageQueue } from "./PendingChatMessageQueue";
 import { ProviderIcon } from "./ProviderIcon";
 import { ChatThinkingLevelControl } from "./ChatThinkingLevelControl";
-import { useModelsCache } from "../hooks/useModelsCache";
+import { useFavorites } from "../hooks/useFavorites";
+import { useChatSnippets } from "../hooks/useChatSnippetsCache";
 import { StandardChatActionButton, StandardChatMessageItem, StandardStreamingMessage, formatModelTag } from "./StandardChatSurface";
 import { filterChatCommands, getSlashTriggerMatch, matchChatCommand, selectChatCommands, type ChatCommand } from "./chat-commands";
+import { applySnippetToDraft, filterChatSnippets, matchStandaloneSnippetInvocation } from "./chat-snippets";
 import { useChatMessageLayout } from "../context/ChatMessageLayoutContext";
+import { useChatEnterSubmits } from "../context/ChatSubmitOnEnterContext";
 import {
   createChatInputAutosizeController,
   type ChatInputAutosizeController,
@@ -40,6 +44,10 @@ interface TaskPlannerChatTabProps {
 }
 
 type ComposerState = "idle" | "sending";
+
+type PlannerSlashMenuEntry =
+  | { kind: "command"; command: ChatCommand }
+  | { kind: "snippet"; snippet: ChatSnippet };
 
 type PendingQueueReservation = {
   sessionId: string;
@@ -118,7 +126,10 @@ function isUsableModel(model: ResolvedModelSelection): model is ResolvedModelSel
 }
 
 function sortMessages(messages: ChatMessage[]): ChatMessage[] {
-  return [...messages].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  return [...messages].sort((a, b) => {
+    const createdOrder = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+    return createdOrder || a.id.localeCompare(b.id);
+  });
 }
 
 function makeOptimisticUserMessage(sessionId: string, content: string): ChatMessage {
@@ -332,6 +343,7 @@ function buildPlannerQuestionRenderStates(messages: readonly ChatMessage[]): Map
 export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expanded = false, onExpandedChange, taskChatModel, addToast, onTaskUpdated }: TaskPlannerChatTabProps) {
   const { t } = useTranslation("app");
   const chatMessageLayout = useChatMessageLayout();
+  const enterSubmits = useChatEnterSubmits();
   const [sessionId, setSessionId] = useState<string | null>(null);
   /*
   FNXC:ChatMemoryFocus 2026-08-13:
@@ -348,6 +360,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const autosizeRef = useRef<ChatInputAutosizeController | null>(null);
   const dictation = useComposerDictation({ textareaRef: composerTextareaRef, value: draft, onChange: setDraft, projectId });
+  const chatSnippets = useChatSnippets();
   const [showCommandMenu, setShowCommandMenu] = useState(false);
   const [commandFilter, setCommandFilter] = useState("");
   const [highlightedCommandIndex, setHighlightedCommandIndex] = useState(0);
@@ -355,6 +368,8 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
   const [composerState, setComposerState] = useState<ComposerState>("idle");
   const composerStateRef = useRef<ComposerState>("idle");
   const [loading, setLoading] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const streamRef = useRef<{ close: () => void } | null>(null);
@@ -370,6 +385,12 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
   } | null>(null);
   const cancellationInProgressRef = useRef<Promise<void> | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const historySentinelRef = useRef<HTMLDivElement | null>(null);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const transcriptKeys = useMemo(() => messages.map((message) => message.id), [messages]);
+  const virtualTranscript = useVirtualizedChatTranscript({ transcriptKey: sessionId, keys: transcriptKeys, scrollRef: transcriptRef });
+  const paginationInFlightRef = useRef<Promise<void> | null>(null);
   const [isTranscriptAtBottom, setIsTranscriptAtBottom] = useState(true);
   const isTranscriptAtBottomRef = useRef(true);
   const previousMessageCountRef = useRef(0);
@@ -406,7 +427,23 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
   const selectedChatCommands = useMemo(() => selectChatCommands({ chatFocusEnabled }), [chatFocusEnabled]);
   const [sessionModel, setSessionModel] = useState<ResolvedModelSelection & { thinkingLevel?: string }>(taskChatModel);
   const hasLocalTargetOverrideRef = useRef(false);
-  const { models, favoriteProviders, favoriteModels } = useModelsCache();
+  const {
+    availableModels: models,
+    favoriteProviders,
+    favoriteModels,
+    toggleFavoriteProvider,
+    toggleFavoriteModel,
+  } = useFavorites();
+  const handleToggleFavoriteProvider = useCallback((provider: string) => {
+    void toggleFavoriteProvider(provider).catch(() => {
+      addToastRef.current(t("models.errors.failedUpdateFavorites", "Failed to update favorites"), "error");
+    });
+  }, [t, toggleFavoriteProvider]);
+  const handleToggleFavoriteModel = useCallback((modelId: string) => {
+    void toggleFavoriteModel(modelId).catch(() => {
+      addToastRef.current(t("models.errors.failedUpdateModelFavorites", "Failed to update model favorites"), "error");
+    });
+  }, [t, toggleFavoriteModel]);
   const displayedModel = sessionModel;
   const displayedModelProvider = isUsableModel(displayedModel) ? displayedModel.provider : undefined;
   const displayedModelId = isUsableModel(displayedModel) ? displayedModel.modelId : undefined;
@@ -528,8 +565,8 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
    * FNXC:TaskPlannerChatSlashCommands 2026-07-08-00:00:
    * /steer is only dispatchable when this task's bound agent is actively
    * running (task.column === "in-progress"), mirroring how TaskChatTab gates
-   * its own done-task affordance on task.column. Any other state (todo,
-   * in-review, done, archived, triage) shows the command in the menu but
+   * its own completed-task affordance on task.column. Any non-WIP state, including
+   * intake, hold, review, and Complete, shows the command in the menu but
    * disabled with a hint instead of hiding it outright, and dispatch itself
    * is refused with the same hint rather than silently sending plain chat.
    */
@@ -544,6 +581,14 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
     () => filterChatCommands(commandFilter, selectedChatCommands),
     [commandFilter, selectedChatCommands],
   );
+  const filteredSnippets = useMemo(
+    () => filterChatSnippets(commandFilter, chatSnippets),
+    [chatSnippets, commandFilter],
+  );
+  const slashMenuEntries = useMemo<PlannerSlashMenuEntry[]>(() => [
+    ...filteredCommands.map((command) => ({ kind: "command" as const, command })),
+    ...filteredSnippets.map((snippet) => ({ kind: "snippet" as const, snippet })),
+  ], [filteredCommands, filteredSnippets]);
 
   useEffect(() => {
     setHighlightedCommandIndex(0);
@@ -558,14 +603,12 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
   }, []);
 
   const refreshMessagesForSession = useCallback(async (resolvedSessionId: string, isCurrentRequest: () => boolean, options?: { mergeOptimistic?: boolean }) => {
+    void options;
     try {
-      const { messages: refreshed } = await fetchChatMessages(resolvedSessionId, { order: "asc" }, projectId);
+      const { messages: refreshed } = await fetchChatMessages(resolvedSessionId, { limit: 50, order: "desc" }, projectId);
       if (!isCurrentRequest()) return;
-      if (options?.mergeOptimistic) {
-        setMessages((current) => mergePlannerTranscriptWithOptimistic(current, refreshed));
-      } else {
-        setMessages(sortMessages(refreshed));
-      }
+      setMessages((current) => mergePlannerTranscriptWithOptimistic(current, refreshed));
+      if (messagesRef.current.length === 0) setHasMoreHistory(refreshed.length >= 50);
       setHistoryLoaded(true);
     } catch (refreshError) {
       if (!isCurrentRequest()) return;
@@ -777,6 +820,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
         replacePendingMessages([], null);
         setSessionMemoryFocus(null);
         setMessages([]);
+        setHasMoreHistory(false);
         setHistoryLoaded(true);
         return;
       }
@@ -784,7 +828,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
       setSessionId(lookupSession.id);
       replacePendingMessages(getPersistedPendingChatMessages(lookupSession.id), lookupSession.id);
       const [{ messages: loadedMessages }, refreshedSessionResult] = await Promise.all([
-        fetchChatMessages(lookupSession.id, { order: "asc" }, projectId),
+        fetchChatMessages(lookupSession.id, { limit: 50, order: "desc" }, projectId),
         fetchChatSession(lookupSession.id, projectId).catch(() => ({ session: lookupSession })),
       ]);
       if (loadRequestRef.current !== requestId) return;
@@ -800,6 +844,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
       );
       setSessionMemoryFocus(resolvedSession.memoryFocus ?? null);
       setMessages(sortMessages(loadedMessages));
+      setHasMoreHistory(loadedMessages.length >= 50);
       setHistoryLoaded(true);
       if (resolvedSession.isGenerating || resolvedSession.inFlightGeneration) {
         const streamRequestId = streamRequestRef.current + 1;
@@ -839,6 +884,8 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
     setQueueActionPending(false);
     setSessionMemoryFocus(null);
     setMessages([]);
+    setHasMoreHistory(false);
+    paginationInFlightRef.current = null;
     setDraft("");
     composerStateRef.current = "idle";
     setStreamingThinking("");
@@ -880,12 +927,62 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
     }
   }, [setTranscriptAtBottom]);
 
+  /*
+  FNXC:ChatMessagePagination 2026-09-06-13:40:
+  Planner Chat keeps its lookup and streaming lifecycle separate from Direct Chat, but uses the same strict `(createdAt, id)` history cursor. One fenced page may run at a time; stable-ID merging preserves already loaded pages during refreshes and a duplicate-only page cannot spin.
+  */
+  const loadOlderMessages = useCallback(async () => {
+    const resolvedSessionId = sessionIdRef.current;
+    if (!resolvedSessionId || !hasMoreHistory || paginationInFlightRef.current) return paginationInFlightRef.current ?? undefined;
+    const cursor = messagesRef.current.find((message) => !message.id.startsWith("optimistic-") && message.id !== "streaming-assistant");
+    if (!cursor) return;
+    const requestGeneration = loadRequestRef.current;
+    const request = (async () => {
+      setLoadingOlder(true);
+      try {
+        const { messages: page } = await fetchChatMessages(resolvedSessionId, {
+          limit: 50,
+          order: "desc",
+          before: cursor.createdAt,
+          beforeId: cursor.id,
+        }, projectId);
+        if (sessionIdRef.current !== resolvedSessionId || loadRequestRef.current !== requestGeneration) return;
+        const existingIds = new Set(messagesRef.current.map((message) => message.id));
+        const added = page.filter((message) => !existingIds.has(message.id));
+        if (added.length > 0) setMessages((current) => mergePlannerTranscriptWithOptimistic(current, page));
+        setHasMoreHistory(page.length >= 50 && added.length > 0);
+      } catch {
+        // Preserve the current cursor for an observer or user retry.
+      } finally {
+        if (sessionIdRef.current === resolvedSessionId) setLoadingOlder(false);
+      }
+    })();
+    paginationInFlightRef.current = request;
+    try {
+      await request;
+    } finally {
+      if (paginationInFlightRef.current === request) paginationInFlightRef.current = null;
+    }
+  }, [hasMoreHistory, projectId]);
+
   const handleTranscriptScroll = useCallback(() => {
     if (isProgrammaticTranscriptScrollRef.current) return;
+    virtualTranscript.onScroll();
     const container = transcriptRef.current;
     if (!container) return;
     setTranscriptAtBottom(isTranscriptNearBottom(container));
-  }, [setTranscriptAtBottom]);
+  }, [setTranscriptAtBottom, virtualTranscript.onScroll]);
+
+  useEffect(() => {
+    const sentinel = historySentinelRef.current;
+    const container = transcriptRef.current;
+    if (!active || !hasMoreHistory || !sentinel || !container || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void loadOlderMessages();
+    }, { root: container });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [active, hasMoreHistory, loadOlderMessages]);
 
   useEffect(() => {
     const container = transcriptRef.current;
@@ -1146,21 +1243,55 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
     setHighlightedCommandIndex(0);
   }, [agentRunning, t]);
 
+  const handleSnippetMenuSelect = useCallback((snippet: ChatSnippet) => {
+    const applied = applySnippetToDraft(
+      draft,
+      snippet,
+      composerTextareaRef.current?.selectionStart ?? draft.length,
+    );
+    if (!applied) return;
+    setDraft(applied.value);
+    setShowCommandMenu(false);
+    setCommandFilter("");
+    setHighlightedCommandIndex(0);
+    window.requestAnimationFrame(() => {
+      composerTextareaRef.current?.focus();
+      composerTextareaRef.current?.setSelectionRange(applied.cursorPosition, applied.cursorPosition);
+      autosizeRef.current?.resize();
+    });
+  }, [draft]);
+
   const sendMessage = useCallback(() => {
     const trimmed = draft.trim();
+    const snippetInvocation = matchStandaloneSnippetInvocation(trimmed, chatSnippets);
+    if (snippetInvocation) {
+      /*
+      FNXC:ChatSnippets 2026-09-03-15:56:
+      A standalone /name expands before command dispatch, streaming, optimistic transcript work, or persistent pending-queue writes. The operator must explicitly submit the inserted prompt a second time.
+      */
+      setDraft(snippetInvocation.prompt);
+      setShowCommandMenu(false);
+      setCommandFilter("");
+      window.requestAnimationFrame(() => {
+        composerTextareaRef.current?.focus();
+        composerTextareaRef.current?.setSelectionRange(snippetInvocation.prompt.length, snippetInvocation.prompt.length);
+        autosizeRef.current?.resize();
+      });
+      return;
+    }
     const commandMatch = matchChatCommand(trimmed, selectedChatCommands);
     if (commandMatch) {
       setShowCommandMenu(false);
       return dispatchSlashCommand(commandMatch.command, commandMatch.remainder);
     }
     return sendMessageContent(draft);
-  }, [draft, dispatchSlashCommand, selectedChatCommands, sendMessageContent]);
+  }, [chatSnippets, draft, dispatchSlashCommand, selectedChatCommands, sendMessageContent]);
 
   const handleDraftChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
     const nextValue = event.target.value;
     setDraft(nextValue);
 
-    const triggerMatch = getSlashTriggerMatch(nextValue);
+    const triggerMatch = getSlashTriggerMatch(nextValue.slice(0, event.target.selectionStart ?? nextValue.length));
     if (triggerMatch) {
       setShowCommandMenu(true);
       setCommandFilter(triggerMatch.filter);
@@ -1211,7 +1342,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
 
         // Reconciliation is part of the cancellation barrier: queued text is not released
         // until the durable interrupted assistant row can be read back from chat history.
-        const refreshed = (await fetchChatMessages(snapshot.sessionId, { order: "asc" }, projectId)).messages;
+        const refreshed = (await fetchChatMessages(snapshot.sessionId, { limit: 50, order: "desc" }, projectId)).messages;
         if (sessionIdRef.current !== snapshot.sessionId) return;
         const persisted = cancellationResult.message ? [cancellationResult.message] : [];
         const reconciled = [
@@ -1302,25 +1433,27 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (showCommandMenu && event.key === "ArrowDown") {
       event.preventDefault();
-      if (filteredCommands.length > 0) {
-        setHighlightedCommandIndex((prev) => (prev + 1) % filteredCommands.length);
+      if (slashMenuEntries.length > 0) {
+        setHighlightedCommandIndex((prev) => (prev + 1) % slashMenuEntries.length);
       }
       return;
     }
 
     if (showCommandMenu && event.key === "ArrowUp") {
       event.preventDefault();
-      if (filteredCommands.length > 0) {
-        setHighlightedCommandIndex((prev) => (prev === 0 ? filteredCommands.length - 1 : prev - 1));
+      if (slashMenuEntries.length > 0) {
+        setHighlightedCommandIndex((prev) => (prev === 0 ? slashMenuEntries.length - 1 : prev - 1));
       }
       return;
     }
 
-    if (showCommandMenu && (event.key === "Enter" || event.key === "Tab") && !event.shiftKey && filteredCommands.length > 0) {
+    if (showCommandMenu && (event.key === "Enter" || event.key === "Tab") && !event.shiftKey && slashMenuEntries.length > 0) {
       event.preventDefault();
-      const commandToSelect = filteredCommands[highlightedCommandIndex] ?? filteredCommands[0];
-      if (commandToSelect) {
-        handleCommandMenuSelect(commandToSelect);
+      const entryToSelect = slashMenuEntries[highlightedCommandIndex] ?? slashMenuEntries[0];
+      if (entryToSelect?.kind === "command") {
+        handleCommandMenuSelect(entryToSelect.command);
+      } else if (entryToSelect?.kind === "snippet") {
+        handleSnippetMenuSelect(entryToSelect.snippet);
       }
       return;
     }
@@ -1331,12 +1464,22 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
       return;
     }
 
+    /*
+    FNXC:ChatComposer 2026-09-06-01:54:
+    `Shift+Enter` n'envoie jamais, y compris combiné à `Cmd/Ctrl` : `Cmd/Ctrl+Shift+Enter` n'est pas un envoi. Elle insère un saut de ligne, sauf dans le Chat lorsqu'un menu d'autocomplétion est ouvert — les trois menus du Chat (fichiers/tâches, agents, compétences) la consomment alors sans insérer de saut de ligne. Dans le Chat de tâche et le Chat du planificateur, `Shift+Enter` traverse le menu et insère bien un saut de ligne.
+    `Cmd/Ctrl+Enter` sans `Shift` envoie, indépendamment du réglage `chatSubmitOnEnter` et du type de pointeur.
+    `Entrée` sans `Cmd/Ctrl` ni `Shift` est gouvernée par `chatSubmitOnEnter` ; `Alt` n'est pas un modificateur d'envoi et ne change rien à cette règle.
+    Les règles 2 et 3 s'appliquent lorsqu'aucun menu d'autocomplétion n'est ouvert. Un menu ouvert a la priorité et consomme `Entrée` comme `Cmd/Ctrl+Enter` ; `Échap` ferme le menu et rétablit les règles.
+    Dans le Chat de tâche uniquement, une composition IME en cours (saisie CJK) court-circuite tout, `Cmd/Ctrl+Enter` compris, jusqu'à la validation du candidat.
+    Le bouton d'envoi reste rendu et actif dès que le brouillon n'est pas vide — menu ouvert et composition IME compris. Sur brouillon vide il est désactivé, comme aujourd'hui.
+    */
     if (event.key !== "Enter" || event.shiftKey) return;
+    if (!(event.metaKey || event.ctrlKey) && !enterSubmits) return;
     event.preventDefault();
     void sendMessage();
-  }, [showCommandMenu, filteredCommands, highlightedCommandIndex, handleCommandMenuSelect, sendMessage]);
+  }, [enterSubmits, showCommandMenu, slashMenuEntries, highlightedCommandIndex, handleCommandMenuSelect, handleSnippetMenuSelect, sendMessage]);
 
-  const canSend = draft.trim().length > 0 && composerState !== "sending" && !queueActionPending;
+  const canSend = draft.trim().length > 0 && composerState !== "sending";
   const showEmptyState = historyLoaded && !loading && !error && messages.length === 0;
   const questionRenderStates = useMemo(() => buildPlannerQuestionRenderStates(messages), [messages]);
   const starterPrompts = useMemo(() => {
@@ -1478,6 +1621,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
         </button>
       )}
       <div className="task-planner-chat-transcript" ref={transcriptRef} onScroll={handleTranscriptScroll} data-testid="task-planner-chat-transcript">
+        {hasMoreHistory && <div ref={historySentinelRef} className="task-planner-chat-history-sentinel" aria-hidden="true">{loadingOlder ? t("chat.loadingOlderMessages", "Loading older messages…") : null}</div>}
         {error && <div className="task-planner-chat-error" role="alert">{error}</div>}
         {loading ? (
           <div className="task-planner-chat-state" role="status" aria-live="polite">
@@ -1520,12 +1664,14 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
           </div>
         ) : (
           <>
-            {messages.map((message) => {
+            {virtualTranscript.topSpacerHeight > 0 && <div className="task-planner-chat-transcript-spacer" style={{ height: virtualTranscript.topSpacerHeight }} aria-hidden="true" />}
+            {virtualTranscript.visibleKeys.map((key) => {
+              const message = messages.find((candidate) => candidate.id === key);
+              if (!message) return null;
               if (message.id === "streaming-assistant") {
                 const streamingToolCalls = extractToolCalls(message);
-                return (
+                return <div key={key} ref={virtualTranscript.measureRow(key)} className="task-planner-chat-transcript-row">
                   <StandardStreamingMessage
-                    key={message.id}
                     streamingText={message.content}
                     streamingThinking={message.thinkingOutput ?? streamingThinking}
                     streamingToolCalls={streamingToolCalls}
@@ -1537,7 +1683,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
                     activeModelProvider={displayedModelProvider ?? null}
                     toolCallRenderer={(toolCall, index) => renderPlannerToolCall(message, toolCall, index)}
                   />
-                );
+                </div>;
               }
               /*
                * FNXC:ChatMessageEdit 2026-07-07-10:15:
@@ -1547,9 +1693,8 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
                * streaming-assistant placeholders, never assistant/system rows, and never while a
                * generation is in flight) so StandardChatMessageItem never renders a dead/no-op button.
                */
-              return (
+              return <div key={key} ref={virtualTranscript.measureRow(key)} className="task-planner-chat-transcript-row">
                 <StandardChatMessageItem
-                  key={message.id}
                   message={toStandardChatMessage(message)}
                   forcePlain={false}
                   agentName={t("taskDetail.plannerChat.assistant", "Task Chat")}
@@ -1563,15 +1708,11 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
                   onQuestionSubmit={(answerText) => void sendMessageContent(answerText)}
                   toolCallRenderer={(toolCall, index) => renderPlannerToolCall(message, toolCall, index)}
                   onEditMessage={editMessageAndResend}
-                  canEdit={
-                    message.role === "user"
-                    && !message.id.startsWith("optimistic-")
-                    && message.id !== "streaming-assistant"
-                    && composerState !== "sending"
-                  }
+                  canEdit={message.role === "user" && !message.id.startsWith("optimistic-") && composerState !== "sending"}
                 />
-              );
+              </div>;
             })}
+            {virtualTranscript.bottomSpacerHeight > 0 && <div className="task-planner-chat-transcript-spacer" style={{ height: virtualTranscript.bottomSpacerHeight }} aria-hidden="true" />}
             {composerState === "sending" && !messages.some((message) => message.id === "streaming-assistant") && (
               <StandardStreamingMessage
                 streamingText=""
@@ -1604,12 +1745,30 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
           className="chat-skill-menu task-planner-chat-command-menu"
           data-testid="task-planner-chat-command-menu"
           role="listbox"
-          aria-label={t("chat.commandSuggestions", "Command suggestions")}
+          aria-label={t("chat.slashSuggestions", "Slash suggestions")}
         >
-          {filteredCommands.length === 0 ? (
-            <div className="chat-skill-menu-empty">{t("chat.noCommandsFound", "No commands found")}</div>
+          {slashMenuEntries.length === 0 ? (
+            <div className="chat-skill-menu-empty">{t("chat.noSlashSuggestions", "No suggestions found")}</div>
           ) : (
-            filteredCommands.map((command, index) => {
+            slashMenuEntries.map((entry, index) => {
+              if (entry.kind === "snippet") {
+                return (
+                  <button
+                    key={`snippet-${entry.snippet.name}`}
+                    type="button"
+                    role="option"
+                    aria-selected={index === highlightedCommandIndex}
+                    className={`chat-skill-menu-item${index === highlightedCommandIndex ? " chat-skill-menu-item--highlighted" : ""}`}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onMouseEnter={() => setHighlightedCommandIndex(index)}
+                    onClick={() => handleSnippetMenuSelect(entry.snippet)}
+                  >
+                    <span className="chat-skill-menu-item-name">/{entry.snippet.name}</span>
+                    <span className="chat-skill-menu-item-description">{t("chat.snippetSuggestion", "Insert saved prompt")}</span>
+                  </button>
+                );
+              }
+
               /*
               FNXC:ChatMemoryFocus 2026-08-13:
               RUFU-068: disable only agent-gated commands (steer) when no agent is
@@ -1617,26 +1776,26 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
               appears disabled. Only the disabled item shows the no-running-agent hint so
               the focus menu entry keeps its real description.
               */
-              const commandDisabled = command.requiresAgent && !agentRunning;
+              const commandDisabled = entry.command.requiresAgent && !agentRunning;
               return (
-              <button
-                key={command.trigger}
-                type="button"
-                role="option"
-                aria-selected={index === highlightedCommandIndex}
-                aria-disabled={commandDisabled}
-                className={`chat-skill-menu-item chat-command-menu-item${index === highlightedCommandIndex ? " chat-skill-menu-item--highlighted" : ""}${commandDisabled ? " chat-command-menu-item--disabled" : ""}`}
-                onMouseDown={(e) => e.preventDefault()}
-                onMouseEnter={() => setHighlightedCommandIndex(index)}
-                onClick={() => handleCommandMenuSelect(command)}
-              >
-                <span className="chat-skill-menu-item-name">{command.trigger}</span>
-                <span className="chat-skill-menu-item-description">
-                  {commandDisabled
-                    ? t("chat.commandNoRunningAgentHint", "No running agent to steer")
-                    : command.description}
-                </span>
-              </button>
+                <button
+                  key={entry.command.trigger}
+                  type="button"
+                  role="option"
+                  aria-selected={index === highlightedCommandIndex}
+                  aria-disabled={commandDisabled}
+                  className={`chat-skill-menu-item chat-command-menu-item${index === highlightedCommandIndex ? " chat-skill-menu-item--highlighted" : ""}${commandDisabled ? " chat-command-menu-item--disabled" : ""}`}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setHighlightedCommandIndex(index)}
+                  onClick={() => handleCommandMenuSelect(entry.command)}
+                >
+                  <span className="chat-skill-menu-item-name">{entry.command.trigger}</span>
+                  <span className="chat-skill-menu-item-description">
+                    {commandDisabled
+                      ? t("chat.commandNoRunningAgentHint", "No running agent to steer")
+                      : entry.command.description}
+                  </span>
+                </button>
               );
             })
           )}
@@ -1667,7 +1826,9 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
           targetKey={plannerChatScopeKey}
           models={models}
           favoriteProviders={favoriteProviders}
+          onToggleFavorite={handleToggleFavoriteProvider}
           favoriteModels={favoriteModels}
+          onToggleModelFavorite={handleToggleFavoriteModel}
           modelProvider={displayedModelProvider ?? null}
           modelId={displayedModelId ?? null}
           modelPickerLabel={t("taskDetail.plannerChat.modelLabel", "Chat model")}
@@ -1679,6 +1840,10 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
           )}
           disabled={queueActionPending || composerState === "sending"}
         />
+        {/*
+        FNXC:TaskPlannerChatQueue 2026-09-06-00:48:
+        Cancellation owns planner dispatch, not the local text or dictation controls. sendMessageContent queues typed text behind cancellationInProgressRef; this composer has no attachment path, so adding one requires an explicit non-text queue contract.
+        */}
         <textarea
           ref={handleComposerRef}
           className="input task-planner-chat-input"
@@ -1687,10 +1852,10 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
           value={draft}
           onChange={handleDraftChange}
           onKeyDown={handleKeyDown}
-          disabled={queueActionPending}
+          enterKeyHint={enterSubmits ? "send" : "enter"}
           rows={1}
         />
-        <MicButton {...dictation.micProps} disabled={queueActionPending} />
+        <MicButton {...dictation.micProps} />
         <StandardChatActionButton
           isStreaming={composerState === "sending"}
           canSend={canSend}

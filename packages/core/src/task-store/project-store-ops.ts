@@ -14,7 +14,7 @@ import {resolveWorkflowIntakeFacts} from "./task-creation.js";
 import {TransitionRejectionError} from "./errors.js";
 import * as schema from "../postgres/schema/index.js";
 import {and, eq, inArray, isNull, ne, or, sql} from "drizzle-orm";
-import {mkdir, writeFile} from "node:fs/promises";
+import {mkdir} from "node:fs/promises";
 import {join} from "node:path";
 import type {Task, ColumnId, CheckoutClaimPrecondition, ActivityLogEntry, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, GoalCitation, GoalCitationFilter} from "../types.js";
 import {parseWorkflowIr, downgradeIrToV1IfPure} from "../workflows/workflow-ir.js";
@@ -33,9 +33,11 @@ import {CentralCore} from "../central/central-core.js";
 import {extractTaskIdTokens, normalizeTitleForTaskId} from "../tasks/task-title-id-drift.js";
 import {generateTaskLineageId} from "../tasks/task-lineage.js";
 import {sanitizeFileScopeInPromptContent} from "../task-store/file-scope.js";
+import {writePromptFileAtomic} from "./prompt-file.js";
 import {preserveDurableTaskWedgeInvariants, type TaskRow} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {isWorkflowDefinitionIdPrimaryKeyCollision, nextWorkflowDefinitionIdAsyncImpl} from "../task-store/workflow-definitions.js";
+import {isWorkflowDefinitionIdPrimaryKeyCollision, maxWorkflowDefinitionSequence} from "../task-store/workflow-definitions.js";
+import {acquireProjectConfigurationMutationLock, readProjectConfig, writeProjectConfig} from "./async/async-settings.js";
 import {upsertTaskRowInTransaction, buildTaskInsertValues} from "./async/async-persistence.js";
 import {readTaskRowInTransaction} from "./async/async-persistence.js";
 import {withTaskWorkflowSerialization} from "./async/async-workflow-workitems.js";
@@ -47,6 +49,8 @@ import {appendPlanEvidenceInTransaction} from "./plan-evidence.js";
 import {recordRunAuditEvent as recordRunAuditEventAsync} from "../postgres/data-layer.js";
 import {listGoalCitations as listGoalCitationsAsync} from "./async/async-events.js";
 import type {RunAuditEventRow} from "../task-store/row-types.js";
+import { DuplicateWorkflowSelectionError, resolveDuplicateTargetWorkflowId } from "./duplicate-workflow-selection.js";
+import { observeOverlapWaitTransitionInTransaction } from "./overlap-wait-ops.js";
 
 export async function getOrCreateForProjectImpl(store: typeof TaskStore, projectId?: string, centralCore?: CentralCore, globalSettingsDir?: string, asyncLayer?: AsyncDataLayer, consumerId?: string,): Promise<TaskStore> {
     if (!asyncLayer) {
@@ -175,6 +179,13 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
       */
       if (row) {
         const existing = store.pgRowToTaskRow(row);
+        if (layer.projectId) {
+          await observeOverlapWaitTransitionInTransaction(tx, {
+            projectId: layer.projectId,
+            previous: store.rowToTask(existing),
+            nextOverlapBlockedBy: task.overlapBlockedBy,
+          });
+        }
         if (planningInvalidation && !sameDependencySet(
           store.rowToTask(existing).dependencies ?? [],
           planningInvalidation.expectedCurrentDependencies,
@@ -206,6 +217,13 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
         // FNXC:MultiProjectIsolation 2026-07-10: preserve the bound projectId partition key.
         const context = store.createTaskPersistSerializationContext(task);
         await upsertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+        if (layer.projectId && task.overlapBlockedBy) {
+          await observeOverlapWaitTransitionInTransaction(tx, {
+            projectId: layer.projectId,
+            previous: { ...task, overlapBlockedBy: undefined },
+            nextOverlapBlockedBy: task.overlapBlockedBy,
+          });
+        }
       }
       if (planningInvalidation) {
         /*
@@ -302,11 +320,49 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
     return;
 }
 
-export async function duplicateTaskImpl(store: TaskStore, id: string): Promise<Task> {
+export async function duplicateTaskImpl(
+  store: TaskStore,
+  id: string,
+  options?: { workflowId?: string | null },
+): Promise<Task> {
     const sourceTask = await store.getTask(id);
     const now = new Date().toISOString();
+    const [sourceSelection, selectableWorkflows] = await Promise.all([
+      store.getTaskWorkflowSelectionAsync(id),
+      store.listWorkflowDefinitions(),
+    ]);
+    const target = resolveDuplicateTargetWorkflowId({
+      requestedWorkflowId: options?.workflowId,
+      sourceWorkflowId: sourceSelection?.workflowId,
+      selectableWorkflowIds: selectableWorkflows.map((workflow) => workflow.id),
+    });
+    if ("rejection" in target) {
+      throw new DuplicateWorkflowSelectionError(target.requestedWorkflowId);
+    }
 
-    return store.createTaskWithDistributedReservation({ description: sourceTask.description }, {
+    /*
+    FNXC:WorkflowSelection 2026-08-28-04:16:
+    A duplicate must remain on its source workflow instead of silently re-homing onto the project
+    default. An explicit target is the operator's workflow-picker choice; when the source selection
+    is no longer selectable, the effective project default remains the safe creation fallback.
+    Materialize once and reuse that selection for placement, optional gates, and durable selection.
+    */
+    let pendingWorkflowSelection: { workflowId: string; stepIds: string[] } | undefined;
+    try {
+      pendingWorkflowSelection = target.workflowId
+        ? await store.materializeExplicitWorkflowSteps(target.workflowId)
+        : await store.materializeDefaultWorkflowSteps();
+    } catch (err) {
+      storeLog.warn("Failed to apply workflow during duplicate task creation", {
+        phase: "duplicateTask:workflow",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    const duplicateIntakeColumn = (
+      await resolveWorkflowIntakeFacts(store, pendingWorkflowSelection?.workflowId)
+    ).intake ?? "triage";
+
+    const newTask = await store.createTaskWithDistributedReservation({ description: sourceTask.description }, {
       createTaskWithId: async (newId) => {
         // FN-5077: duplicated drift-stripped fragments may normalize to null and should remain unset.
         const normalizedTitle = normalizeTitleForTaskId(sourceTask.title, newId);
@@ -320,12 +376,7 @@ export async function duplicateTaskImpl(store: TaskStore, id: string): Promise<T
           title: normalizedTitle.title ?? undefined,
           description: `${sourceTask.description}\n\n(Duplicated from ${id})`,
           priority: normalizeTaskPriority(sourceTask.priority),
-          /*
-          FNXC:MergedPlanningColumn 2026-07-31-22:35 (missed creation surface — duplicate):
-          Same fix as refine: resolve the default workflow's intake lane instead of the legacy
-          `"triage"` literal, which the merged coding workflow no longer declares.
-          */
-          column: ((await resolveWorkflowIntakeFacts(store)).intake ?? "triage") as Task["column"],
+          column: duplicateIntakeColumn as Task["column"],
           modelPresetId: sourceTask.modelPresetId,
           sourceType: "task_duplicate",
           sourceParentTaskId: id,
@@ -337,6 +388,9 @@ export async function duplicateTaskImpl(store: TaskStore, id: string): Promise<T
           createdAt: now,
           updatedAt: now,
           baseBranch: sourceTask.baseBranch,
+          ...(pendingWorkflowSelection
+            ? { enabledWorkflowSteps: pendingWorkflowSelection.stepIds }
+            : {}),
         };
 
         await store.maybeResolveTombstonedTaskId(newId, {}, "duplicateTask");
@@ -349,7 +403,7 @@ export async function duplicateTaskImpl(store: TaskStore, id: string): Promise<T
           storeLog.log(`[file-scope-sanitize] duplicate ${newId} from ${id}: dropped=[${sanitizedPrompt.dropped.join(",")}]`);
         }
         await mkdir(newDir, { recursive: true });
-        await writeFile(join(newDir, "PROMPT.md"), sanitizedPrompt.sanitized);
+        await writePromptFileAtomic(join(newDir, "PROMPT.md"), sanitizedPrompt.sanitized);
 
         if (store.isWatching) store.taskCache.set(newId, { ...newTask });
         store.emit("task:created", newTask);
@@ -357,6 +411,23 @@ export async function duplicateTaskImpl(store: TaskStore, id: string): Promise<T
         return newTask;
       },
     });
+
+    if (pendingWorkflowSelection) {
+      try {
+        await store.writeTaskWorkflowSelection(
+          newTask.id,
+          pendingWorkflowSelection.workflowId,
+          pendingWorkflowSelection.stepIds,
+        );
+      } catch (err) {
+        storeLog.warn("Failed to record duplicated workflow selection", {
+          taskId: newTask.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return newTask;
   }
 
 export async function listStrandedRefinementsImpl(store: TaskStore, options?: { freshnessThresholdMs?: number; }): Promise<Array<{ task: Task; reasons: Array<"untriaged-stale" | "awaiting-approval" | "failed" | "stuck-killed" | "recovery-backoff">; nextRecoveryAt?: string; ageMs: number; }>> {
@@ -856,57 +927,69 @@ export async function createWorkflowDefinitionImpl(store: TaskStore, input: Work
       another process, and retrying every unique error would hide unrelated
       constraints from plugin and API callers.
       */
+      const layer = store.asyncLayer!;
       for (let attempt = 0; attempt < 8; attempt += 1) {
-        const id = await nextWorkflowDefinitionIdAsyncImpl(store);
-        const definition: WorkflowDefinition = {
-          id,
-          name,
-          description: input.description ?? "",
-          icon: normalizeWorkflowIcon(input.icon),
-          kind: input.kind === "fragment" ? "fragment" : "workflow",
-          ir,
-          layout,
-          createdAt: now,
-          updatedAt: now,
-        };
-
         try {
-          await workflowDefinitionBeforeInsertForTesting?.(id, store.backendMode);
-          /*
-          FNXC:MultiProjectIsolation 2026-08-15-22:10:
-          Stamp the bound layer's project explicitly, like the FN-8997 workflowSteps insert does.
-          FN-8998 scopes every workflow-definition READ by `layer.projectId`; leaving the INSERT to
-          the session GUC default splits the write/read authority, so a layer bound in JS over a
-          bypass connection creates a row it can never read back ('' normalizes to the GUC/legacy
-          partition via the fusion_assign_project_id trigger, preserving unbound behavior).
-          */
-                    await store.asyncLayer!.db.insert(schema.project.workflows).values({
-            projectId: store.asyncLayer!.projectId?.trim() ?? "",
-            id: definition.id,
-            name: definition.name,
-            description: definition.description,
-            icon: definition.icon ?? null,
-            ir: downgradeIrToV1IfPure(definition.ir) as unknown as object,
-            layout: definition.layout as unknown as object,
-            kind: definition.kind,
-            createdAt: definition.createdAt,
-            updatedAt: definition.updatedAt,
-          });
+          return await layer.transactionImmediate(async (tx) => {
+            await acquireProjectConfigurationMutationLock(tx, layer.projectId);
+            const configRow = await readProjectConfig(layer, tx);
+            const workflowIds = await tx.select({ id: schema.project.workflows.id }).from(schema.project.workflows);
+            const counter = configRow.nextWorkflowDefinitionId ?? 1;
+            const nextSequence = Math.max(counter, maxWorkflowDefinitionSequence(workflowIds.map(({ id }) => id)) + 1);
+            const id = `WF-${String(nextSequence).padStart(3, "0")}`;
+            const definition: WorkflowDefinition = {
+              id,
+              name,
+              description: input.description ?? "",
+              icon: normalizeWorkflowIcon(input.icon),
+              kind: input.kind === "fragment" ? "fragment" : "workflow",
+              ir,
+              layout,
+              createdAt: now,
+              updatedAt: now,
+            };
 
+            await workflowDefinitionBeforeInsertForTesting?.(id, store.backendMode);
+            /*
+            FNXC:MultiProjectIsolation 2026-08-15-22:10:
+            Stamp the bound layer's project explicitly, like the FN-8997 workflowSteps insert does.
+            FN-8998 scopes every workflow-definition READ by `layer.projectId`; leaving the INSERT to
+            the session GUC default splits the write/read authority, so a layer bound in JS over a
+            bypass connection creates a row it can never read back ('' normalizes to the GUC/legacy
+            partition via the fusion_assign_project_id trigger, preserving unbound behavior).
+            */
+            await tx.insert(schema.project.workflows).values({
+              projectId: layer.projectId?.trim() ?? "",
+              id: definition.id,
+              name: definition.name,
+              description: definition.description,
+              icon: definition.icon ?? null,
+              ir: downgradeIrToV1IfPure(definition.ir) as unknown as object,
+              layout: definition.layout as unknown as object,
+              kind: definition.kind,
+              createdAt: definition.createdAt,
+              updatedAt: definition.updatedAt,
+            });
+            await writeProjectConfig(layer, configRow.settings ?? {}, {
+              nextWorkflowDefinitionId: nextSequence + 1,
+            }, tx);
+            return definition;
+          });
         } catch (error) {
           if (!isWorkflowDefinitionIdPrimaryKeyCollision(error)) throw error;
-          continue;
         }
-
-        store.workflowDefinitionsCache = null;
-                return definition;
       }
       throw new Error("Unable to allocate a free workflow definition id after repeated id collisions");
     });
   }
 
+/*
+FNXC:WorkflowSuccession 2026-09-06-02:54:
+Both capacity counters canonicalize the requested pool and every persisted occupant through the shared resolver. This keeps historical retired selections in the successor budget regardless of which identity belongs to the candidate.
+*/
 export function countActiveInCapacitySlotSyncImpl(store: TaskStore, params: { targetColumn: string; workflowId: string; countPending: boolean; excludeTaskId: string; }): number {
     const { targetColumn, workflowId, countPending, excludeTaskId } = params;
+    const requestedWorkflowId = resolveCapacityPoolId(workflowId);
     // Candidate rows: in the column now, or (optionally) mid-transition into it.
     // LEFT JOIN the selection row so we can scope by effective workflow id in JS.
     const rows = store.db
@@ -928,7 +1011,7 @@ export function countActiveInCapacitySlotSyncImpl(store: TaskStore, params: { ta
     let count = 0;
     for (const row of rows) {
       const effectiveWorkflowId = resolveCapacityPoolId(row.wid);
-      if (effectiveWorkflowId !== workflowId) continue;
+      if (effectiveWorkflowId !== requestedWorkflowId) continue;
 
       if (row.col === targetColumn) {
         count += 1;
@@ -951,6 +1034,7 @@ export function countActiveInCapacitySlotSyncImpl(store: TaskStore, params: { ta
 
 export async function countActiveInCapacitySlotAsyncImpl(store: TaskStore, params: { tx: DbTransaction; targetColumn: string; workflowId: string; countPending: boolean; excludeTaskId: string; }): Promise<number> {
     const { tx, targetColumn, workflowId, countPending, excludeTaskId } = params;
+    const requestedWorkflowId = resolveCapacityPoolId(workflowId);
     const rows = await tx
       .select({
         id: schema.project.tasks.id,
@@ -980,7 +1064,7 @@ export async function countActiveInCapacitySlotAsyncImpl(store: TaskStore, param
     let count = 0;
     for (const row of rows) {
       const effectiveWorkflowId = resolveCapacityPoolId(row.wid);
-      if (effectiveWorkflowId !== workflowId) continue;
+      if (effectiveWorkflowId !== requestedWorkflowId) continue;
 
       if (row.col === targetColumn) {
         count += 1;

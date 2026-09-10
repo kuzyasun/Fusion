@@ -1063,11 +1063,6 @@ rendered window. Reuses the shared `.btn .btn-secondary .btn-sm` primitive — n
   background: color-mix(in srgb, var(--done) 18%, transparent);
 }
 
-.agent-task-column.column-archived {
-  color: var(--text-muted);
-  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
-}
-
 .agent-tasks-empty {
   display: flex;
   flex-direction: column;
@@ -1259,7 +1254,7 @@ Agent Settings composes native inputs, buttons, editors, and portaled controls. 
   gap: var(--space-sm);
   margin: 0;
   padding: var(--space-sm);
-  border: var(--border-width) solid var(--border);
+  border: var(--btn-border-width) solid var(--border);
   border-radius: var(--radius-md);
 }
 

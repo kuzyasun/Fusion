@@ -117,7 +117,7 @@ export type GitMutationType =
   | "worktree:base-refresh-reconciled"
   /*
    * FNXC:TaskPinnedWorktrees 2026-07-16-00:00:
-   * Emitted when task-pinned acquisition (`worktreeNaming: "task-id"`) corrects a `task.worktree` cache that
+   * Emitted when task-ID worktree acquisition corrects a `task.worktree` cache that
    * disagrees with the derived `<worktreesDir>/<task-id>` path (the FN-7996 stale/foreign-pointer shape).
    * Metadata is ids/paths-only: `{ taskId, previous, derived, source }`.
    */
@@ -180,6 +180,14 @@ export type GitMutationType =
   | "worktree:admin-entry-pruned"
   | "worktree:removal-refused-active-session"
   | "worktree:removal-forced-over-active-session"
+  /*
+  FNXC:WorktreeCleanup 2026-09-01-06:09:
+  FN-9233 records defensive preservation and regenerable-output discard outcomes without exposing
+  porcelain paths or making audit persistence a worktree-removal lifecycle gate.
+  */
+  | "worktree:post-landing-ignored-content-discarded"
+  | "worktree:removal-discarded-regenerable-content"
+  | "worktree:removal-preserved"
   | "worktree:active-session-reconciled"
   | "worktree:stale-lock-detected"
   | "worktree:stale-lock-recovered"
@@ -495,6 +503,13 @@ export type DatabaseMutationType =
   | "task:steering-comment:add"
   | "task:assign"
   | "task:checkout"
+  /* FNXC:ExternalBlock 2026-08-28-04:08: external-block telemetry contains ids and fixed classifications only; raw obstacle prose stays on the task. */
+  | "task:external-block-parked"
+  | "task:external-block-cleared"
+  /** Metadata: { taskId, column, trigger, outcome, completedStepCount } */
+  | "task:step-session-abort-contained"
+  /** Metadata: { taskId, blockerTaskIds, episodeCount, commonFileCount, decision, freshness } — paths and prose stay in the transactional receipt. */
+  | "task:overlap-wait-released"
   /** Metadata: { taskId, artifactKeys, owner, source, action, attempt, maxAttempts, nodeId? } */
   | "task:required-artifact-missing"
   /*
@@ -504,6 +519,12 @@ export type DatabaseMutationType =
   */
   | "task:review-finding-disputed"
   | "task:review-convergence-escalation"
+  /** FNXC:ReviewVerdictNotes 2026-08-28-22:45: Records ids and fixed note-repair outcomes only; reviewer prose never enters run-audit. */
+  | "task:review-notes-repaired"
+  /** FNXC:ReviewVerdictAuthority 2026-09-03-05:40: Records ids, the fixed repair outcome, and an authored repaired verdict only; reviewer prose never enters run-audit. */
+  | "task:review-verdict-repaired"
+  /** FNXC:ReviewEmptyContent 2026-08-28-13:14: Records the ids-only terminal close for a provably empty Code Review input. */
+  | "task:review-empty-content-parked"
   | "task:review-arbitration"
   | "task:review-convergence-human-escalation"
   /**
@@ -542,11 +563,6 @@ export type DatabaseMutationType =
   Generic terminal recovery records only durable identifiers and bounded outcomes.
   The apply token is a fencing capability, so audit rows must never persist it or task error prose.
   */
-  | "task:auto-recover-terminal-failure"
-  | "task:auto-recover-terminal-failure-exhausted"
-  /** Metadata: { taskId, column, attempt, maxAttempts, delayMs?, outcome } — ids/counts/outcomes only. */
-  | "task:no-progress-no-task-done-requeue"
-  | "task:no-progress-no-task-done-requeue-exhausted"
   | "task:auto-recover-finalize-already-on-main"
   /** Metadata: { taskId, previousColumn, targetColumn, commitSha, status, blockedBy, overlapBlockedBy, reason } */
   | "task:auto-merge-finalize-column-mismatch-reconciled"
@@ -582,10 +598,13 @@ export type DatabaseMutationType =
   | "task:auto-recover-paused-abort-park"
   // FNXC:Lifecycle FNXC_LOG 2026-06-20-00:00: audit type for reaping a leaked worktree/lease/semaphore slot whose holder left in-progress.
   | "task:reap-leaked-concurrency-slot"
-  // task:auto-archived-ghost-bug metadata: { findings: Array<{ construct: { kind: string; raw: string; filePath?: string; line?: number }; matched: boolean; probeError?: string; output?: string }>; reason: string }
-  // task:auto-archived-duplicate metadata: { siblingTaskIds: string[]; scores: Record<string, number> }
+  // Historical compatibility metadata: { findings: Array<{ construct: { kind: string; raw: string; filePath?: string; line?: number }; matched: boolean; probeError?: string; output?: string }>; reason: string }
+  // FNXC:GhostBugPreflight 2026-09-07-17:01: Auto-delete visibility records IDs, counts, and fixed outcomes only: { taskId, reason, constructCount, definitiveCount, missingCount, controlOutcome }.
+  | "task:auto-deleted-ghost-bug"
   | "task:auto-archived-ghost-bug"
   | "task:auto-archived-duplicate"
+  /** Metadata: { taskId, source: "live-column" | "cold-storage", movedCount, restoredCount, outcome } */
+  | "task:reconcile-archived-into-done"
   /** Metadata: { taskId, attempts, maxAttempts, reason: "lineage-children" | "task-live" | "dependents" | "not-found" | "unknown" } */
   | "task:auto-archive-failure-budget-exhausted"
   | "task:auto-reconciled-self-defeating-dep"
@@ -634,9 +653,6 @@ export type DatabaseMutationType =
    * Metadata: { source, classification, recordedWorktreeStillUsable, clearedWorktreeMetadata, clearedBranch, retainedNonCanonicalBranch }
    */
   | "task:auto-recover-worktree-session-metadata"
-  | "task:auto-recover-in-progress-limbo"
-  /** Metadata: { taskId, branch, worktree, checkedOutBy, executionStartedAt, executionAgeMs, graceMs, liveWorktreeBoundBranch, reason } */
-  | "task:auto-recover-in-progress-limbo-no-action"
   | "task:resume-limbo-escalated"
   /** Metadata: { taskId, executionAgeMs, graceMs, staleBindingAgeFloorMs, checkedOutBy, agentPresent, lastActivityMs, hasRecentRunAudit, worktree, branch, worktreeExists, signalReason } */
   | "task:reclaim-phantom-executor-binding"
@@ -651,7 +667,7 @@ export type DatabaseMutationType =
   | "task:reconcile-workspace-land-intent"
   /** Metadata: { taskId, reason: "auto-merge-off" | "user-paused" | "live-worktree", livePaths: string[] } */
   | "task:reconcile-workspace-partial-land-no-action"
-  /** Metadata: { taskId, path, kind: "workspace-repo-land", registeredAt, ageMs, staleBindingAgeFloorMs, ownerColumn, ownerTerminalReason: "missing" | "complete" | "archived" | "deleted" | "failed" } */
+  /** Metadata: { taskId, path, kind: "workspace-repo-land", registeredAt, ageMs, staleBindingAgeFloorMs, ownerColumn, ownerTerminalReason: "missing" | "complete" | "deleted" | "failed" } */
   | "task:reclaim-phantom-workspace-land-lease"
   /** Metadata: { taskId, path, kind: "workspace-repo-acquire", registeredAt, ageMs, staleBindingAgeFloorMs, ownerColumn, ownerTerminalReason }. */
   | "task:reclaim-phantom-workspace-acquire-lease"
@@ -691,6 +707,12 @@ export type DatabaseMutationType =
   { taskId, column, orphanedCount, resultCount }.
   */
   | "task:reconcile-orphaned-pending-step-results"
+  /**
+   * Rewrites already-persisted singular content approvals that lack review-input proof to failed.
+   * Metadata is ids/counts/outcomes-only:
+   * { taskId, column, workflowStepId, repairedCount, resultCount, needsOperatorBypass }.
+   */
+  | "task:reconcile-unproven-review-approval"
   /* FNXC:StalledCardWatchdog 2026-07-26-19:40: detect-only backstop — a non-terminal card with no
      live session and no queued continuation that has not moved past the stall floor. */
   | "task:stall-watchdog-detected"
@@ -704,10 +726,6 @@ export type DatabaseMutationType =
   | "task:reclaim-self-owned-branch-conflict-no-action"
   | "task:orphan-detected-no-action"
   | "task:reattach-orphaned-execution"
-  /** Metadata: { taskId, lastReason, stuckKillCount, attemptedStuckKillCount, maxStuckKills, checkedOutBy, executionStartedAt, executionAgeMs, graceMs, liveWorktreeBoundBranch } */
-  | "task:stuck-loop-exhausted-no-action"
-  /** Metadata: { taskId: string; ignoredStepUpdateCount: number; stuckKillStreak: number; lastReason: "no-progress-churn" } */
-  | "task:stuck-no-progress-churn-terminalized"
   /** Metadata: { taskId, cycleCount, windowMs, lastMoveSource } */
   | "task:dispatch-oscillation-terminalized"
   /** Metadata: { taskId, cycleCount, maxCycles, progressSignature, failureValue } */
@@ -903,7 +921,7 @@ export type DatabaseMutationType =
   | "task:empty-merge-finalize-blocked-no-landed-proof"
   | "task:integrity-reconcile-modified-files"
   | "task:integrity-warning"
-  /** FN-5092 watchdog: stale `status: "merging"` / `"merging-pr"` cleared on a done/archived task. Metadata: { previousColumn, previousStatus, ageMs, mergeConfirmed?: boolean } */
+  /** FN-5092 watchdog: stale `status: "merging"` / `"merging-pr"` cleared on a workflow Complete task. Metadata: { previousColumn, previousStatus, ageMs, mergeConfirmed?: boolean } */
   | "task:auto-recover-stale-merger-status"
   | "auto-recovery:classify-decision"
   | "auto-recovery:retry-issued"

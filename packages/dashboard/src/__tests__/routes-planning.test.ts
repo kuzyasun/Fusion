@@ -231,8 +231,6 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     // Existing planning-route scenarios exercise the enabled checkpoint flow; explicit disabled cases override this default.
     getSettings: vi.fn().mockResolvedValue({ autoMerge: false, defaultBranch: "main", agentClarificationEnabled: true }),
     getSettingsFast: vi.fn().mockResolvedValue({ autoMerge: false, defaultBranch: "main", agentClarificationEnabled: true }),
@@ -2563,6 +2561,55 @@ describe("Planning Mode Routes", () => {
         expect(createInput.description).toContain("## Planning Interview Context");
         expect(createInput.description).toContain("Must have login");
         expect(createInput.description.match(/## Planning Interview Context/g)).toHaveLength(1);
+      });
+
+      it.each([
+        { label: "null", workflowId: null, expectedWorkflowId: undefined },
+        { label: "blank", workflowId: "  ", expectedWorkflowId: undefined },
+        { label: "aggregate sentinel", workflowId: "__all_workflows__", expectedWorkflowId: undefined },
+        { label: "concrete workflow", workflowId: "wf-real", expectedWorkflowId: "wf-real" },
+      ])("normalizes a $label workflow id before task creation", async ({ workflowId, expectedWorkflowId }) => {
+        (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+          id: "FN-WORKFLOW",
+          description: "Planned workflow task",
+          column: "triage",
+          dependencies: [],
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        });
+        (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+        const startRes = await REQUEST(
+          buildApp(),
+          "POST",
+          "/api/planning/start",
+          JSON.stringify({ initialPlan: "Create a workflow-routed task" }),
+          { "Content-Type": "application/json" },
+        );
+        const response = await REQUEST(
+          buildApp(),
+          "POST",
+          "/api/planning/create-task",
+          JSON.stringify({
+            sessionId: startRes.body.sessionId,
+            workflowId,
+            summary: {
+              title: "Workflow-routed task",
+              description: "Create it from Planning Mode",
+              suggestedDependencies: [],
+              keyDeliverables: ["Task"],
+            },
+          }),
+          { "Content-Type": "application/json" },
+        );
+
+        expect(response.status, JSON.stringify(response.body)).toBe(201);
+        const createInput = (store.createTask as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+        if (expectedWorkflowId) {
+          expect(createInput).toMatchObject({ workflowId: expectedWorkflowId });
+        } else {
+          expect(createInput).not.toHaveProperty("workflowId");
+        }
       });
 
       it("terminalizes a not-yet-validated session when Proceed with plan creates its task", async () => {

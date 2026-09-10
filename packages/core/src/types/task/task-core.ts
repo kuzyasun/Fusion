@@ -30,6 +30,7 @@ import type { InReviewStallSignal } from "../../tasks/in-review-stall.js";
 import type { InReviewStalledSignal } from "../../tasks/in-review-stalled.js";
 import type { StalePausedReviewSignal } from "../../tasks/stale-paused-review.js";
 import type { StalePausedTodoSignal } from "../../tasks/stale-paused-todo.js";
+import type { TaskExternalBlock } from "../../tasks/task-external-block.js";
 import type { StalledReviewSignal } from "../../tasks/stalled-review-detector.js";
 import type { TaskAgeStalenessSignal } from "../../tasks/task-age-staleness.js";
 import type { PlannerOverseerRuntimeSnapshot } from "../../planner/planner-overseer-state.js";
@@ -39,11 +40,26 @@ import type {
   TaskComment,
   TaskLogEntry,
   TaskStep,
+  TaskStepReport,
   WorkflowTransitionNotificationMarker,
 } from "./task-log.js";
 
+/** Engine-owned planning retry evidence. */
+export type TaskPlanningFailureState = {
+  specLockUnavailable?: { sourceHash: string; reason: string; sections: string[]; at: string; attempt: number | null };
+  lifecycleLockTransport?: { message: string; at: string; attempt: number | null };
+};
+
 export interface MergeDetails {
   commitSha?: string;
+  /**
+   * FNXC:AIMerge 2026-08-28-09:29:
+   * The task-branch tip observed when a real landing was recorded. A later merge attempt may skip
+   * rebuilding its clean room only when this pin still equals the live branch tip, proving that no
+   * post-landing task work would be dropped. `mergeDetails` is stored in the task JSON column, so
+   * this additive optional field requires no SQL migration or schema-applier registration.
+   */
+  landedBranchTipSha?: string;
   /**
    * When merger used rebase strategy (>=2 substantive commits), this is the
    * parent SHA on the target branch before the cherry-pick chain. The canonical
@@ -150,6 +166,8 @@ export interface MergeDetails {
    * for single-repo tasks.
    */
   workspaceLandedShas?: Record<string, string>;
+  /** Per-repository paths captured before workspace finalization; an empty list proves a no-op repository. */
+  workspaceLandedFiles?: Record<string, string[]>;
 }
 
 /** Represents an agent's checkout lease on a task. */
@@ -387,6 +405,8 @@ export interface TaskBranchContext {
   source?: TaskBranchGroupSource;
   /** Omitted for a provenance-only operator override payload. */
   assignmentMode?: TaskBranchAssignmentMode;
+  /** Shared-group integration target retained across per-task worktree cleanup and Reset. */
+  mergeTargetBranch?: string;
   inheritedBaseBranch?: string;
 }
 
@@ -704,19 +724,19 @@ name in baseBranchFallbackFrom. Legacy entries without these fields remain pinne
 integration branch and ignore task.baseBranch. Ref names live here and in task logs, never audit metadata.
 */
 /*
-FNXC:RepositoryScope 2026-08-20-23:07:
-Repository acquisition is an implementation detail, not task intent. This durable scope is the
-sole authority for workspace review, landing, and recovery; unprefixed file scope can seed it but
-must never expand it to every acquired checkout.
+FNXC:RepositoryScope 2026-08-29-08:50:
+FN-258 makes configured workspace membership the complete, confirmed scope for every workspace task.
+Review and landing still use this durable snapshot, but neither task creation nor later task mutations
+may select a subset of configured repositories.
 */
 export interface TaskRepositoryScope {
   repositories: string[];
-  /** A proposal is visible before the planner confirms the repository intent. */
-  state?: "proposed" | "confirmed";
-  /** Monotonic intent generation used to fence stale review callbacks. */
+  /** Workspace membership is confirmed from the configured workspace, never selected per task. */
+  state?: "confirmed";
+  /** Monotonic configuration generation used to fence stale review callbacks. */
   revision?: number;
   confirmedAt?: string;
-  confirmedBy?: "operator" | "plan" | "inferred";
+  confirmedBy?: "workspace";
   /** FNXC:RepositoryScope 2026-08-21-01:18: Fresh landing accepts only the exact repository diff approved by Code Review. */
   reviewEvidence?: Record<string, { fingerprint: string; approvedAt: string }>;
   /*
@@ -726,6 +746,7 @@ export interface TaskRepositoryScope {
   or checkout path, so a changed scope or diff opens a new remediation episode safely.
   */
   reviewRemediation?: { scopeRevision: number; repository: string; inputSignature: string };
+  /** Historical manual-scope events remain readable in Task Detail but no new task may write them. */
   extensions?: Array<{
     repository: string;
     requestedAt: string;
@@ -861,6 +882,19 @@ export interface Task {
    */
   customFields?: Record<string, unknown>;
   status?: string;
+  /**
+   * FNXC:ExternalBlock 2026-08-28-03:48:
+   * Only obstacles originating outside the task worktree create this durable freeze. Internal
+   * code, test, planning, and review failures remain AI-repairable, while dependency and file
+   * overlap waits retain their separate queue state.
+   */
+  externalBlock?: TaskExternalBlock;
+  /**
+   * FNXC:TriagePlanningState 2026-09-07-19:49:
+   * FN-9273 keeps engine planning retry evidence outside workflow-validated customFields.
+   * Workflows reject planning.* fields, which previously discarded the retry-hold update.
+   */
+  planningFailure?: TaskPlanningFailureState;
   /**
    * FNXC:TaskActivity 2026-07-28-12:00:
    * Dashboard-only signal from a fresh planner agent-log SSE entry. It is never
@@ -1082,6 +1116,8 @@ export interface Task {
   enabledWorkflowSteps?: string[];
   /** Results from workflow step executions (populated after task implementation) */
   workflowStepResults?: WorkflowStepResult[];
+  /** Append-only implementation summaries retained independently of replannable steps. */
+  stepReports?: TaskStepReport[];
   /** Number of merge retry attempts made for this task (auto-merge conflict recovery) */
   mergeRetries?: number;
   /*
@@ -1165,7 +1201,7 @@ export interface Task {
   /** Number of bounded recovery retry attempts for transient executor/triage failures.
    *  Distinct from `mergeRetries` (merge-conflict-specific). Incremented by the
    *  recovery-policy module on each recoverable failure; cleared when work restarts
-   *  cleanly or reaches a terminal column (in-review, done, archived). */
+   *  cleanly, reaches review/Complete, or becomes a deleted/historical sentinel row. */
   recoveryRetryCount?: number;
   /** FNXC:WorkspaceContention 2026-08-23-06:40: Durable owner-local retry budget for holdForSessionContention; manual retry, clean completion, and exhausted waits reset it. */
   sessionContentionHoldCount?: number;
@@ -1631,8 +1667,6 @@ export interface TaskCreateInput {
   dependencies?: string[];
   /** When true, this task is expected to complete without creating git commits. */
   noCommitsExpected?: boolean;
-  /** Explicit workspace repository intent selected by the operator at creation. */
-  repositoryScope?: string[];
   /** IDs of workflow steps to enable for this task */
   enabledWorkflowSteps?: string[];
   /**

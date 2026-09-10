@@ -8,12 +8,19 @@ import type { ArbitrationFailureFence, Task, TaskStore, WorkflowReviewFinding, W
 import {
   archiveArbitratedWorkflowStepFailure,
   resolveReviewArbitrationTarget,
+  resolveStepReopenPolicy,
   resolveValidatorFallbackModel,
+  resolveWorkflowIrForTask,
 } from "@fusion/core";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { reviewStep } from "../execution/reviewer.js";
 import type { EngineRunContext } from "../util/run-audit.js";
 import { emitBoundedRunAudit } from "./emit-bounded-run-audit.js";
+import type { AppendReviewRemediationOptions, AppendReviewRemediationOutcome } from "./append-review-remediation-steps.js";
+import type { RequestPreMergeOptionalStepFixInfo } from "./request-pre-merge-optional-step-fix.js";
+import { resolveRemediationCheckout } from "./resolve-remediation-checkout.js";
+import type { SendTaskBackForFixOutcome } from "./send-task-back-for-fix.js";
+import { optionalStepRevisionKey, reviewRemediationEpisodeIdentity } from "./optional-step-revision.js";
 
 export type ReviewArbitrationReleaseDeps = {
   store: TaskStore;
@@ -25,7 +32,14 @@ export type ReviewArbitrationDeps = ReviewArbitrationReleaseDeps & {
     task: Task, worktreePath: string, failureFeedback: string, stepName: string, reason: string,
     preserveResumeState: boolean, mergeVerificationFailure: boolean,
     retryPresentation?: { attempt: number; max?: number }, findings?: WorkflowReviewFinding[],
-  ) => Promise<void>;
+    persistWorktreePath?: boolean, stepReopenPolicy?: "reopen-trailing" | "none",
+    replayAccounting?: import("./reopen-last-step-for-revision.js").TrailingReplayAccounting,
+  ) => Promise<SendTaskBackForFixOutcome | void>;
+  appendReviewRemediationSteps?: (
+    task: Task,
+    info: RequestPreMergeOptionalStepFixInfo,
+    options?: AppendReviewRemediationOptions,
+  ) => Promise<AppendReviewRemediationOutcome>;
 };
 
 type ArbitrationDecision = "UPHOLD_REVIEW" | "UPHOLD_IMPLEMENTER" | "SPLIT";
@@ -152,6 +166,7 @@ export async function runReviewArbitration(
   const failed = (task.workflowStepResults ?? []).find((result) =>
     result.workflowStepId === workflowStepId && result.status === "failed");
   if (!failed) return "declined";
+  const remediationCheckout = resolveRemediationCheckout(task, failed);
   const settings = await mergeEffectiveSettings(deps.store, task, await deps.store.getSettings());
   const configuredTarget = resolveReviewArbitrationTarget(settings);
   if (settings.reviewArbitrationEnabled === false) return "declined";
@@ -163,7 +178,7 @@ export async function runReviewArbitration(
   const prompt = `${task.prompt ?? ""}\n\n## Review arbitration\nDecide this disagreement using the code and the complete same-gate ledger below. Return exactly one trailing JSON object: {"decision":"UPHOLD_REVIEW"|"UPHOLD_IMPLEMENTER"|"SPLIT","notes":"...","bindingFindingIds":["..."]}.\n\n${JSON.stringify(history)}`;
   let raw: string;
   try {
-    const result = await reviewStep(task.worktree ?? process.cwd(), task.id, 0, `Arbitration: ${stepName}`, "code", prompt, undefined, {
+    const result = await reviewStep(remediationCheckout?.path ?? process.cwd(), task.id, 0, `Arbitration: ${stepName}`, "code", prompt, undefined, {
       store: deps.store,
       taskId: task.id,
       settings,
@@ -182,6 +197,7 @@ export async function runReviewArbitration(
     const release = await applyReviewArbitrationRelease(deps, task.id, fence);
     return release.applied ? "arbitrated" : "declined";
   }
+  if (!remediationCheckout) return "declined";
   const obligations = bindingObligations(failed.findings, ruling.bindingFindingIds, ruling.decision);
   /*
   FNXC:ReviewConvergence 2026-08-22-05:56:
@@ -190,7 +206,7 @@ export async function runReviewArbitration(
   binding subset as its must-fix findings.
   */
   let obligationsApplied = false;
-  await deps.store.updateTaskAtomic(task.id, (current) => {
+  const adjudicatedTask = await deps.store.updateTaskAtomic(task.id, (current) => {
     const currentGate = current.workflowStepResults?.find((entry) => entry.workflowStepId === failed.workflowStepId);
     const fenceStillMatches = currentGate?.status === "failed"
       && currentGate.startedAt === failed.startedAt
@@ -226,8 +242,71 @@ export async function runReviewArbitration(
     });
     return "declined";
   }
-  await deps.sendTaskBackForFix(task, task.worktree ?? "", feedback, stepName,
+  const adjudicatedFailed = adjudicatedTask.workflowStepResults?.find((entry) =>
+    entry.workflowStepId === failed.workflowStepId
+    && entry.status === "failed"
+    && entry.startedAt === failed.startedAt
+    && entry.completedAt === failed.completedAt
+    && entry.verdict === failed.verdict
+    && entry.reviewInputFingerprint === failed.reviewInputFingerprint
+    && entry.supersededAt == null);
+  if (!adjudicatedFailed) return "declined";
+  const workflowIr = await resolveWorkflowIrForTask(deps.store, task.id).catch(() => undefined);
+  const stepReopenPolicy = resolveStepReopenPolicy(workflowIr);
+  /*
+  FNXC:LifecycleContainment 2026-08-30-12:57:
+  Arbitration must use the selected workflow's remediation model too. A `none` workflow cannot
+  receive a raw send-back: append the arbiter's surviving obligations first, including the
+  deterministic Code Review fallback when the reviewer omitted usable Fix steps.
+
+  FNXC:ReviewRemediationBudget 2026-09-08-02:55:
+  An upheld arbitration ruling is a remediation producer, so it carries the post-adjudication failed
+  episode and ladder ceiling into the fenced appender. The dispute-cleanup CAS changes the episode
+  identity; remediation must use that authoritative occurrence so work and its charge commit together.
+  */
+  if (stepReopenPolicy === "none") {
+    const appender = deps.appendReviewRemediationSteps;
+    if (!appender) return "declined";
+    const outcome = await appender(adjudicatedTask, {
+      nodeId: adjudicatedFailed.workflowStepId,
+      stepName,
+      feedback,
+      phase: adjudicatedFailed.phase ?? "pre-merge",
+      status: adjudicatedFailed.status,
+      verdict: adjudicatedFailed.verdict,
+      reviewKind: adjudicatedFailed.reviewKind,
+      findings: adjudicatedFailed.findings,
+    }, {
+      attemptClaim: {
+        revisionKey: optionalStepRevisionKey(adjudicatedFailed.workflowStepId, stepName),
+        stepName,
+        status: adjudicatedFailed.status,
+        maxRevisions: max ?? "unbounded",
+        expectedWorkflowStepId: adjudicatedFailed.workflowStepId,
+        expectedReviewEpisodeIdentity: reviewRemediationEpisodeIdentity(adjudicatedFailed),
+        runContext: deps.getRunContextFor(task.id),
+      },
+    });
+    return outcome === "appended" ? "arbitrated" : "declined";
+  }
+  /*
+  FNXC:ReviewRemediationBudget 2026-09-08-04:39:
+  An arbitration-upheld trailing replay is remediation work, not convergence narration. Pass the
+  post-adjudication episode into the durable replay fence and advance only when that producer reports
+  a scheduled handoff; exhausted, stale, duplicate, and unavailable refusals remain non-consuming.
+  */
+  const outcome = await deps.sendTaskBackForFix(adjudicatedTask, remediationCheckout.path, feedback, stepName,
     "Review arbitration upheld remaining review obligations", true, false,
-    { attempt: attempt + 1, max }, obligations ?? failed.findings);
-  return "arbitrated";
+    { attempt: attempt + 1, max }, adjudicatedFailed.findings, remediationCheckout.persist, stepReopenPolicy, {
+      revisionKey: optionalStepRevisionKey(adjudicatedFailed.workflowStepId, stepName),
+      stepName,
+      status: adjudicatedFailed.status,
+      maxRevisions: max ?? "unbounded",
+      expectedWorkflowStepId: adjudicatedFailed.workflowStepId,
+      expectedReviewEpisodeIdentity: reviewRemediationEpisodeIdentity(adjudicatedFailed),
+      expectedColumn: adjudicatedTask.column,
+      expectedStatus: adjudicatedTask.status,
+      runContext: deps.getRunContextFor(task.id),
+    });
+  return outcome === undefined || outcome.kind === "scheduled" ? "arbitrated" : "declined";
 }

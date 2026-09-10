@@ -13,6 +13,7 @@ import { buildWorkflowFailureScopeGuard } from "./workflow-failure-scope-guard.j
 import { resolveAuthoritativeExternalExecutionRoute } from "./resolve-authoritative-external-execution-route.js";
 import { TaskExecutorWorktreePureFacades } from "./task-executor-worktree-pure-facades.js";
 import { ChatSessionMemoryCapture, createStashChatMemoryCaptureSink, type ChatEventEmitter, type RuntimeProjectIdentity } from "./memory-capture.js";
+import { appendReviewRemediationStepsWithResolvedAccounting } from "./append-review-remediation-steps.js";
 
 export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePureFacades {
   /** Active complete-chat memory capture service + its emitter/detach (RUFU-068). */
@@ -57,9 +58,10 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   hasLiveSessionSurface(taskId: string): boolean {
     return impl.hasLiveSessionSurfaceImpl(bags.buildHasLiveSessionSurfaceDeps(this, (id) => activeSessionRegistry.pathsForTask(id)), taskId);
   }
-  clearPhantomExecutorBinding(taskId: string, options: { preserveWorktrees?: boolean } = {}): boolean {
+  clearPhantomExecutorBinding(taskId: string, options: { preserveWorktrees?: boolean; externallyBlocked?: boolean } = {}): boolean {
     return impl.clearPhantomExecutorBindingImpl(bags.buildClearPhantomExecutorBindingDeps(this), taskId, options);
   }
+  protected prepareAbortInFlightTaskWork(...args: FacadeRestArgs<typeof impl.prepareAbortInFlightTaskWorkImpl>): ReturnType<typeof impl.prepareAbortInFlightTaskWorkImpl> { return impl.prepareAbortInFlightTaskWorkImpl(bags.buildAwaitAbortInFlightTaskWorkDeps(this), ...args); }
   async awaitAbortInFlightTaskWork(...args: FacadeRestArgs<typeof impl.awaitAbortInFlightTaskWorkImpl>): ReturnType<typeof impl.awaitAbortInFlightTaskWorkImpl> { return impl.awaitAbortInFlightTaskWorkImpl(bags.buildAwaitAbortInFlightTaskWorkDeps(this), ...args); }
   async abortAllInFlight(reason: string): Promise<void> { return impl.abortAllInFlightImpl(bags.buildAbortAllInFlightDeps(this), reason); }
   abortAllSessionBash(): void { impl.abortAllSessionBashImpl({ ...facadeFields(this, ["activeSessions", "childSessions", "activeStepExecutors"]) }); }
@@ -132,10 +134,18 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   protected async executeReviewHandoff(...args: FacadeRestArgs<typeof impl.executeReviewHandoffImpl>): ReturnType<typeof impl.executeReviewHandoffImpl> { return impl.executeReviewHandoffImpl(bags.buildExecuteReviewHandoffDeps(this), ...args); }
   async recoverCompletedTask(task: import("@fusion/core").Task): Promise<boolean> { return impl.recoverCompletedTaskImpl(bags.buildRecoverCompletedTaskDeps(this), task); }
   protected async parkPlanReviewReplanCapExhausted(...args: FacadeRestArgs<typeof impl.parkPlanReviewReplanCapExhaustedImpl>): ReturnType<typeof impl.parkPlanReviewReplanCapExhaustedImpl> { return impl.parkPlanReviewReplanCapExhaustedImpl(bags.buildStoreRunContextDeps(this), ...args); }
-  protected async appendReviewRemediationSteps(...args: FacadeRestArgs<typeof impl.appendReviewRemediationStepsImpl>): ReturnType<typeof impl.appendReviewRemediationStepsImpl> { return impl.appendReviewRemediationStepsImpl(bags.buildAppendReviewRemediationStepsDeps(this), ...args); }
+  /*
+  FNXC:ReviewRemediationBudget 2026-09-08-02:24:
+  Every executor-owned named-remediation caller enters through the accounting adapter. Legacy callers
+  may omit claim metadata, but the adapter resolves the live workflow/project budget and failed
+  episode before the strict producer can publish work; unresolved callers remain reporting-only.
+  */
+  protected async appendReviewRemediationSteps(...args: FacadeRestArgs<typeof impl.appendReviewRemediationStepsImpl>): ReturnType<typeof impl.appendReviewRemediationStepsImpl> { return appendReviewRemediationStepsWithResolvedAccounting(bags.buildAppendReviewRemediationStepsDeps(this), ...args); }
   protected async requestPreMergeOptionalStepFix(...args: FacadeRestArgs<typeof impl.requestPreMergeOptionalStepFixImpl>): ReturnType<typeof impl.requestPreMergeOptionalStepFixImpl> { return impl.requestPreMergeOptionalStepFixImpl(bags.buildRequestPreMergeOptionalStepFixDeps(this), ...args); }
   protected async recoverMissingRequiredArtifacts(...args: FacadeRestArgs<typeof impl.recoverMissingRequiredArtifactsImpl>): ReturnType<typeof impl.recoverMissingRequiredArtifactsImpl> { return impl.recoverMissingRequiredArtifactsImpl(bags.buildRecoverMissingRequiredArtifactsDeps(this), ...args); }
   async recoverFailedPreMergeWorkflowStep(task: import("@fusion/core").Task): Promise<boolean> { return impl.recoverFailedPreMergeWorkflowStepImpl(bags.buildRecoverFailedPreMergeWorkflowStepDeps(this), task); }
+  /* FNXC:LifecycleContainment 2026-08-30-13:36: claim-scoped entry point so self-healing's admission claim fences the recovery it authorized. */
+  async recoverFailedPreMergeWorkflowStepDetailed(...args: FacadeRestArgs<typeof impl.recoverFailedPreMergeWorkflowStepDetailedImpl>): ReturnType<typeof impl.recoverFailedPreMergeWorkflowStepDetailedImpl> { return impl.recoverFailedPreMergeWorkflowStepDetailedImpl(bags.buildRecoverFailedPreMergeWorkflowStepDeps(this), ...args); }
   protected async shouldDeferForHeartbeat(agentId: string): ReturnType<typeof impl.shouldDeferForHeartbeatImpl> { return impl.shouldDeferForHeartbeatImpl({ agentStore: this.options.agentStore }, agentId); }
   protected async getAuthoritativeAssignedAgent(...args: FacadeRestArgs<typeof impl.getAuthoritativeAssignedAgentImpl>): ReturnType<typeof impl.getAuthoritativeAssignedAgentImpl> { return impl.getAuthoritativeAssignedAgentImpl(bags.buildGetAuthoritativeAssignedAgentDeps(this), ...args); }
   protected async getAssignedAgentRuntimeConfig(...args: FacadeRestArgs<typeof impl.getAssignedAgentRuntimeConfigImpl>): ReturnType<typeof impl.getAssignedAgentRuntimeConfigImpl> { return impl.getAssignedAgentRuntimeConfigImpl(bags.buildGetAssignedAgentRuntimeConfigDeps(this), ...args); }
@@ -190,7 +200,7 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
     return resolveAuthoritativeExternalExecutionRoute(this.store, task);
   }
   protected async handleDepAbortCleanup(taskId: string, worktreePath: string): ReturnType<typeof impl.handleDepAbortCleanupImpl> { return impl.handleDepAbortCleanupImpl(bags.buildHandleDepAbortCleanupDeps(this), taskId, worktreePath); }
-  protected async reopenLastStepForRevision(...args: import("./facade-methods.js").FacadeAfterFirst<typeof impl.reopenLastStepForRevisionImpl>): Promise<{ index: number; name: string; indexes: number[] } | null> { return impl.reopenLastStepForRevisionImpl(this.store, ...args); }
+  protected async reopenLastStepForRevision(...args: import("./facade-methods.js").FacadeAfterFirst<typeof impl.reopenLastStepForRevisionImpl>): Promise<{ index: number; name: string; indexes: number[] } | null | import("./reopen-last-step-for-revision.js").TrailingReplayAccountingOutcome> { return impl.reopenLastStepForRevisionImpl(this.store, ...args); }
   protected async runExecutorDeterministicVerification(...args: FacadeRestArgs<typeof impl.runExecutorDeterministicVerificationImpl>): ReturnType<typeof impl.runExecutorDeterministicVerificationImpl> { return impl.runExecutorDeterministicVerificationImpl(bags.buildStoreRunContextDeps(this), ...args); }
   protected async attemptExecutorVerificationFix(...args: FacadeRestArgs<typeof impl.attemptExecutorVerificationFixImpl>): ReturnType<typeof impl.attemptExecutorVerificationFixImpl> { return impl.attemptExecutorVerificationFixImpl(bags.buildAttemptExecutorVerificationFixDeps(this), ...args); }
   protected async sendTaskBackForFix(...args: FacadeRestArgs<typeof impl.sendTaskBackForFixImpl>): ReturnType<typeof impl.sendTaskBackForFixImpl> { return impl.sendTaskBackForFixImpl(bags.buildSendTaskBackForFixDeps(this, constants.MAX_WORKFLOW_STEP_RETRIES), ...args); }

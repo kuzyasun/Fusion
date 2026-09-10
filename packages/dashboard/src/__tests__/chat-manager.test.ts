@@ -8,7 +8,7 @@ FN-6444 confirmed this ChatManager API-path suite is deterministic under dashboa
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { runWithFusionSessionIdentity, resolveFusionSessionPrincipal } from "@fusion/core";
+import { runWithFusionSessionIdentity, resolveFusionSessionPrincipal, type Settings } from "@fusion/core";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -111,16 +111,7 @@ function createChatManagerForRoot(rootDir: string): ChatManager {
   return new ChatManager(mockChatStore as any, rootDir, mockAgentStore as any);
 }
 
-function createChatManagerWithSettings(settings: {
-  fallbackProvider?: string;
-  fallbackModelId?: string;
-  defaultProvider?: string;
-  defaultModelId?: string;
-  defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  defaultThinkingLevelOverride?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  executionThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  executionGlobalThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-}): ChatManager {
+function createChatManagerWithSettings(settings: Partial<Settings>): ChatManager {
   return new ChatManager(
     mockChatStore as any,
     "/tmp/test",
@@ -1399,6 +1390,100 @@ describe("ChatManager.sendMessage", () => {
     });
   });
 
+
+  it("reconciles a streamed trailer with all assistant messages in the current turn", async () => {
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+    mockChatStore.addMessage.mockImplementation((sessionId, input) => ({
+      id: input.role === "user" ? "msg-user" : "msg-assistant",
+      sessionId,
+      role: input.role,
+      content: input.content,
+      thinkingOutput: null,
+      metadata: null,
+      attachments: undefined,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    }));
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => options.onText?.("Waiting for your choice above.")),
+        dispose: vi.fn(),
+        state: { messages: [
+          { role: "user", content: "Check the results" },
+          { role: "assistant", content: "Lost answer paragraph with the complete results." },
+          { role: "assistant", content: "Waiting for your choice above." },
+        ] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Check the results");
+    unsubscribe();
+
+    const persisted = mockChatStore.addMessage.mock.calls.at(-1)?.[1];
+    expect(persisted.content).toBe("Lost answer paragraph with the complete results.\n\nWaiting for your choice above.");
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "done",
+      data: expect.objectContaining({ message: expect.objectContaining({ content: persisted.content }) }),
+    }));
+  });
+
+  it("keeps complete streaming output without duplicating authoritative turn text", async () => {
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => options.onText?.("Complete streamed answer.")),
+        dispose: vi.fn(),
+        state: { messages: [
+          { role: "user", content: "Question" },
+          { role: "assistant", content: "Complete streamed answer." },
+        ] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Question");
+
+    expect(mockChatStore.addMessage.mock.calls.at(-1)?.[1].content).toBe("Complete streamed answer.");
+  });
+
+  it("excludes assistant messages from prior turns during reconciliation", async () => {
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => options.onText?.("Current answer.")),
+        dispose: vi.fn(),
+        state: { messages: [
+          { role: "assistant", content: "Prior turn must not be persisted." },
+          { role: "user", content: "Current question" },
+          { role: "assistant", content: "Current answer." },
+        ] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Current question");
+
+    expect(mockChatStore.addMessage.mock.calls.at(-1)?.[1].content).toBe("Current answer.");
+  });
+
+  it("separates streamed text blocks exactly once through the boundary callback", async () => {
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => {
+          options.onText?.("First block.");
+          options.onTextBlockBoundary?.();
+          options.onTextBlockBoundary?.();
+          options.onText?.("Second block.");
+        }),
+        dispose: vi.fn(),
+        state: { messages: [] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Question");
+    unsubscribe();
+
+    expect(mockChatStore.addMessage.mock.calls.at(-1)?.[1].content).toBe("First block.\n\nSecond block.");
+    expect(events.filter((event) => event.type === "text" && event.data === "\n\n")).toHaveLength(1);
+  });
 
   it("broadcasts tool_start and tool_end SSE events when agent calls tools", async () => {
     const events: Array<{ type: string; data: unknown }> = [];
@@ -2996,7 +3081,7 @@ describe("ChatManager.sendMessage", () => {
     const assistantCall = mockChatStore.addMessage.mock.calls.find(
       (call) => call[1].role === "assistant"
     );
-    expect(assistantCall?.[1].content).toBe("Accumulated text");
+    expect(assistantCall?.[1].content).toBe("State messages text");
   });
 
   it("falls back to state.messages when accumulated text is empty", async () => {
@@ -3387,6 +3472,7 @@ describe("ChatManager.sendMessage", () => {
         "/tmp/test",
         undefined,
         undefined,
+        expect.objectContaining({ mode: "english", locale: "en" }),
       );
 
       // Assert - session was updated with the generated title
@@ -3394,6 +3480,82 @@ describe("ChatManager.sendMessage", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Chat title generation is a single server-side seam shared by every desktop and mobile chat host.
+  it("passes configured interface language to background title generation", async () => {
+    mockSummarizeTitle.mockResolvedValue("Titre court");
+    __setCreateFnAgent(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [] },
+      },
+    }));
+
+    const chatManager = createChatManagerWithSettings({ taskOutputLanguage: "interface", language: "fr" });
+    await chatManager.sendMessage("chat-001", "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.");
+    await vi.waitFor(() => expect(mockSummarizeTitle).toHaveBeenCalled());
+
+    expect(mockSummarizeTitle).toHaveBeenLastCalledWith(
+      "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.",
+      "/tmp/test",
+      undefined,
+      undefined,
+      expect.objectContaining({ mode: "interface", locale: "fr" }),
+    );
+  });
+
+  it("falls back to English titles when loading settings rejects", async () => {
+    mockSummarizeTitle.mockResolvedValue("Short Title");
+    __setCreateFnAgent(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [] },
+      },
+    }));
+    const chatManager = new ChatManager(
+      mockChatStore as any,
+      "/tmp/test",
+      mockAgentStore as any,
+      undefined,
+      async () => Promise.reject(new Error("settings unavailable")),
+    );
+
+    await chatManager.sendMessage("chat-001", "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.");
+    await vi.waitFor(() => expect(mockSummarizeTitle).toHaveBeenCalled());
+
+    expect(mockSummarizeTitle).toHaveBeenLastCalledWith(
+      "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.",
+      "/tmp/test",
+      undefined,
+      undefined,
+      expect.objectContaining({ mode: "english", locale: "en" }),
+    );
+  });
+
+  it("does not wait for title settings before prompting the chat agent", async () => {
+    const prompt = vi.fn().mockResolvedValue(undefined);
+    __setCreateFnAgent(async () => ({
+      session: { prompt, dispose: vi.fn(), state: { messages: [] } },
+    }));
+    let settingsReadCount = 0;
+    const chatManager = new ChatManager(
+      mockChatStore as any,
+      "/tmp/test",
+      undefined,
+      undefined,
+      async () => {
+        settingsReadCount += 1;
+        return settingsReadCount === 1 ? new Promise<Partial<Settings>>(() => undefined) : {};
+      },
+    );
+
+    await chatManager.sendMessage("chat-001", "A message must still reach the chat agent.");
+
+    expect(prompt).toHaveBeenCalled();
+    expect(mockSummarizeTitle).not.toHaveBeenCalled();
   });
 
   it("uses truncated content when summarizeTitle returns null", async () => {

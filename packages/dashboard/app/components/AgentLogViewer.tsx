@@ -13,8 +13,11 @@ import { Maximize2, Minimize2, Loader2, ChevronDown, ChevronRight } from "lucide
 import "./AgentLogViewer.css";
 import { linkifyFilePaths, linkifyReactChildren } from "../utils/filePathLinkify";
 import { getRelativeTimeBucket } from "../utils/relativeTimeAgo";
-import { ToolCallDetails } from "./ToolCallDetails";
+import { ToolCallDetails, TOOL_CALL_PREVIEW_MAX_CHARS, TOOL_CALL_PREVIEW_MAX_LINES } from "./ToolCallDetails";
 import { ThinkingTrace } from "./ThinkingTrace";
+import { PreciseTimestamp } from "./PreciseTimestamp";
+import { useVirtualizedList } from "../hooks/useVirtualizedList";
+import { useAutoPaginationSentinel } from "../hooks/useAutoPaginationSentinel";
 
 const MARKDOWN_TOGGLE_STORAGE_KEY = "fn-agent-log-markdown";
 const TOOL_OUTPUT_TOGGLE_STORAGE_KEY = "fn-agent-log-tool-output";
@@ -175,38 +178,58 @@ interface CollapsibleToolDetailProps {
   type?: "tool" | "tool_result" | "tool_error";
 }
 
+/*
+FNXC:ToolCallDisplay 2026-08-29-04:34:
+FN-253 requires complete tool payloads to remain visible on Raw Logs by default. Long values use a
+visible CSS preview with an explicit reveal instead of hiding the payload, and the control only exists
+when it can reveal more content.
+*/
 function CollapsibleToolDetail({ detail, type = "tool_result" }: CollapsibleToolDetailProps): ReactElement {
   const { t } = useTranslation("app");
   const [expanded, setExpanded] = useState(false);
   const contentId = useId();
   const lineCount = detail.split("\n").length;
+  const exceedsPreview = lineCount > TOOL_CALL_PREVIEW_MAX_LINES || detail.length > TOOL_CALL_PREVIEW_MAX_CHARS;
+  const detailLabel = type === "tool_error"
+    ? t("agentLog.error", "Error")
+    : type === "tool"
+      ? t("agentLog.arguments", "Arguments")
+      : t("agentLog.output", "Output");
   const toggleLabel = expanded
-    ? t("agentLog.hideOutput", "Hide output")
-    : t("agentLog.showOutput", `Show output${lineCount > 1 ? ` (${lineCount} lines)` : ""}`);
+    ? t("agentLog.showLessDetail", "Show less {{detailLabel}}", { detailLabel })
+    : t(
+      "agentLog.showMoreDetail",
+      "Show more {{detailLabel}}{{lineCount}}",
+      { detailLabel, lineCount: lineCount > 1 ? ` (${lineCount} lines)` : "" },
+    );
 
   return (
     <div className="agent-log-tool-detail-wrapper">
-      <button
-        type="button"
-        className="agent-log-tool-detail-toggle"
-        onClick={() => setExpanded((prev) => !prev)}
-        aria-expanded={expanded}
-        aria-controls={contentId}
-        data-testid="tool-detail-toggle"
-      >
-        {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <span>{toggleLabel}</span>
-      </button>
+      {exceedsPreview ? (
+        <button
+          type="button"
+          className="agent-log-tool-detail-toggle"
+          onClick={() => setExpanded((prev) => !prev)}
+          aria-expanded={expanded}
+          aria-controls={contentId}
+          data-testid="tool-detail-toggle"
+        >
+          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <span>{toggleLabel}</span>
+        </button>
+      ) : null}
       <div
         id={contentId}
-        className={expanded ? "agent-log-tool-detail-content" : "agent-log-tool-detail-content agent-log-tool-detail-content--collapsed"}
+        className={expanded || !exceedsPreview
+          ? "agent-log-tool-detail-content"
+          : "agent-log-tool-detail-content agent-log-tool-detail-content--preview"}
         data-testid="tool-detail-content"
       >
         <ToolCallDetails
           className="agent-log-tool-detail"
           resultValue={detail}
           argumentsLabel={t("agentLog.arguments", "Arguments")}
-          resultLabel={type === "tool_error" ? t("agentLog.error", "Error") : type === "tool" ? t("agentLog.arguments", "Arguments") : t("agentLog.output", "Output")}
+          resultLabel={detailLabel}
           resultIsError={type === "tool_error"}
           renderValue={linkifyFilePaths}
         />
@@ -309,6 +332,8 @@ interface AgentLogViewerProps {
   loadingMore?: boolean;
   /** Total number of entries (when known) for "Showing X of Y" summary */
   totalCount?: number | null;
+  /** Shows one explanatory note for visible historical tool rows without saved detail. */
+  showMissingDetailHint?: boolean;
 }
 
 /**
@@ -319,13 +344,13 @@ interface AgentLogViewerProps {
  * - Coalesces consecutive same-agent `text`/`thinking` chunks into continuous groups
  * - Auto-scrolls to keep latest entries visible when streaming
  * - Supports toggling between markdown-formatted and plain-text rendering
- * - "Load More" button to fetch older entries when pagination is enabled
+ * - Automatic edge pagination for older entries when pagination is enabled
  * - Shows "Showing X of Y entries" summary when totalCount is provided
  *
  * @param entries - Array of log entries (in chronological order, oldest first)
  * @param loading - Whether initial load is in progress
  * @param hasMore - Whether more older entries exist beyond the current page
- * @param onLoadMore - Callback to load older entries
+ * @param onLoadMore - Callback invoked automatically near the history edge
  * @param loadingMore - Whether a load more request is in progress
  * @param totalCount - Total number of entries (when known) for summary display
  */
@@ -339,6 +364,7 @@ export function AgentLogViewer({
   onLoadMore,
   loadingMore = false,
   totalCount = null,
+  showMissingDetailHint = false,
 }: AgentLogViewerProps) {
   const { t } = useTranslation("app");
   const containerRef = useRef<HTMLDivElement>(null);
@@ -397,9 +423,37 @@ export function AgentLogViewer({
     [visibleEntries],
   );
 
+  const virtualLog = useVirtualizedList({
+    collectionKey: entries[0]?.taskId ?? "empty-log",
+    keys: chronologicalEntryKeys,
+    scrollRef: containerRef,
+    estimateHeight: 96,
+    maxRenderedRows: 60,
+    initialAlign: "end",
+    preservePrependAnchor: false,
+  });
+  const visibleEntryKeys = new Set(virtualLog.visibleKeys);
+  const windowedRenderEntries = renderEntries.filter((_, index) => visibleEntryKeys.has(chronologicalEntryKeys[index]!));
+  const windowedRenderKeys = chronologicalEntryKeys.filter((key) => visibleEntryKeys.has(key));
   const renderGroups = useMemo(
-    () => buildRenderGroups(renderEntries, chronologicalEntryKeys),
-    [renderEntries, chronologicalEntryKeys],
+    () => buildRenderGroups(windowedRenderEntries, windowedRenderKeys),
+    [windowedRenderEntries, windowedRenderKeys],
+  );
+  const logPagination = useAutoPaginationSentinel({
+    rootRef: containerRef,
+    hasMore: Boolean(hasMore && onLoadMore),
+    loading: loadingMore,
+    onLoadMore: onLoadMore ?? (() => undefined),
+    direction: "start",
+  });
+  /*
+  FNXC:ToolCallDisplay 2026-08-29-04:34:
+  A missing-detail explanation is host-opted because this viewer also serves historical and
+  synthesized agent-run pages. FN-253 shows it once for task-log tool/result rows instead of
+  silently rendering an empty space or asserting that the current persistence setting is off.
+  */
+  const hasMissingToolDetail = showMissingDetailHint && visibleEntries.some(
+    (entry) => (entry.type === "tool" || entry.type === "tool_result") && !entry.detail,
   );
 
   /*
@@ -669,7 +723,7 @@ export function AgentLogViewer({
       <div
         ref={containerRef}
         className="agent-log-viewer-scroll"
-        onScroll={handleScroll}
+        onScroll={() => { handleScroll(); virtualLog.onScroll(); }}
       >
         {/* Pagination summary */}
         {totalCount !== null && (
@@ -681,38 +735,44 @@ export function AgentLogViewer({
           </div>
         )}
 
-        {hasMore && onLoadMore && (
-          <div className="agent-log-load-more" data-testid="agent-log-load-more">
-            <button
-              className="agent-log-mode-toggle"
-              onClick={onLoadMore}
-              disabled={loadingMore}
-              data-testid="agent-log-load-more-button"
-            >
-              {loadingMore ? (
-                <>
-                  <Loader2 size={14} className="animate-spin" />
-                  {t("agentLog.loadingMore", "Loading…")}
-                </>
-              ) : (
-                t("agentLog.loadMore", "Load More")
-              )}
-            </button>
+        {hasMore && onLoadMore ? (
+          <div ref={logPagination.sentinelRef} className="agent-log-load-more" data-testid="agent-log-auto-pagination-sentinel" role="status" aria-live="polite">
+            {loadingMore ? <><Loader2 size={14} className="animate-spin" />{t("agentLog.loadingMore", "Loading…")}</> : null}
           </div>
-        )}
+        ) : null}
+        {virtualLog.topSpacerHeight > 0 ? <div aria-hidden="true" style={{ height: virtualLog.topSpacerHeight }} /> : null}
+
+        {hasMissingToolDetail ? (
+          <div className="agent-log-missing-detail-hint" role="note" data-testid="agent-log-missing-detail-hint">
+            {t("agentLog.missingToolDetailHint", "Some tool details are unavailable. They may have been recorded while detail saving was disabled; check Settings → Global General to save future tool details.")}
+          </div>
+        ) : null}
 
         {renderGroups.map((group) => {
           const firstEntry = group.kind === "single" ? group.entry : group.entries[0];
+          /*
+          FNXC:PreciseTaskLogTimestamps 2026-09-01-01:03:
+          FN-272 keeps Raw Logs' established relative label for quick scanning and adds the logged action's precise wall-clock reading beside it.
+          Gate both labels on showBadge so grouped streamed output remains free of mid-message timestamp shells.
+          */
           const timestampSpan = group.showBadge ? (
             <span className="agent-log-timestamp" data-testid="agent-log-timestamp">
               {formatTimestamp(firstEntry.timestamp, t as TFunction<"app">)}
             </span>
+          ) : null;
+          const preciseTimestamp = group.showBadge ? (
+            <PreciseTimestamp
+              timestamp={firstEntry.timestamp}
+              className="agent-log-precise-timestamp"
+              testId="agent-log-precise-timestamp"
+            />
           ) : null;
 
           const agentBadge = group.showBadge ? (
             <span className="agent-log-badge-row">
               <span className="agent-log-agent-badge">[{getAgentDisplayName(firstEntry.agent!, t as TFunction<"app">)}]</span>
               {timestampSpan}
+              {preciseTimestamp}
             </span>
           ) : null;
 
@@ -780,6 +840,7 @@ export function AgentLogViewer({
             </div>
           );
         })}
+        {virtualLog.bottomSpacerHeight > 0 ? <div aria-hidden="true" style={{ height: virtualLog.bottomSpacerHeight }} /> : null}
 
         {!isFollowing && (
           <button

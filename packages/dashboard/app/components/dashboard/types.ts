@@ -15,9 +15,9 @@ import type {
   GithubIssueAction,
   MergeResult,
   Task,
-  TaskColumnSortMode,
   TaskCreateInput,
   TaskDetail,
+  TaskColumnSortMode,
   ThemeMode,
   WorkflowStep,
   TraitFlags,
@@ -52,10 +52,12 @@ import { ChatView } from "../ChatView";
 import type { ChatSessionInfo } from "../../hooks/useChat";
 import { CommandCenter } from "../command-center/CommandCenter";
 import { DevServerView } from "../DevServerView";
-import { DocumentsView } from "../DocumentsView";
+import { NotesView } from "../NotesView";
+import { WhiteboardView } from "../WhiteboardView";
 import { EvalsView } from "../EvalsView";
 import { GitHubImportModal } from "../GitHubImportModal";
 import { GoalsView } from "../GoalsView";
+import { PatchnodeView } from "../PatchnodeView";
 import { InsightsView } from "../InsightsView";
 import { MemoryView } from "../MemoryView";
 import { PullRequestView } from "../PullRequestView";
@@ -180,6 +182,7 @@ export interface MainContentProps {
   researchReadinessVersion: number;
   evalsEnabled: boolean;
   ideationEnabled: boolean;
+  whiteboardEnabled: boolean;
   memoryEnabled: boolean;
   goalsEnabled: boolean;
   handleOpenMission: (missionId: string) => void;
@@ -192,13 +195,13 @@ export interface MainContentProps {
   mainPanelDetailTask: Task | TaskDetail | null;
   filteredBoardTasks: Task[];
   maxConcurrent: number;
-  /** Shared effective ceiling used by board previews and engine admission. */
-  effectiveMaxConcurrent: number;
+  /** Execution-worktree ceiling used by the board's Up Next worktree preview. */
+  maxWorktrees: number;
   showWorktreeGrouping: boolean;
   moveTask: (
     id: string,
     column: ColumnId,
-    optionsOrPosition?: { preserveProgress?: boolean } | number,
+    optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
   ) => Promise<Task>;
   pauseTask: (id: string) => Promise<Task>;
   openBoardTaskDetail: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
@@ -214,13 +217,6 @@ export interface MainContentProps {
     updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean },
   ) => Promise<Task>;
   retryTask: (id: string) => Promise<Task>;
-  archiveTask: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  unarchiveTask: (id: string) => Promise<Task>;
-  /*
-  FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
-  Threaded alongside archiveTask/unarchiveTask; never mutates the source
-  task's column as a side effect (see route + client contract comments).
-  */
   revertTask: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   deleteTask: (
     id: string,
@@ -231,18 +227,25 @@ export interface MainContentProps {
       allowResurrection?: boolean;
     },
   ) => Promise<Task>;
-  archiveAllDone: () => Promise<Task[]>;
-  loadArchivedTasks: () => Promise<void>;
-  /** FNXC:ArchivePagination 2026-07-08-00:00: FN-7659 — fetch the next 100-item page of archived tasks (newest-first). */
-  loadMoreArchivedTasks: () => Promise<void>;
-  /** Board action callback that commits Archive order only after its first replacement page succeeds. */
-  changeArchivedSortMode: (mode: TaskColumnSortMode) => Promise<void>;
-  /** Committed server-backed Archive order. */
-  archivedSortMode: TaskColumnSortMode;
-  /** Whether another page of archived tasks is available beyond what is currently loaded. */
-  archivedHasMore: boolean;
-  /** True while a "Show more" archived page fetch is in flight. */
-  archivedLoadingMore: boolean;
+  loadMoreCurrentTasks: () => Promise<void>;
+  currentTasksTotal: number;
+  currentTasksHasMore: boolean;
+  currentTasksLoadingMore: boolean;
+  currentTasksPaginationError?: "timeout" | "invalid-continuation" | "request-failed" | null;
+  currentTasksProgressKey?: string;
+  retryCurrentTasksPagination?: () => Promise<void>;
+  loadMoreCompletedTasks: () => Promise<void>;
+  completedCounts: {
+    byColumn: Record<string, number>;
+    byWorkflow: Record<string, Record<string, number>>;
+  };
+  completedHasMore: boolean;
+  completedLoadingMore: boolean;
+  completedPaginationError?: "timeout" | "invalid-continuation" | "request-failed" | null;
+  completedProgressKey?: string;
+  retryCompletedTasksPagination?: () => Promise<void>;
+  completedSortMode: TaskColumnSortMode;
+  changeCompletedSortMode: (mode: TaskColumnSortMode) => Promise<void>;
   searchQuery: string;
   availableModels: ModelInfo[];
   favoriteProviders: string[];
@@ -256,12 +259,13 @@ export interface MainContentProps {
   openCreateWorkflowWithNav: () => void;
   sidebarActive: boolean;
   isMobile: boolean;
+  /** Whether the measured Alpha pill is currently rendered and needs drawer clearance. */
   mainPanelDetailInitialTab: DetailTaskTab | undefined;
   closeTaskDetailMainPanel: () => void;
   setMainPanelDetailTask: Dispatch<SetStateAction<Task | TaskDetail | null>>;
   mergeTask: (id: string) => Promise<MergeResult>;
-  resetTask: (id: string) => Promise<Task>;
-  duplicateTask: (id: string) => Promise<Task>;
+  resetTask: (id: string, options?: { description?: string }) => Promise<Task>;
+  duplicateTask: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   unpauseTask: (id: string) => Promise<Task>;
   capacityRiskBannerEnabled: boolean;
   capacityRiskDismissed: boolean;
@@ -272,9 +276,11 @@ export interface MainContentProps {
   ChatView: LazyExoticComponent<typeof ChatView>;
   CommandCenter: LazyExoticComponent<typeof CommandCenter>;
   DevServerView: LazyExoticComponent<typeof DevServerView>;
-  DocumentsView: LazyExoticComponent<typeof DocumentsView>;
+  NotesView: LazyExoticComponent<typeof NotesView>;
+  WhiteboardView: LazyExoticComponent<typeof WhiteboardView>;
   EvalsView: LazyExoticComponent<typeof EvalsView>;
   GoalsView: LazyExoticComponent<typeof GoalsView>;
+  PatchnodeView: LazyExoticComponent<typeof PatchnodeView>;
   InsightsView: LazyExoticComponent<typeof InsightsView>;
   MemoryView: LazyExoticComponent<typeof MemoryView>;
   PullRequestView: LazyExoticComponent<typeof PullRequestView>;

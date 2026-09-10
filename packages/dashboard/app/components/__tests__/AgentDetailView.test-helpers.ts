@@ -1,5 +1,5 @@
 // Shared mocks/fixtures for AgentDetailView.*.test.tsx — see FN-4088
-import { createElement } from "react";
+import { createElement, useState } from "react";
 import { vi } from "vitest";
 import type { AgentCapability, AgentDetail } from "../../api";
 
@@ -96,22 +96,69 @@ vi.mock("../../api", () => ({
 }));
 
 vi.mock("../AgentLogViewer", () => ({
-  AgentLogViewer: ({ entries }: { entries: Array<{ text: string; detail?: string }> }) => createElement(
-    "div",
-    { "data-testid": "agent-log-viewer" },
-    ...entries.map((e, i) => createElement(
+  AgentLogViewer: ({
+    entries,
+    showMissingDetailHint = false,
+  }: {
+    entries: Array<{ text: string; detail?: string; type?: string }>;
+    showMissingDetailHint?: boolean;
+  }) => {
+    const [expanded, setExpanded] = useState(false);
+    const [showStart, setShowStart] = useState(false);
+    const tailEntries = entries.slice(-60);
+    const reconnectMarker = entries.find((entry) => entry.text.includes("Log stream reconnected"));
+    const renderedEntries = entries.length > 60
+      ? (showStart ? entries.slice(0, 60) : reconnectMarker ? [reconnectMarker, ...tailEntries.slice(-59)] : tailEntries)
+      : entries;
+    return createElement(
       "div",
-      { key: i },
-      createElement("span", null, e.text),
-      e.detail
+      { "data-testid": "agent-log-viewer" },
+      showMissingDetailHint && entries.some((entry) =>
+        (entry.type === "tool" || entry.type === "tool_result") && !entry.detail)
         ? createElement(
-          "button",
-          { type: "button", "data-testid": "tool-detail-toggle", "aria-expanded": "false" },
-          "Show output",
+          "div",
+          { "data-testid": "agent-log-missing-detail-hint", role: "note" },
+          "Some tool details are unavailable.",
         )
         : null,
-    )),
-  ),
+      createElement(
+        "div",
+        { className: "agent-log-viewer-scroll", onScroll: (event: { currentTarget: { scrollTop: number } }) => { if (event.currentTarget.scrollTop === 0) setShowStart(true); } },
+        ...renderedEntries.map((entry, index) => {
+        const exceedsPreview = Boolean(entry.detail && (entry.detail.length > 600 || entry.detail.split("\n").length > 6));
+        return createElement(
+          "div",
+          { key: index, className: "agent-log-text" },
+          createElement("span", null, entry.text),
+          entry.detail
+            ? createElement(
+              "pre",
+              {
+                "data-testid": "tool-detail-content",
+                className: exceedsPreview && !expanded
+                  ? "agent-log-tool-detail-content agent-log-tool-detail-content--preview"
+                  : "agent-log-tool-detail-content",
+              },
+              entry.detail,
+            )
+            : null,
+          exceedsPreview
+            ? createElement(
+              "button",
+              {
+                type: "button",
+                "data-testid": "tool-detail-toggle",
+                "aria-expanded": String(expanded),
+                onClick: () => setExpanded((value) => !value),
+              },
+              expanded ? "Show less" : "Show more",
+            )
+            : null,
+        );
+      }),
+      ),
+    );
+  },
 }));
 
 vi.mock("../CustomModelDropdown", () => ({

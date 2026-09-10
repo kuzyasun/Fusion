@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import * as fusionCore from "@fusion/core";
 import type { AgentState, AgentCapability, AgentUpdateInput, AgentLogEntry, Artifact, ArtifactCreateInput, ArtifactWithTask, Task, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus, WorkflowIrNode, IdeationCandidate, MissionWithHierarchy, DbTransaction } from "@fusion/core";
-import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon, parseWorkflowIr, WorkflowIrError, assertColumnTraitsValid, ColumnTraitValidationError, isLegacyWorkspaceWorktreeLayout, resolveWorkspaceRepoWorktreePath, resolveWorkspaceTaskWorktreeDir } from "@fusion/core";
+import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon, parseWorkflowIr, WorkflowIrError, assertColumnTraitsValid, ColumnTraitValidationError } from "@fusion/core";
 import { promoteHeldTask } from "./execution/hold-release.js";
 import { computeCrossParentDiagnosticClaim, computeCrossParentDiagnosticClaimId, computeParentIntentClaimId, DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, evaluateImplementationTaskBind, extractAgentProvisioningRequest, findSameAgentDuplicates, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, reconcileDeterministicDuplicate, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTaskGithubTracking, runDeterministicDuplicateGuard, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh } from "@fusion/core";
 import { ResearchOrchestrator } from "./research/research-orchestrator.js";
@@ -26,14 +26,18 @@ import type { AgentReflectionService } from "./agents/agent-reflection.js";
 import { createLogger } from "./logger.js";
 // FNXC:PlanArtifactPersistence 2026-07-26-03:55: PROMPT.md is filesystem-only; mirror plan writes into the DB.
 import { mirrorPlanToProjectDb } from "./plan-artifact-writeback.js";
-import { isPlanningLifecycleLockTransportError } from "./planning-handoff-recovery.js";
 import { fetchWebContent, WebFetchError } from "./util/web-fetch.js";
 import type { RunAuditor } from "./util/run-audit.js";
 import { computeApprovalDedupeKey } from "./agents/agent-action-gate.js";
 import { MessageDeliveryAutoRecoveryHandler } from "./auto-recovery-handlers/message-delivery.js";
 import { emitGoalRetrievalAudit } from "./goals/goal-anchoring-audit.js";
 import { recordRetry } from "./errors/retry-burned-logger.js";
-import { acquireWorkspaceRepoWorktree, WorkspaceRepoAcquireBusyError } from "./worktree/worktree-acquisition.js";
+import {
+  DEPENDENCY_INSTALL_COMMAND_TIMEOUT_MS,
+  recordPlannerDependencyResolution,
+  type DependencyCommandResult,
+  type DependencyCommandRunner,
+} from "./worktree/worktree-dependency-install.js";
 import { validateCodeNodeSources } from "./execution/code-node-runner.js";
 import { resolveFeatureRepairTargets } from "./missions/mission-feature-sync.js";
 import { reconcileMissionState } from "./missions/mission-state-reconcile.js";
@@ -79,13 +83,6 @@ export const taskCreateParams = Type.Object({
         "Omit to inherit the project default workflow. Use fn_workflow_list to discover valid IDs.",
     }),
   ),
-  repository_scope: Type.Optional(
-    Type.Array(Type.String(), {
-      description:
-        "Explicit workspace repositories this task may modify. Names must match configured workspace repositories; " +
-        "omitting this lets the planner confirm a proposed scope.",
-    }),
-  ),
   mission_lineage: Type.Optional(missionLineageParams),
 });
 
@@ -103,10 +100,18 @@ const agentLogTypeParams = Type.Union([
   Type.Literal("tool_error"),
 ], { description: "Only return entries of this agent-log type." });
 
+const agentLogDetailModeParams = Type.Union([
+  Type.Literal("preview"),
+  Type.Literal("full"),
+], {
+  description: "Tool-detail mode. Preview (default) bounds each detail row; full lifts that row preview while the whole response remains bounded.",
+});
+
 export const taskLogsReadParams = Type.Object({
   limit: Type.Optional(Type.Number({ description: "Maximum matching entries to return (default 100)." })),
   offset: Type.Optional(Type.Number({ description: "Number of matching entries to skip from the newest entry (default 0)." })),
   type: Type.Optional(agentLogTypeParams),
+  detail: Type.Optional(agentLogDetailModeParams),
 });
 
 export const chatTaskLogsReadParams = Type.Object({
@@ -114,6 +119,7 @@ export const chatTaskLogsReadParams = Type.Object({
   limit: Type.Optional(Type.Number({ description: "Maximum matching entries to return (default 100)." })),
   offset: Type.Optional(Type.Number({ description: "Number of matching entries to skip from the newest entry (default 0)." })),
   type: Type.Optional(agentLogTypeParams),
+  detail: Type.Optional(agentLogDetailModeParams),
 });
 
 export const taskListParams = Type.Object({});
@@ -124,19 +130,24 @@ export const taskShowParams = Type.Object({
 
 export const taskSearchParams = Type.Object({
   query: Type.String({ minLength: 1, description: "Search query" }),
-  includeDone: Type.Optional(Type.Boolean({ description: "Include done tasks (default true)" })),
-  includeArchived: Type.Optional(Type.Boolean({ description: "Include archived tasks (default true)" })),
+  includeDone: Type.Optional(Type.Boolean({ description: "Include done tasks (default false)" })),
   limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50, description: "Max results (default 20, max 50)" })),
 });
 
-export const acquireRepoWorktreeParams = Type.Object({
-  repo: Type.String({
-    description:
-      "Relative path of the sub-repo within the workspace to acquire a worktree in " +
-      "(e.g. 'wolf-server'). Must be one of the repos listed in the workspace. " +
-      "If already acquired, returns the existing worktree path immediately.",
+export const historyReadParams = Type.Object({
+  query: Type.Optional(Type.String({ description: "Search task IDs, titles, and completion summaries" })),
+  from: Type.Optional(Type.String({ description: "First UTC day, YYYY-MM-DD (inclusive)" })),
+  to: Type.Optional(Type.String({ description: "Last UTC day, YYYY-MM-DD (inclusive)" })),
+  limit: Type.Optional(Type.Number({ minimum: 1, description: "Max entries (default 20, max 50)" })),
+});
+
+export const installWorktreeDependenciesParams = Type.Object({
+  action: Type.Union([Type.Literal("install"), Type.Literal("none")], {
+    description: "Run an engine-observed dependency install, or record a reasoned absence of an install step.",
   }),
-  reason: Type.Optional(Type.String({ minLength: 1, description: "Why this repository is needed when it is outside the current task scope." })),
+  command: Type.Optional(Type.String({ minLength: 1, description: "Required for action=install; command executed by Fusion in the task worktree." })),
+  reason: Type.Optional(Type.String({ minLength: 1, description: "Required for action=none; why this dependency evidence needs no install step." })),
+  repository: Type.Optional(Type.String({ minLength: 1, description: "Workspace-relative repository path when this task has multiple configured repositories." })),
 });
 
 export const taskDocumentWriteParams = Type.Object({
@@ -266,37 +277,12 @@ export const taskPromoteParams = Type.Object({
   task_id: Type.Optional(
     Type.String({ description: "Held task to promote. Defaults to the current task." }),
   ),
-  /*
-  FNXC:WorkflowScheduling 2026-07-25-05:40:
-  Agent-native parity with the dashboard's force-promote override: an agent that
-  has read the card and judged the pending replan / Plan Review not worth waiting
-  for can start execution anyway. Opt-in per call and never defaulted on — the
-  automatic surfaces (hold-release sweep, webhook release) still cannot force, so
-  FN-7648 holds for everything that is not an explicit promote request.
-  */
-  force: Type.Optional(
-    Type.Boolean({
-      description:
-        "Start execution even when the task is still waiting on planning or plan review "
-        + "(rejection 'unplanned-for-execution'). Waives ONLY that gate — hold membership and "
-        + "downstream capacity still apply — and cancels the pending replan. Default false.",
-    }),
-  ),
-});
-
-export const taskArchiveParams = Type.Object({
-  id: Type.String({ description: "Task ID to archive from any live column (e.g. FN-001)." }),
-  removeLineageReferences: Type.Optional(Type.Boolean({ description: "When true, clear incoming lineage-parent references (child sourceParentTaskId) before archiving, so a task still referenced as a lineage parent can be archived." })),
 });
 
 export const taskDeleteParams = Type.Object({
   id: Type.String({ description: "Task ID to delete (e.g. FN-001)" }),
   allowResurrection: Type.Optional(Type.Boolean({ description: "When true, mark this tombstone as explicitly reusable for future recreation." })),
   removeLineageReferences: Type.Optional(Type.Boolean({ description: "When true, clear incoming lineage-parent references before deleting." })),
-});
-
-export const taskUnarchiveParams = Type.Object({
-  id: Type.String({ description: "Task ID to unarchive (e.g. FN-001). Must be in 'archived' column." }),
 });
 
 export const taskRetryParams = Type.Object({
@@ -332,6 +318,7 @@ export const taskUpdateParams = Type.Object({
     STEP_STATUSES.map((s) => Type.Literal(s)),
     { description: "New status: pending, in-progress, done, or skipped. Required when step is set." },
   )),
+  summary: Type.Optional(Type.String({ description: "2-4 plain-language sentences describing what THIS step actually delivered (files/behavior changed, verification run). Required when status is 'done'. Shown to the operator in the task History tab." })),
   dependencies: Type.Optional(Type.Array(Type.String(), {
     description: "Optional task dependency array. Replaces existing dependencies. Pass ['FN-001', 'FN-002'] to set dependencies. Pass [] to clear all dependencies. Omit parameter to preserve existing dependencies.",
   })),
@@ -612,6 +599,13 @@ export const askQuestionParams = Type.Object({
       })),
       multiSelect: Type.Optional(Type.Boolean({
         description: "Set true when the user may choose multiple options. Prefer type='multi_select' for clarity.",
+      })),
+      /*
+       * FNXC:ChatAskQuestion 2026-09-09-02:42:
+       * An agent must be able to append a non-blocking free-text field to a structured form without forcing the user to type filler.
+       */
+      optional: Type.Optional(Type.Boolean({
+        description: "Set true when the user may leave this question unanswered; the card can be submitted without it. Defaults to false (required).",
       })),
       type: Type.Optional(Type.Union([
         Type.Literal("text"),
@@ -1213,7 +1207,7 @@ async function resolveApprovedMissionLineage(
 type DefinedFeatureBootstrapStore = {
   claimDefinedFeatureTaskInTransaction: (tx: DbTransaction, input: { featureId: string; taskId: string; missionId: string; sliceId: string }) => Promise<unknown>;
   claimDefinedFeatureTask: (input: { featureId: string; taskId: string; missionId: string; sliceId: string }) => Promise<unknown>;
-  archiveDefinedFeatureBootstrapDuplicate: (input: { featureId: string; taskId: string; duplicateTaskId: string }) => Promise<void>;
+  deleteDefinedFeatureBootstrapDuplicate: (input: { featureId: string; taskId: string; duplicateTaskId: string }) => Promise<void>;
 };
 
 type AgentTaskInputWithBootstrap = TaskCreateInput & {
@@ -1227,7 +1221,7 @@ type AgentTaskInputWithBootstrap = TaskCreateInput & {
 function definedFeatureBootstrapInput(store: TaskStore, lineage: MissionLineageReference | null): Pick<AgentTaskInputWithBootstrap, "afterTaskInsert" | "validateDuplicateCanonical" | "skipSameAgentDuplicateIntake" | "preflightSameAgentDuplicate" | "reconcileCreatedDuplicate"> {
   if (!lineage?.bootstrapDefinedFeature) return {};
   const missionStore = store.getMissionStore() as Partial<DefinedFeatureBootstrapStore>;
-  if (!missionStore.claimDefinedFeatureTaskInTransaction || !missionStore.claimDefinedFeatureTask || !missionStore.archiveDefinedFeatureBootstrapDuplicate) {
+  if (!missionStore.claimDefinedFeatureTaskInTransaction || !missionStore.claimDefinedFeatureTask || !missionStore.deleteDefinedFeatureBootstrapDuplicate) {
     throw new Error("Defined-feature bootstrap requires the PostgreSQL mission store; no task was created.");
   }
   const claim = (taskId: string) => ({ featureId: lineage.featureId, taskId, missionId: lineage.missionId, sliceId: lineage.sliceId });
@@ -1242,14 +1236,14 @@ function definedFeatureBootstrapInput(store: TaskStore, lineage: MissionLineageR
     validateDuplicateCanonical: async (task) => { await missionStore.claimDefinedFeatureTask!(claim(task.id)); },
     /*
     FNXC:MissionAdmission 2026-07-23-20:00:
-    The ordinary same-agent intake runs after task-row commit and could archive
+    The ordinary same-agent intake runs after task-row commit and could delete
     feature.taskId. Suppress only that path; deterministic reconciliation below
-    retains the claimed task and atomically archives a late competing duplicate.
+    retains the claimed task and atomically soft-deletes a late competing duplicate.
     */
     skipSameAgentDuplicateIntake: true,
     preflightSameAgentDuplicate: true,
     reconcileCreatedDuplicate: async (duplicate, created) => {
-      await missionStore.archiveDefinedFeatureBootstrapDuplicate!({
+      await missionStore.deleteDefinedFeatureBootstrapDuplicate!({
         featureId: lineage.featureId,
         taskId: created.id,
         duplicateTaskId: duplicate.id,
@@ -1269,14 +1263,13 @@ async function findDefinedFeatureBootstrapDuplicate(
   sourceParentTaskId: string | undefined,
 ): Promise<Task | undefined> {
   if (!sourceAgentId && !sourceParentTaskId) return undefined;
-  const candidates = await store.listTasks({ slim: true, includeArchived: true, includeDeleted: true });
+  const candidates = await store.listTasks({ slim: true, includeArchived: false, includeDeleted: true });
   const byId = new Map(candidates.map((task) => [task.id, task]));
   /*
   FNXC:WorkflowResolvedColumns 2026-07-30-10:05 (batch-engine tail):
-  Resolved AHEAD of the synchronous `flatMap` below, which cannot await. NOT the query-filter class: this
-  query passes `includeArchived: true`, so the predicate inside the callback is the ONLY archived guard on
-  this path — on a renamed archive lane an archived sibling became a bootstrap canonical, and
-  `claimDefinedFeatureTask` then rejects the non-live row, so the claim fails outright.
+  Resolve terminal columns ahead of the synchronous `flatMap`, which cannot await. The query excludes
+  historical snapshots but includes soft-deleted rows so the explicit `deletedAt` guard below preserves
+  the no-resurrection boundary without treating deleted work as a canonical duplicate.
   */
   const isTerminalCandidate = await resolveTerminalColumnsForTasks(store, candidates);
   const matches = findSameAgentDuplicates({
@@ -1288,8 +1281,8 @@ async function findDefinedFeatureBootstrapDuplicate(
     /*
     FNXC:MissionAdmission 2026-07-23-21:10:
     Defined-feature retry preflight follows the normal duplicate guard's live
-    task boundary. An archived sibling cannot be a bootstrap canonical because
-    claimDefinedFeatureTask rejects non-live task rows.
+    task boundary. Completed or soft-deleted siblings cannot become bootstrap
+    canonicals because `claimDefinedFeatureTask` accepts only live work.
     */
     if (Number.isNaN(createdAt) || task.deletedAt || isTerminalCandidate(task)) return [];
     return [{
@@ -1347,12 +1340,11 @@ async function carryCanonicalTaskRouting(
 
 /*
 FNXC:WorkflowResolvedColumns 2026-07-30-23:05 (batch-engine — the agent tools listed finished cards as active):
-`fn_task_list` describes itself as "list active tasks that aren't done or archived", and `fn_task_search`
-offers `includeDone: false`. Both filtered with `task.column !== "done"`, so on a board whose complete lane
+`fn_task_list` describes itself as listing active tasks, and `fn_task_search` offers `includeDone: false`. Both filtered with `task.column !== "done"`, so on a board whose Complete lane
 is renamed a FINISHED card came back as active — to an AGENT, which then reasons and acts on it as
 outstanding work. `includeArchived: false` is handled by the query, but "done" was only ever a TS predicate.
 
-MEMBERSHIP over the complete AND archived roles, unioned with the legacy pair: `resolveWorkflowIrForTask`
+MEMBERSHIP over every Complete column, unioned with the legacy Done fallback: `resolveWorkflowIrForTask`
 returns the BUILT-IN IR for a missing or corrupt workflow rather than throwing, so without the union a
 degraded renamed board would resolve a terminal set that excludes its own terminal lane and the filter
 would go inert.
@@ -1367,14 +1359,13 @@ export async function resolveTerminalColumnsForTasks(
   const terminalByTaskId = new Map<string, ReadonlySet<string>>();
   for (const task of tasks) {
     if (terminalByTaskId.has(task.id)) continue;
-    const columns = new Set<string>(["done", "archived"]);
+    const columns = new Set<string>(["done"]);
     try {
       const ir = await fusionCore.resolveWorkflowIrForTask(store, task.id, cache);
       if (ir) {
         for (const id of fusionCore.columnsWithFlag(ir, "complete")) columns.add(id);
-        for (const id of fusionCore.columnsWithFlag(ir, "archived")) columns.add(id);
       }
-    } catch { /* degraded: legacy pair only */ }
+    } catch { /* degraded: Done only */ }
     terminalByTaskId.set(task.id, columns);
   }
   return (task: Task) => terminalByTaskId.get(task.id)?.has(task.column) === true;
@@ -1581,10 +1572,10 @@ export async function createAgentTask(
         : undefined,
     });
 
-    const wasDuplicate = proposalClaimConflict || reconcile.outcome === "archived" || reconcile.outcome === "kept-duplicate";
+    const wasDuplicate = proposalClaimConflict || reconcile.outcome === "removed" || reconcile.outcome === "kept-duplicate";
     const canonical = proposalClaimConflict
       ? await carryCanonicalTaskRouting(store, createdTask, input)
-      : reconcile.outcome === "archived"
+      : reconcile.outcome === "removed"
       ? await carryCanonicalTaskRouting(store, reconcile.canonical, input)
       : reconcile.canonical;
     /*
@@ -1693,7 +1684,6 @@ export function createTaskCreateTool(
           description: params.description,
           dependencies: params.dependencies,
           priority: params.priority,
-          ...(params.repository_scope ? { repositoryScope: params.repository_scope } : {}),
           ...(workflowId ? { workflowId } : {}),
           ...(lineage ? { missionId: lineage.missionId, sliceId: lineage.sliceId } : {}),
           ...definedFeatureBootstrapInput(store, lineage),
@@ -1780,6 +1770,8 @@ providing a useful source-level stop before the universal per-result wrapper run
 The hint names the narrowing surface instead of silently tail-cutting an agent's context.
 */
 const SEMANTIC_TOOL_READ_MAX_CHARS = 12_000;
+/** Maximum persisted tool-detail characters shown per row in normal agent log reads. */
+export const AGENT_LOG_READ_DETAIL_PREVIEW_MAX = 600;
 
 function trimSemanticToolRead(text: string, hint: string): string {
   if (text.length <= SEMANTIC_TOOL_READ_MAX_CHARS) return text;
@@ -1805,7 +1797,7 @@ export function createTaskListTool(store: TaskStore): ToolDefinition {
     name: "fn_task_list",
     label: "List Tasks",
     description:
-      "List active tasks that aren't done or archived. Returns ID, description, column, " +
+      "List active tasks that have not reached their workflow's Complete column. Returns ID, description, column, " +
       "and dependencies for each. Use to discover work and check for duplicates.",
     parameters: taskListParams,
     execute: async () => {
@@ -1827,7 +1819,7 @@ export function createTaskSearchTool(store: TaskStore): ToolDefinition {
     label: "Search Tasks",
     description:
       "Keyword search across active tasks by default. " +
-      "Done and archived history is opt-in and must not be used for duplicate detection.",
+      "Done history is opt-in and must not be used for duplicate detection.",
     parameters: taskSearchParams,
     execute: async (_id: string, params: Static<typeof taskSearchParams>) => {
       const query = params.query.trim();
@@ -1840,7 +1832,7 @@ export function createTaskSearchTool(store: TaskStore): ToolDefinition {
       const limit = Math.min(50, Math.max(1, Math.floor(params.limit ?? 20)));
       const results = await store.searchTasks(query, {
         slim: true,
-        includeArchived: params.includeArchived ?? false,
+        includeArchived: false,
         limit,
       });
       const includeDone = params.includeDone ?? false;
@@ -1854,6 +1846,53 @@ export function createTaskSearchTool(store: TaskStore): ToolDefinition {
       return {
         content: [{ type: "text" as const, text }],
         details: { count: filtered.length },
+      };
+    },
+  };
+}
+
+/*
+FNXC:PatchnodeChat 2026-08-28-12:16:
+Chat reads the same permanent, per-delivery ledger as the dashboard and never looks task rows up, so later-deleted deliveries remain answerable.
+
+FNXC:HistoryChat 2026-09-04-09:35:
+FN-293 completes the agent-facing rename by exposing only `fn_history_read`, without a compatibility alias.
+The HTTP route, PostgreSQL table, view id, i18n keys, and `@fusion/core` types and methods intentionally retain their stable `patchnode` identifiers.
+*/
+export function createHistoryReadTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_history_read",
+    label: "Read History",
+    description: "Read the permanent daily history of completed and reverted task deliveries.",
+    parameters: historyReadParams,
+    execute: async (_id: string, params: Static<typeof historyReadParams>) => {
+      const limit = Math.min(50, Math.max(1, Math.floor(params.limit ?? 20)));
+      const result = await store.listPatchnodeEntries({
+        ...(params.query?.trim() ? { query: params.query.trim() } : {}),
+        ...(params.from ? { from: params.from } : {}),
+        ...(params.to ? { to: params.to } : {}),
+        limit,
+      });
+      const days = fusionCore.groupPatchnodeEntriesByDay(result.entries);
+      if (days.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No History entries matched." }],
+          details: { dayCount: 0, entryCount: 0 },
+        };
+      }
+      const lines = days.flatMap((day) => [
+        `## ${day.day}`,
+        ...day.entries.map((entry) => {
+          const cancelled = entry.kind === "reverted" ? "CANCELLED — " : "";
+          const reverted = entry.kind === "completed" && entry.revertedAt
+            ? ` (reverted ${entry.revertedAt.slice(0, 10)})`
+            : "";
+          return `${cancelled}${entry.taskId} — ${entry.title}: ${entry.body}${reverted}`;
+        }),
+      ]);
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: { dayCount: days.length, entryCount: result.entries.length },
       };
     },
   };
@@ -1922,18 +1961,7 @@ export function createTaskLogTool(store: TaskStore, taskId: string): ToolDefinit
       "Use for significant events — not every small step.",
     parameters: taskLogParams,
     execute: async (_id: string, params: Static<typeof taskLogParams>) => {
-      try {
-        await store.logEntry(taskId, params.message, params.outcome);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } catch (err: any) {
-        if (typeof err?.message === "string" && err.message.toLowerCase().includes("archived")) {
-          return {
-            content: [{ type: "text" as const, text: "ERROR: Cannot log to archived task — this task is read-only" }],
-            details: {},
-          };
-        }
-        throw err;
-      }
+      await store.logEntry(taskId, params.message, params.outcome);
 
       return {
         content: [{ type: "text" as const, text: `Logged: ${params.message}` }],
@@ -1960,18 +1988,7 @@ export function createTaskLogToolWithContext(store: TaskStore, taskId: string, r
       "Use for significant events — not every small step.",
     parameters: taskLogParams,
     execute: async (_id: string, params: Static<typeof taskLogParams>) => {
-      try {
-        await store.logEntry(taskId, params.message, params.outcome, runContext);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } catch (err: any) {
-        if (typeof err?.message === "string" && err.message.toLowerCase().includes("archived")) {
-          return {
-            content: [{ type: "text" as const, text: "ERROR: Cannot log to archived task — this task is read-only" }],
-            details: {},
-          };
-        }
-        throw err;
-      }
+      await store.logEntry(taskId, params.message, params.outcome, runContext);
 
       return {
         content: [{ type: "text" as const, text: `Logged: ${params.message}` }],
@@ -1998,20 +2015,67 @@ export function normalizeAgentLogPaging(rawLimit?: unknown, rawOffset?: unknown,
 FNXC:TaskLogsRead 2026-07-16-00:00:
 Issue #2149 requires failure analysis to preserve each persisted log row's chronology. AgentLogEntry has no persisted stream/run boundary, so adjacent text or thinking rows cannot safely be re-glued here: they may be distinct responses from the same agent. The dashboard can group its live render entries using its hidden tool-boundary metadata; this store-only reader must render every persisted row separately.
 */
-export function renderAgentLogEntries(entries: AgentLogEntry[]): string {
-  return entries.map((entry) => formatAgentLogBlock(entry, entry.text)).join("\n\n");
+export interface RenderAgentLogEntriesOptions {
+  /** Maximum tool-detail characters per entry; omit to retain the legacy unbounded renderer. */
+  detailPreviewMax?: number;
 }
 
-function formatAgentLogBlock(entry: AgentLogEntry, text: string): string {
+function buildAgentLogDetailPreview(detail: string, maximum: number | undefined): string {
+  if (maximum === undefined || detail.length <= maximum) return detail;
+
+  let kept = maximum;
+  let marker = "";
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    const omitted = detail.length - kept;
+    marker = `\n[Detail preview truncated: ${omitted} characters omitted. Use detail: "full" with a smaller limit, offset, or type filter to retrieve the complete payload.]`;
+    const nextKept = Math.max(0, maximum - marker.length);
+    if (nextKept === kept) break;
+    kept = nextKept;
+  }
+  return `${detail.slice(0, kept)}${marker}`;
+}
+
+export function renderAgentLogEntries(entries: AgentLogEntry[], options?: RenderAgentLogEntriesOptions): string {
+  return entries.map((entry) => formatAgentLogBlock(entry, entry.text, options?.detailPreviewMax)).join("\n\n");
+}
+
+function formatAgentLogBlock(entry: AgentLogEntry, text: string, detailPreviewMax?: number): string {
   const agent = entry.agent ? ` (${entry.agent})` : "";
-  const detail = entry.detail !== undefined ? `\nDetail:\n${entry.detail}` : "";
+  const detail = entry.detail !== undefined
+    ? `\nDetail:\n${buildAgentLogDetailPreview(entry.detail, detailPreviewMax)}`
+    : "";
   return `[${entry.timestamp}] ${entry.type}${agent}\n${text}${detail}`;
+}
+
+export type AgentLogReadDetailMode = "preview" | "full";
+
+export interface TaskAgentLogReadTextOptions {
+  total: number;
+  limit: number;
+  offset: number;
+  type?: AgentLogEntry["type"];
+  detail?: AgentLogReadDetailMode;
+}
+
+/*
+FNXC:TaskLogsRead 2026-08-29-05:00:
+FN-253 makes tool detail default-persisted, so all three fn_task_logs_read registrations share this
+builder. Preview mode bounds each row before the existing 12,000-character response budget; full mode
+is the explicit retrieval escape hatch while the same whole-response narrowing hint remains intact.
+*/
+export function buildTaskAgentLogReadText(entries: AgentLogEntry[], options: TaskAgentLogReadTextOptions): string {
+  const filter = options.type ? `, type=${options.type}` : "";
+  const header = `Agent log: ${entries.length}/${options.total} entries (limit=${options.limit}, offset=${options.offset}${filter})`;
+  const rendered = entries.length > 0
+    ? `${header}\n\n${renderAgentLogEntries(entries, options.detail === "full" ? undefined : { detailPreviewMax: AGENT_LOG_READ_DETAIL_PREVIEW_MAX })}`
+    : `${header}\n\n(no matching log entries)`;
+  return trimSemanticToolRead(rendered, "use a smaller limit, offset, or type filter for more");
 }
 
 async function readTaskAgentLogs(
   store: TaskStore,
   taskId: string,
-  params: { limit?: unknown; offset?: unknown; type?: AgentLogEntry["type"] },
+  params: { limit?: unknown; offset?: unknown; type?: AgentLogEntry["type"]; detail?: AgentLogReadDetailMode },
 ) {
   const { limit, offset } = normalizeAgentLogPaging(params.limit, params.offset);
   try {
@@ -2019,11 +2083,14 @@ async function readTaskAgentLogs(
       store.getAgentLogs(taskId, { limit, offset, type: params.type }),
       store.getAgentLogCount(taskId, { type: params.type }),
     ]);
-    const filter = params.type ? `, type=${params.type}` : "";
-    const header = `Agent log: ${entries.length}/${total} entries (limit=${limit}, offset=${offset}${filter})`;
-    const text = entries.length > 0 ? `${header}\n\n${renderAgentLogEntries(entries)}` : `${header}\n\n(no matching log entries)`;
     return {
-      content: [{ type: "text" as const, text: trimSemanticToolRead(text, "use a smaller limit, offset, or type filter for more") }],
+      content: [{ type: "text" as const, text: buildTaskAgentLogReadText(entries, {
+        total,
+        limit,
+        offset,
+        type: params.type,
+        detail: params.detail,
+      }) }],
       details: { taskId, total, limit, offset, type: params.type },
     };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2040,7 +2107,7 @@ export function createTaskLogsReadTool(store: TaskStore, taskId: string): ToolDe
   return {
     name: "fn_task_logs_read",
     label: "Read Agent Logs",
-    description: "Read this task's persisted agent log with pagination and optional type filtering. Default page size is 100.",
+    description: "Read this task's persisted agent log with pagination and optional type filtering. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response stays bounded. Default page size is 100.",
     parameters: taskLogsReadParams,
     execute: async (_id: string, params: Static<typeof taskLogsReadParams>) => readTaskAgentLogs(store, taskId, params),
   };
@@ -2054,7 +2121,7 @@ export function createChatTaskLogsReadTool(store: TaskStore): ToolDefinition {
   return {
     name: "fn_task_logs_read",
     label: "Read Agent Logs",
-    description: "Read a task's persisted agent log with pagination and optional type filtering. Requires task_id; default page size is 100.",
+    description: "Read a task's persisted agent log with pagination and optional type filtering. Requires task_id. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response stays bounded. Default page size is 100.",
     parameters: chatTaskLogsReadParams,
     execute: async (_id: string, params: Static<typeof chatTaskLogsReadParams>) => readTaskAgentLogs(store, params.task_id, params),
   };
@@ -2137,26 +2204,142 @@ export function createTaskDocumentReadTool(store: TaskStore, taskId: string): To
   };
 }
 
+/*
+FNXC:WorktreeDependencies 2026-08-29-06:59:
+Planner dependency resolutions are durable only when Fusion itself observed the command result. The
+planning-only tool below runs in the pinned task worktree through the sandbox-routed command seam;
+planner prose or a shell claim cannot mark an install as successful. A reasoned `none` is limited to
+unrecognised evidence, while Plan Review remains the bounded blocker for unresolved readiness.
+*/
+export function createInstallWorktreeDependenciesTool(
+  store: TaskStore,
+  taskId: string,
+  options: {
+    rootDir: string;
+    runConfiguredCommand: DependencyCommandRunner;
+    getSettings: () => Promise<Settings>;
+    runContext?: RunMutationContext;
+    taskEnv?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+  },
+): ToolDefinition {
+  const errorResult = (message: string) => ({
+    content: [{ type: "text" as const, text: `ERROR: ${message}` }],
+    details: {},
+    isError: true,
+  });
+  const tail = (value: string, max = 2_000) => value.length <= max ? value : `…${value.slice(-max)}`;
+
+  return {
+    name: "fn_install_worktree_dependencies",
+    label: "Install Worktree Dependencies",
+    description:
+      "Run a planner-selected dependency install through Fusion, or record a reasoned no-install decision. " +
+      "Plan Review will continue to request revision until dependency readiness is durable.",
+    parameters: installWorktreeDependenciesParams,
+    execute: async (_id: string, params: Static<typeof installWorktreeDependenciesParams>) => {
+      const task = await store.getTask(taskId);
+      if (!task) return errorResult(`Task ${taskId} no longer exists.`);
+      const workspaceRepos = (await fusionCore.loadWorkspaceConfig(options.rootDir))?.repos ?? [];
+      const requestedRepository = params.repository?.trim();
+      let worktreePath: string | undefined;
+      let repositoryLabel: string | undefined;
+      if (workspaceRepos.length > 0) {
+        if (workspaceRepos.length > 1 && !requestedRepository) {
+          return errorResult("repository is required for a workspace with multiple configured repositories.");
+        }
+        if (workspaceRepos.length === 1 && requestedRepository && requestedRepository !== workspaceRepos[0]) {
+          return errorResult(`Unknown workspace repository: ${requestedRepository}`);
+        }
+        const repository = requestedRepository ?? workspaceRepos[0]!;
+        if (!workspaceRepos.includes(repository)) return errorResult(`Unknown workspace repository: ${repository}`);
+        worktreePath = task.workspaceWorktrees?.[repository]?.worktreePath;
+        repositoryLabel = repository;
+      } else {
+        if (requestedRepository) return errorResult("repository is only valid for a configured workspace task.");
+        worktreePath = task.worktree;
+      }
+      if (!worktreePath || !existsSync(worktreePath)) {
+        return errorResult(`No acquired task worktree is available${repositoryLabel ? ` for ${repositoryLabel}` : ""}.`);
+      }
+
+      const settings = await options.getSettings();
+      if (params.action === "none") {
+        const reason = params.reason?.trim();
+        if (!reason) return errorResult("reason is required for action=none.");
+        const readiness = recordPlannerDependencyResolution({
+          worktreePath,
+          action: "none",
+          reason,
+          settings,
+        });
+        await store.logEntry(
+          taskId,
+          `Planner recorded no dependency install step${repositoryLabel ? ` [${repositoryLabel}]` : ""}`,
+          reason,
+          options.runContext,
+        );
+        return {
+          content: [{ type: "text" as const, text: `Recorded no-install resolution${repositoryLabel ? ` for ${repositoryLabel}` : ""}. Readiness: ${readiness.readiness}.` }],
+          details: { readiness: readiness.readiness },
+        };
+      }
+
+      const command = params.command?.trim();
+      if (!command) return errorResult("command is required for action=install.");
+      let result: DependencyCommandResult;
+      try {
+        result = await options.runConfiguredCommand(
+          command,
+          worktreePath,
+          DEPENDENCY_INSTALL_COMMAND_TIMEOUT_MS,
+          options.taskEnv ?? process.env,
+        );
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        result = {
+          stdout: "",
+          stderr: "",
+          exitCode: null,
+          signal: null,
+          bufferExceeded: false,
+          timedOut: false,
+          spawnError: error instanceof Error ? error : new Error(String(error)),
+        };
+      }
+      const readiness = recordPlannerDependencyResolution({
+        worktreePath,
+        action: "install",
+        command,
+        result,
+        settings,
+      });
+      const succeeded = !result.spawnError && !result.timedOut && result.exitCode === 0;
+      const output = tail([result.stdout ?? "", result.stderr ?? "", typeof result.spawnError === "string" ? result.spawnError : result.spawnError?.message ?? ""]
+        .filter(Boolean)
+        .join("\n"));
+      await store.logEntry(
+        taskId,
+        `Planner dependency install${repositoryLabel ? ` [${repositoryLabel}]` : ""} ${succeeded ? "completed" : "failed"}`,
+        output || `Exit code: ${result.exitCode ?? "unknown"}`,
+        options.runContext,
+      );
+      return {
+        content: [{
+          type: "text" as const,
+          text: `${succeeded ? "Dependency install completed" : "Dependency install failed"}${repositoryLabel ? ` for ${repositoryLabel}` : ""}. Exit code: ${result.exitCode ?? "unknown"}. Readiness: ${readiness.readiness}.${output ? `\n${output}` : ""}`,
+        }],
+        details: { exitCode: result.exitCode, readiness: readiness.readiness },
+        ...(succeeded ? {} : { isError: true }),
+      };
+    },
+  };
+}
+
 /**
  * FNXC:WorkflowReviewers 2026-07-01-13:22:
  * Plan Review inline fixes must be able to rewrite the task's authoritative PROMPT.md, but that pre-execution reviewer should not need general source-file write tools. Route the write through TaskStore so existing PROMPT.md validation, task directory placement, and task.json sync remain the single persistence path.
  */
-/*
-FNXC:RepositoryScope 2026-08-20-23:40:
-A workspace plan confirms a task-level intent once, rather than turning each acquired checkout into
-an independent plan. The heading is mandatory for a workspace plan: retaining a creation proposal
-when a planner omitted or misspelled it would let review approve unconfirmed repository intent.
-*/
-function parsePlanRepositoryScope(content: string, configured: readonly string[]): string[] | undefined {
-  const match = content.match(/^##\s+Repository Scope\s*$([\s\S]*?)(?=^##\s|(?![\s\S]))/m);
-  if (!match) return undefined;
-  const repositories = [...match[1].matchAll(/^\s*[-*]\s+`?([^`\n]+?)`?\s*$/gm)]
-    .map((entry) => entry[1].trim())
-    .filter(Boolean);
-  if (repositories.length === 0 || repositories.some((repo) => !configured.includes(repo))) return undefined;
-  return [...new Set(repositories)].sort();
-}
-
 export function createTaskPromptWriteTool(
   store: TaskStore,
   taskId: string,
@@ -2178,42 +2361,6 @@ export function createTaskPromptWriteTool(
       confirmation could run, so the validated prompt-then-scope compensation remains sequential.
       */
       try {
-        const rootDir = typeof (store as unknown as { getRootDir?: unknown }).getRootDir === "function"
-          ? store.getRootDir()
-          : undefined;
-        const configured = rootDir ? (await fusionCore.loadWorkspaceConfig(rootDir))?.repos ?? [] : [];
-        const plannedScope = parsePlanRepositoryScope(params.content, configured);
-        /*
-        FNXC:RepositoryScope 2026-08-20-23:57:
-        Workspace plans cannot persist before their Repository Scope is validated. This blocks a
-        Plan Review from approving a stale creation proposal when the planner omitted an empty, or
-        unknown scope heading; non-workspace plans retain their existing prompt-only contract.
-        */
-        if (configured.length > 0 && !plannedScope) {
-          throw new Error("Workspace PROMPT.md must include a non-empty ## Repository Scope with configured repository names");
-        }
-        const current = await store.getTask(taskId);
-        const hasStartedLanding = Object.values(current?.workspaceWorktrees ?? {}).some((entry) => Boolean(entry.landedSha));
-        if (plannedScope && hasStartedLanding && JSON.stringify(current?.repositoryScope?.repositories ?? []) !== JSON.stringify(plannedScope)) {
-          throw new Error(`Repository scope for ${taskId} cannot change after workspace landing has started`);
-        }
-        /*
-        FNXC:RepositoryScope 2026-08-21-01:18:
-        PROMPT.md and confirmed task intent are one observable generation. The authoritative
-        updateTask path holds the planning lifecycle lock and writes both fields in one task-row
-        transaction, so review, completion, and land readers never observe a new scope heading
-        paired with the prior repository_scope value. File projection follows the committed row.
-        */
-        const repositoryScope = plannedScope
-          ? {
-              repositories: plannedScope,
-              state: "confirmed" as const,
-              revision: (current?.repositoryScope?.revision ?? 0) + 1,
-              confirmedAt: new Date().toISOString(),
-              confirmedBy: "plan" as const,
-              extensions: current?.repositoryScope?.extensions,
-            }
-          : undefined;
         /*
         FNXC:TaskReset 2026-08-22-04:49:
         A triage attempt captured before Reset can outlive the route's non-reentrant planning lock.
@@ -2223,10 +2370,8 @@ export function createTaskPromptWriteTool(
         if (canPersist && !canPersist()) {
           throw new Error(`Planning for ${taskId} was reset before PROMPT.md could be persisted`);
         }
-        const promptUpdate = {
-          prompt: params.content,
-          ...(repositoryScope ? { repositoryScope } : {}),
-        };
+        // Workspace membership is derived from workspace.json at task start; PROMPT.md is plan-only.
+        const promptUpdate = { prompt: params.content };
         if (canPersist) {
           /*
           FNXC:TaskReset 2026-08-22-18:07:
@@ -2568,7 +2713,6 @@ async function registerArtifactForAgent(
     };
 
     const artifact: Artifact = await store.registerArtifact(input);
-    void notifyArtifactRegistered(messageStore, artifact, authorId);
     return {
       content: [{
         type: "text" as const,
@@ -2844,35 +2988,6 @@ function hasImageSignature(data: Buffer, mimeType: string): boolean {
   }
 
   return false;
-}
-
-async function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifact: Artifact, authorId: string): Promise<void> {
-  if (!messageStore) return;
-
-  /*
-  FNXC:ArtifactRegistry 2026-07-12-00:00:
-  Artifact-registration mailbox notifications remain best-effort and keep their stable content string, but metadata now carries mimeType so dashboard mailbox surfaces can render document/other artifact affordances from metadata without an extra artifact fetch.
-  */
-  try {
-    await messageStore.sendMessage({
-      fromType: "system",
-      toType: "user",
-      toId: DASHBOARD_USER_ID,
-      type: "system",
-      content: `New ${artifact.type} artifact registered: ${artifact.title}`,
-      metadata: {
-        artifactId: artifact.id,
-        artifactType: artifact.type,
-        title: artifact.title,
-        mimeType: artifact.mimeType,
-        authorId,
-        taskId: artifact.taskId,
-      },
-    });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } catch (err: any) {
-    log.warn(`Failed to send best-effort artifact registration notification for ${artifact.id}: ${err instanceof Error ? err.message : String(err)}`);
-  }
 }
 
 async function listArtifactsForAgent(store: TaskStore, params: Static<typeof artifactListParams>) {
@@ -3195,12 +3310,10 @@ export function createWorkflowSelectTool(store: TaskStore, currentTaskId: string
  * hold column — the agent-native equivalent of the dashboard's "promote" action.
  * Defaults to the current task. Wraps {@link promoteHeldTask}.
  *
- * FNXC:WorkflowScheduling 2026-07-25-05:40:
- * `force: true` mirrors the dashboard's confirm-dialog override for the
- * `unplanned-for-execution` rejection. The rejection message names the flag so a
- * caller that hit the gate can decide to waive it rather than guessing; the
- * result text says so explicitly when a promote was forced, because "started
- * without its plan review" is not a detail to bury.
+ * FNXC:WorkflowScheduling 2026-08-29-00:24:
+ * FN-245 removes the agent-native plan-gate override. The tool exposes only a
+ * normal promote request and reports an unplanned refusal plainly, so agents
+ * cannot waive pending planning or plan review.
  */
 export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): ToolDefinition {
   return {
@@ -3210,39 +3323,32 @@ export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): 
       "Manually promote a held task out of its hold column, releasing it regardless of the " +
       "hold's release kind (the explicit operator action a 'manual' hold waits for). Defaults " +
       "to the current task. Returns the destination column, or a rejection reason when the task " +
-      "is not held or the destination is full. Pass force:true to start execution even when " +
-      "planning or plan review is still outstanding (that waives the plan gate and cancels the " +
-      "pending replan; capacity still applies).",
+      "is not held, is still waiting on planning or plan review, or the destination is full.",
     parameters: taskPromoteParams,
     execute: async (_id: string, params: Static<typeof taskPromoteParams>) => {
       const taskId = params.task_id?.trim() || currentTaskId;
-      const force = params.force === true;
       try {
-        const outcome = await promoteHeldTask(store, taskId, {}, { force });
+        const outcome = await promoteHeldTask(store, taskId);
         if (outcome.released) {
-          const forcedNote = outcome.forcedUnplanned
-            ? " Forced past the outstanding planning/plan review — the pending replan was cancelled."
-            : "";
           return {
             content: [{
               type: "text" as const,
-              text: `Promoted ${taskId} to column '${outcome.toColumn}'.${forcedNote}`,
+              text: `Promoted ${taskId} to column '${outcome.toColumn}'.`,
             }],
             details: {
               taskId,
               released: true,
               toColumn: outcome.toColumn,
-              forcedUnplanned: outcome.forcedUnplanned === true,
             },
           };
         }
-        const forceHint = outcome.rejection === "unplanned-for-execution"
-          ? " Pass force:true to start execution anyway."
-          : "";
+        const message = outcome.rejection === "unplanned-for-execution"
+          ? `${taskId} is still waiting on planning or plan review.`
+          : outcome.rejection ?? "unknown";
         return {
           content: [{
             type: "text" as const,
-            text: `ERROR: Could not promote ${taskId}: ${outcome.rejection ?? "unknown"}.${forceHint}`,
+            text: `ERROR: Could not promote ${taskId}: ${message}.`,
           }],
           details: { taskId, released: false, rejection: outcome.rejection },
           isError: true,
@@ -3266,53 +3372,6 @@ Keep catch blocks typed as unknown (no-explicit-any) and surface err.message via
 */
 function toolErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-export function createTaskArchiveTool(store: TaskStore): ToolDefinition {
-  return {
-    name: "fn_task_archive",
-    label: "Archive Task",
-    description:
-      "Archive a task from any live column (move to archived). " +
-      "Archived tasks are preserved for historical reference but moved out of the main board view. " +
-      "If the task is still referenced as a lineage parent by another task, archiving is rejected unless removeLineageReferences:true is passed.",
-    parameters: taskArchiveParams,
-    execute: async (_id: string, params: Static<typeof taskArchiveParams>) => {
-      try {
-        const task = await store.archiveTask(params.id, {
-          removeLineageReferences: params.removeLineageReferences === true,
-        });
-        return {
-          content: [{ type: "text" as const, text: `Archived ${task.id} → ${task.column}` }],
-          details: { taskId: task.id, column: task.column },
-        };
-      } catch (err: unknown) {
-        return { content: [{ type: "text" as const, text: `ERROR: Failed to archive task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
-      }
-    },
-  };
-}
-
-export function createTaskUnarchiveTool(store: TaskStore): ToolDefinition {
-  return {
-    name: "fn_task_unarchive",
-    label: "Unarchive Task",
-    description:
-      "Unarchive an archived task (move from archived → its restore column). " +
-      "Restores to the pre-archive column when available, with active execution columns downgraded to todo.",
-    parameters: taskUnarchiveParams,
-    execute: async (_id: string, params: Static<typeof taskUnarchiveParams>) => {
-      try {
-        const task = await store.unarchiveTask(params.id);
-        return {
-          content: [{ type: "text" as const, text: `Unarchived ${task.id} → ${task.column}` }],
-          details: { taskId: task.id, column: task.column },
-        };
-      } catch (err: unknown) {
-        return { content: [{ type: "text" as const, text: `ERROR: Failed to unarchive task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
-      }
-    },
-  };
 }
 
 export function createTaskDeleteTool(store: TaskStore): ToolDefinition {
@@ -3412,7 +3471,7 @@ export function createTaskDuplicateTool(store: TaskStore): ToolDefinition {
   return {
     name: "fn_task_duplicate",
     label: "Duplicate Task",
-    description: "Duplicate an existing task, preserving its description, workflow, and dependencies.",
+    description: "Duplicate an existing task, preserving its description and workflow (dependencies are not copied).",
     parameters: taskDuplicateParams,
     execute: async (_id: string, params: Static<typeof taskDuplicateParams>) => {
       try {
@@ -3486,8 +3545,13 @@ export function createTaskUpdateTool(store: TaskStore, taskId: string): ToolDefi
           await store.updateTask(taskId, { dependencies: params.dependencies });
         }
         if (params.step !== undefined && params.status !== undefined) {
-          const task = await store.updateStep(taskId, params.step, params.status);
-          return { content: [{ type: "text" as const, text: `Updated ${taskId}: step ${params.step} → ${params.status}` }], details: { taskId: task.id, step: params.step, status: params.status } };
+          const task = params.summary === undefined
+            ? await store.updateStep(taskId, params.step, params.status)
+            : await store.updateStep(taskId, params.step, params.status, { summary: params.summary });
+          const reminder = params.status === "done" && !params.summary?.trim()
+            ? " No step summary recorded — call fn_task_update again for this step with `summary` to record what it delivered."
+            : "";
+          return { content: [{ type: "text" as const, text: `Updated ${taskId}: step ${params.step} → ${params.status}.${reminder}` }], details: { taskId: task.id, step: params.step, status: params.status } };
         }
         if (params.custom_fields !== undefined || params.dependencies !== undefined) {
           return { content: [{ type: "text" as const, text: "Updated." }], details: {} };
@@ -6542,222 +6606,6 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           details: {},
         };
       }
-    },
-  };
-}
-
-export function isLateAcquireColumnBlocked(workflowIr: fusionCore.WorkflowIr, column: string): boolean {
-  const blockedColumns = new Set<string>([
-    "in-review",
-    "done",
-    "archived",
-    ...fusionCore.resolveReviewColumns(workflowIr),
-    ...fusionCore.columnsWithFlag(workflowIr, "complete"),
-    ...fusionCore.columnsWithFlag(workflowIr, "archived"),
-  ]);
-  return blockedColumns.has(column);
-}
-
-class LateWorkspaceRepoAcquireError extends Error {
-  constructor(public readonly repo: string) {
-    super(`Cannot acquire new repository ${repo} after review or landing has started`);
-    this.name = "LateWorkspaceRepoAcquireError";
-  }
-}
-
-  /*
-  FNXC:WorkspaceLateAcquire 2026-08-20-20:37 DELIBERATE-LITERAL:
-  Late worktree acquisition is refused once the task has left the executable column set
-  (in-review — review/merge owns the worktree; done/archived — terminal) or has started
-  landing (a merging-* status, or any workspace repo with a landedSha). This is a
-  deliberate column+status+workspace condition (FN-9163, upstream 2a3150582) — reviewed
-  and intentionally kept as an honest literal for the lifecycle-column census; no single
-  role helper expresses this three-part condition without inventing a bespoke trait.
-  (2026-08-21, RUFU-146 rebase: after #3492 landed the column half is resolved by
-  isLateAcquireColumnBlocked and the three-part condition now lives in this helper.)
-  */
-async function isWorkspaceRepoLateAcquireBlocked(store: TaskStore, currentTask: import("@fusion/core").Task, repo: string): Promise<boolean> {
-  if (currentTask.workspaceWorktrees?.[repo]) return false;
-  if (["merging", "merging-pr", "merging-fix"].includes(currentTask.status ?? "")) return true;
-  if (Object.values(currentTask.workspaceWorktrees ?? {}).some((entry) => Boolean(entry.landedSha))) return true;
-  const workflowIr = await fusionCore.resolveWorkflowIrForTask(store, currentTask.id);
-  return isLateAcquireColumnBlocked(workflowIr, currentTask.column);
-}
-
-export function createAcquireRepoWorktreeTool(opts: {
-  workspaceRootDir: string;
-  workspaceRepos: string[];
-  resolveWorkspaceRepos?: () => Promise<string[]>;
-  task: import("@fusion/core").Task;
-  store: TaskStore;
-  settings: Partial<Settings>;
-  logger?: { log: (m: string) => void; warn: (m: string) => void };
-  secretsStore?: Pick<import("@fusion/core").SecretsStore, "listEnvExportable">;
-  runContext?: RunMutationContext;
-  audit?: Pick<RunAuditor, "git" | "filesystem">;
-  /*
-  FNXC:Workspace 2026-06-21-22:30:
-  F2 — executor-supplied callback invoked after a SUCCESSFUL fresh acquire so the
-  acquired sub-repo worktree path is registered in the executor's per-task
-  activeWorktrees Set (KTD2). Without this the Set only ever held the browse-only
-  root and the "task holds N sub-repo paths" invariant was hollow — owner/liveness
-  checks never saw live sub-repo worktrees. Not called on the already-acquired
-  short-circuit (the path was registered on the original fresh acquire).
-  */
-  onAcquired?: (worktreePath: string) => void;
-  // FNXC:Workspace 2026-06-22 — thread the configured worktree-init runner so sub-repo worktrees run configured setup.
-  runConfiguredCommand?: import("./worktree/worktree-acquisition.js").AcquireWorkspaceRepoWorktreeOptions["runConfiguredCommand"];
-  taskEnv?: NodeJS.ProcessEnv;
-}): ToolDefinition {
-  const { workspaceRootDir, workspaceRepos, resolveWorkspaceRepos, task, store, settings, logger, secretsStore, runContext, audit, onAcquired, runConfiguredCommand, taskEnv } = opts;
-  return {
-    name: "fn_acquire_repo_worktree",
-    label: "Acquire Repo Worktree",
-    description:
-      "Acquire an isolated git worktree for a sub-repo in this workspace. " +
-      "The returned repository-relative path is inside this task's workspace directory. " +
-      "Call this before editing files in a sub-repo; work in the returned path. " +
-      `Available repos: ${workspaceRepos.join(", ")}.`,
-    parameters: acquireRepoWorktreeParams,
-    execute: async (_id: string, params: Static<typeof acquireRepoWorktreeParams>) => {
-      const { repo } = params;
-      const freshTask = await store.getTask(task.id);
-      /*
-      FNXC:Workspace 2026-08-20-02:03:
-      Membership can grow on disk during a run. Refresh per acquire, but use a monotone union of
-      startup, fresh, and acquired members so a transient refresh never revokes a usable repo.
-      */
-      let freshRepos: string[] = [];
-      try { freshRepos = await resolveWorkspaceRepos?.() ?? []; } catch { /* optional refresh is fail-safe */ }
-      const allowed = [...new Set([...workspaceRepos, ...freshRepos, ...Object.keys(freshTask.workspaceWorktrees ?? {})])];
-      if (!allowed.includes(repo)) {
-        return {
-          content: [{ type: "text" as const, text: `ERROR: Unknown repo: "${repo}". Available: ${allowed.join(", ")}. Add it to .fusion/workspace.json in Settings → General → Workspace repositories, then retry without restarting the engine.` }],
-          details: {},
-          isError: true,
-        };
-      }
-      const refuseLateAcquisition = async () => {
-        await store.logEntry(task.id, `fn_acquire_repo_worktree: refused late acquisition of ${repo}; task is already in review or landing`, undefined, runContext);
-        return {
-          content: [{ type: "text" as const, text: `ERROR: Cannot acquire new repository "${repo}" after review or landing has started. Create a follow-up task with fn_task_create for this repository.` }],
-          details: {},
-          isError: true,
-        };
-      };
-      /*
-      FNXC:WorkflowResolvedColumns 2026-08-20-04:35:
-      A renamed review/terminal lane must close late repository admission exactly like the built-in
-      `in-review`/`done`/`archived` lanes. Resolve membership from the task's own workflow while
-      retaining the legacy ids as a fail-safe for malformed or partially migrated task state.
-      */
-      if (await isWorkspaceRepoLateAcquireBlocked(store, freshTask, repo)) {
-        return refuseLateAcquisition();
-      }
-      /*
-      FNXC:Workspace 2026-06-21-22:30:
-      F1 — acquireWorkspaceRepoWorktree can throw WorkspaceRepoAcquireBusyError on
-      same-sub-repo contention (KTD4) or a generic failure. Both must surface as a
-      structured isError tool result, never an uncaught throw that crashes the agent
-      loop. The busy message is sanitized — it does NOT leak the holder task id into
-      agent-facing text (only into details). runContext is forwarded so the helper's
-      audit/log entries keep run attribution.
-      */
-      let result: Awaited<ReturnType<typeof acquireWorkspaceRepoWorktree>>;
-      try {
-        result = await acquireWorkspaceRepoWorktree({
-          repoRelPath: repo,
-          workspaceRootDir,
-          task: freshTask,
-          store,
-          settings,
-          logger,
-          secretsStore,
-          audit,
-          runContext,
-          runConfiguredCommand,
-          taskEnv,
-          validateTaskBeforeCreate: async (latestTask) => {
-            if (await isWorkspaceRepoLateAcquireBlocked(store, latestTask, repo)) {
-              throw new LateWorkspaceRepoAcquireError(repo);
-            }
-          },
-          // FNXC:WorkspaceWorktree 2026-08-22-22:16: A mid-flight scope extension joins the task's single directory unless this task is already legacy.
-          ...(() => {
-            const taskDir = resolveWorkspaceTaskWorktreeDir(workspaceRootDir, settings, freshTask.id);
-            return isLegacyWorkspaceWorktreeLayout(freshTask, taskDir)
-              ? {}
-              : { worktreePath: resolveWorkspaceRepoWorktreePath(taskDir, repo) };
-          })(),
-        });
-      } catch (err) {
-        if (err instanceof LateWorkspaceRepoAcquireError) {
-          return refuseLateAcquisition();
-        }
-        if (err instanceof WorkspaceRepoAcquireBusyError) {
-          return {
-            content: [{ type: "text" as const, text: `Sub-repo ${repo} is temporarily locked by another task's acquisition; retry fn_acquire_repo_worktree shortly.` }],
-            details: { holderTaskId: err.holderTaskId },
-            isError: true,
-          };
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text" as const, text: `ERROR: Failed to acquire worktree for ${repo}: ${message}` }],
-          details: {},
-          isError: true,
-        };
-      }
-      // FNXC:PlanningLifecycleLock 2026-08-23-07:00: active-worktree registration is idempotent and must precede the later planning-locked scope mutation, so a retryable transport error cannot hide a successful acquisition.
-      onAcquired?.(result.worktreePath);
-      /*
-      FNXC:RepositoryScope 2026-08-20-23:40:
-      A successful pre-land acquisition outside explicit intent is an extension request, not evidence
-      that every acquired repository belongs to the task. Persist the accepted extension once so the
-      next review and land pass can deliberately include it.
-      */
-      if (!freshTask.repositoryScope?.repositories.includes(repo)) {
-        /*
-        FNXC:RepositoryScope 2026-08-21-01:53:
-        Acquisition extends intent as a durable delta after the checkout succeeds. A fresh
-        planning-locked read preserves a concurrent plan confirmation or operator decision.
-        */
-        try {
-          await store.mutateTaskRepositoryScope(task.id, {
-            action: "add",
-            repositories: [repo],
-            reason: params.reason ?? "Executor acquired a repository required for implementation.",
-            actor: runContext?.agentId ?? "executor",
-          });
-        } catch (err) {
-          if (isPlanningLifecycleLockTransportError(err)) {
-            return {
-              content: [{ type: "text" as const, text: "Worktree was acquired but repository-scope persistence is temporarily unavailable; retry fn_acquire_repo_worktree shortly." }],
-              details: {}, isError: true,
-            };
-          }
-          throw err;
-        }
-      }
-      // FNXC:Workspace 2026-06-21-22:30: F2 — register a freshly-acquired sub-repo worktree in the executor's activeWorktrees Set (KTD2) so owner/liveness checks see live per-repo worktrees, not just the browse-only root.
-      // FNXC:Workspace 2026-06-22-09:00: register UNCONDITIONALLY, including the
-      // already-acquired short-circuit. After an executor restart activeWorktrees is an
-      // empty Map; a resumed workspace task with pre-existing task.workspaceWorktrees hits
-      // the alreadyAcquired path, so skipping onAcquired left the sub-repo path unregistered
-      // in-memory and conflict/liveness checks missed it. Set.add is idempotent, so re-firing
-      // on a fresh acquire is a harmless no-op.
-      await store.logEntry(
-        task.id,
-        result.alreadyAcquired
-          ? `fn_acquire_repo_worktree: reusing existing worktree for ${repo} at repository-relative path ${repo}`
-          : `fn_acquire_repo_worktree: created worktree for ${repo} at repository-relative path ${repo} (branch: ${result.branch})`,
-        undefined,
-        runContext,
-      );
-      return {
-        content: [{ type: "text" as const, text: `Worktree ready at: ${result.worktreePath} (branch: ${result.branch}, alreadyAcquired: ${result.alreadyAcquired})` }],
-        details: result,
-      };
     },
   };
 }

@@ -13,7 +13,7 @@ import type { BlockerFanoutEntry } from "../hooks/useBlockerFanout";
  * Column.tsx in workflow mode). The header shows the workflow name, the card
  * count, and a collapse toggle (collapse state persisted by the parent Board).
  *
- * Archived / hidden-from-board columns are hidden. Hold columns render the
+ * Hidden-from-board columns are hidden. Hold columns render the
  * per-card promote affordance. Cross-lane drag is rejected by the drag
  * pre-check the Board threads through (drag never switches workflows).
  *
@@ -30,9 +30,9 @@ export interface LaneProps {
   onToggleCollapse: (workflowId: string) => void;
   projectId?: string;
   maxConcurrent: number;
+  maxWorktrees: number;
   showWorktreeGrouping?: boolean;
-  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
-  onPromote: (taskId: string) => Promise<void>;
+  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
   onPauseTask?: (id: string) => Promise<Task>;
   onOpenDetail: (task: Task | TaskDetail) => void;
   onOpenGroupModal?: (groupId: string) => void;
@@ -44,9 +44,6 @@ export interface LaneProps {
   globalPaused?: boolean;
   onUpdateTask?: (id: string, updates: { title?: string; description?: string; dependencies?: string[] }) => Promise<Task>;
   onRetryTask?: (id: string) => Promise<Task>;
-  onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  onUnarchiveTask?: (id: string) => Promise<Task>;
-  /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside onArchiveTask/onUnarchiveTask. */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   onDeleteTask?: (id: string, options?: {
     removeDependencyReferences?: boolean;
@@ -74,9 +71,9 @@ function LaneComponent(props: LaneProps) {
   const { t } = useTranslation("app");
   const laneRef = useRef<HTMLDivElement | null>(null);
 
-  // Visible columns: archived / hidden-from-board columns are hidden per lane.
+  // Visible columns exclude only explicit workflow-hidden destinations.
   const visibleColumns = useMemo(
-    () => workflow.columns.filter((col) => !col.flags.archived && !col.flags.hiddenFromBoard),
+    () => workflow.columns.filter((col) => !col.flags.hiddenFromBoard),
     [workflow.columns],
   );
   const contextMenuColumns = useMemo(
@@ -86,8 +83,8 @@ function LaneComponent(props: LaneProps) {
     [workflow.columns],
   );
   const createColumnId = useMemo(() => (
-    visibleColumns.find((col) => col.flags.intake && !col.flags.archived)?.id
-      ?? visibleColumns.find((col) => !col.flags.archived)?.id
+    visibleColumns.find((col) => col.flags.intake)?.id
+      ?? visibleColumns[0]?.id
   ), [visibleColumns]);
 
   // Group + sort tasks by column id (stable per render).
@@ -179,9 +176,9 @@ function LaneComponent(props: LaneProps) {
               allTasks={tasks}
               projectId={props.projectId}
               maxConcurrent={props.maxConcurrent}
+              maxWorktrees={props.maxWorktrees}
               showWorktreeGrouping={props.showWorktreeGrouping === true}
               onMoveTask={props.onMoveTask}
-              onPromote={props.onPromote}
               onPauseTask={props.onPauseTask}
               onOpenDetail={props.onOpenDetail}
               onOpenGroupModal={props.onOpenGroupModal}
@@ -189,8 +186,6 @@ function LaneComponent(props: LaneProps) {
               globalPaused={props.globalPaused}
               onUpdateTask={props.onUpdateTask}
               onRetryTask={props.onRetryTask}
-              onArchiveTask={props.onArchiveTask}
-              onUnarchiveTask={props.onUnarchiveTask}
               onRevertTask={props.onRevertTask}
               onDeleteTask={props.onDeleteTask}
               availableModels={props.availableModels}

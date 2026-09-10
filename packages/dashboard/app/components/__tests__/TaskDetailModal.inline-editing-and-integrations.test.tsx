@@ -27,6 +27,12 @@ import { TaskDetailModal, TaskDetailContent } from "../TaskDetailModal";
 
 setupTaskDetailModalHooks();
 
+function openTaskDetailActionsMenu() {
+  const trigger = screen.getByRole("button", { name: "Actions" });
+  if (trigger.getAttribute("aria-expanded") !== "true") fireEvent.click(trigger);
+  return screen.getByRole("menu");
+}
+
 function getMediaBlocks(css: string, mediaQuery: string): string[] {
   const blocks: string[] = [];
   let searchFrom = 0;
@@ -518,7 +524,7 @@ describe("TaskDetailModal", () => {
 
   describe("inline editing", () => {
     const chooseInlinePriority = (priority: TaskPriority) => {
-      fireEvent.click(screen.getByTestId("detail-priority-trigger"));
+      openTaskDetailActionsMenu();
       fireEvent.click(screen.getByTestId(`detail-priority-option-${priority}`));
     };
     beforeEach(() => {
@@ -1200,6 +1206,68 @@ describe("TaskDetailModal", () => {
       });
     });
 
+    it("keeps edit-mode optional workflow steps out of the fast-to-standard update payload", async () => {
+      const { updateTask } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      mockUpdate.mockResolvedValue({ id: "FN-001" } as Task);
+
+      const { container } = render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({
+            id: "FN-001",
+            column: "triage",
+            title: "Test",
+            description: "Desc",
+            executionMode: "fast",
+            enabledWorkflowSteps: ["code-review"],
+          })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "standard" } });
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: null }, undefined);
+      });
+      expect(mockUpdate.mock.calls[0]?.[1]).toEqual({ executionMode: null });
+      expect(mockUpdate.mock.calls[0]?.[1]).not.toHaveProperty("enabledWorkflowSteps");
+    });
+
+    it("patches edit-mode standard-to-fast on a todo task without confirmation or replanning", async () => {
+      const { updateTask, rebuildTaskSpec } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      const mockRebuild = vi.mocked(rebuildTaskSpec);
+      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", title: "Test", description: "Desc", executionMode: "fast" }) as Task);
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ id: "FN-001", column: "todo", title: "Test", description: "Desc", executionMode: "standard" })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "fast" } });
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined));
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
+    });
+
     it("confirms and replans when edit-mode executionMode changes on a todo task", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
@@ -1271,8 +1339,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const priorityTrigger = screen.getByTestId("detail-priority-trigger");
-      expect(priorityTrigger).toHaveAccessibleName("Priority: Normal");
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-priority-option-normal")).toHaveAttribute("aria-pressed", "true");
     });
 
     it("renders priority select and execution mode toggle together and keeps both interactive", async () => {
@@ -1294,23 +1362,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const controls = screen.getByTestId("detail-meta-inline-controls");
-      const priorityTrigger = screen.getByTestId("detail-priority-trigger");
-      const executionModeToggle = screen.getByRole("button", { name: "Execution mode: standard" });
-
-      /*
-      FNXC:QuickAddActionRow 2026-07-16-16:00:
-      FN-8194: attach, GitHub, and Oversight precede the Quick Add-matched
-      Priority/Fast controls; both controls remain direct interactive children.
-      */
-      expect(controls).toContainElement(priorityTrigger.parentElement);
-      expect(executionModeToggle.parentElement).toBe(controls);
+      const menu = openTaskDetailActionsMenu();
+      expect(menu).toContainElement(screen.getByTestId("detail-priority-option-high"));
+      expect(menu).toContainElement(screen.getByTestId("detail-execution-mode-toggle"));
 
       chooseInlinePriority("urgent");
-      fireEvent.click(executionModeToggle);
+      await waitFor(() => expect(mockUpdate).toHaveBeenNthCalledWith(1, "FN-001", { priority: "urgent" }, undefined));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
-        expect(mockUpdate).toHaveBeenNthCalledWith(1, "FN-001", { priority: "urgent" }, undefined);
         expect(mockUpdate).toHaveBeenNthCalledWith(2, "FN-001", { executionMode: "fast" }, undefined);
       });
     });
@@ -1407,24 +1468,27 @@ describe("TaskDetailModal", () => {
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { priority: "urgent" }, undefined);
       });
-      await waitFor(() => {
-        expect(screen.getByTestId("detail-priority-trigger")).toHaveAccessibleName("Priority: Low");
-      });
-      expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Request failed", "error");
+      await waitFor(() => expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Request failed", "error"));
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-priority-option-low")).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("prompts before replanning a todo task when changing inline execution mode from standard to fast", async () => {
+    it.each([
+      ["desktop", undefined],
+      ["mobile", "back"],
+    ] as const)("patches a todo task from standard to fast in place on %s", async (_surface, mobileHeaderMode) => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       const addToast = vi.fn();
       const onTaskUpdated = vi.fn();
-      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: "fast" }) as Task);
-      mockRebuild.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "triage", status: "needs-replan", executionMode: "fast" }) as Task);
+      const updatedTask = makeTask({ id: "FN-001", column: "todo", executionMode: "fast" });
+      mockUpdate.mockResolvedValueOnce(updatedTask as Task);
 
       render(
         <TaskDetailModal
           initialTab="definition"
+          mobileHeaderMode={mobileHeaderMode}
           task={makeTask({ id: "FN-001", column: "todo", executionMode: "standard" })}
           onClose={noop}
           onDeleteTask={noopDelete}
@@ -1435,57 +1499,23 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
-      await waitFor(() => {
-        expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({
-          title: "Change execution mode and replan?",
-          message: "Changing execution mode for this task will move it back to Planning so Fusion can rebuild the plan for fast mode.",
-        }));
-      });
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
-        expect(mockRebuild).toHaveBeenCalledWith("FN-001", undefined);
       });
-      expect(mockUpdate.mock.invocationCallOrder[0]).toBeLessThan(mockRebuild.mock.invocationCallOrder[0]);
-      expect(onTaskUpdated).not.toHaveBeenCalled();
-      expect(addToast).toHaveBeenCalledWith("Execution mode updated to fast — FN-001 returned to Planning for replanning", "info");
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
+      expect(onTaskUpdated).toHaveBeenCalledWith(updatedTask);
+      expect(addToast).toHaveBeenCalledWith("Execution mode updated to fast", "success");
     });
 
-    it("cancels a todo inline execution mode change before update or replan", async () => {
+    it("cancels the retained fast-to-standard todo replan before update", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       mockConfirm.mockResolvedValueOnce(false);
-
-      render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ id: "FN-001", column: "todo", executionMode: "standard" })}
-          onClose={noop}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
-
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
-
-      await waitFor(() => {
-        expect(mockConfirm).toHaveBeenCalled();
-      });
-      expect(mockUpdate).not.toHaveBeenCalled();
-      expect(mockRebuild).not.toHaveBeenCalled();
-      expect(screen.getByRole("button", { name: "Execution mode: standard" })).toHaveAttribute("aria-pressed", "false");
-    });
-
-    it("prompts and replans a todo task when changing inline execution mode from fast to standard", async () => {
-      const { updateTask, rebuildTaskSpec } = await import("../../api");
-      const mockUpdate = vi.mocked(updateTask);
-      const mockRebuild = vi.mocked(rebuildTaskSpec);
-      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: null }) as Task);
-      mockRebuild.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "triage", status: "needs-replan", executionMode: null }) as Task);
 
       render(
         <TaskDetailModal
@@ -1499,7 +1529,43 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: fast" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
+
+      await waitFor(() => {
+        expect(mockConfirm).toHaveBeenCalled();
+      });
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it.each([
+      ["desktop", undefined],
+      ["mobile", "back"],
+    ] as const)("prompts and replans a todo task from fast to standard on %s", async (_surface, mobileHeaderMode) => {
+      const { updateTask, rebuildTaskSpec } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      const mockRebuild = vi.mocked(rebuildTaskSpec);
+      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: null }) as Task);
+      mockRebuild.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "triage", status: "needs-replan", executionMode: null }) as Task);
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          mobileHeaderMode={mobileHeaderMode}
+          task={makeTask({ id: "FN-001", column: "todo", executionMode: "fast" })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
         expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({
@@ -1511,12 +1577,11 @@ describe("TaskDetailModal", () => {
       expect(mockUpdate.mock.invocationCallOrder[0]).toBeLessThan(mockRebuild.mock.invocationCallOrder[0]);
     });
 
-    it("prompts and replans an in-progress task when changing inline execution mode", async () => {
+    it("patches an in-progress task from standard to fast without confirmation or replanning", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "in-progress", executionMode: "fast" }) as Task);
-      mockRebuild.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "triage", status: "needs-replan", executionMode: "fast" }) as Task);
 
       render(
         <TaskDetailModal
@@ -1530,13 +1595,14 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
-        expect(mockConfirm).toHaveBeenCalled();
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
-        expect(mockRebuild).toHaveBeenCalledWith("FN-001", undefined);
       });
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
     });
 
     it("updates triage inline execution mode without prompting or replanning", async () => {
@@ -1561,7 +1627,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
@@ -1570,23 +1637,22 @@ describe("TaskDetailModal", () => {
       expect(mockRebuild).not.toHaveBeenCalled();
       expect(onTaskUpdated).toHaveBeenCalledWith(updatedTask);
       expect(addToast).toHaveBeenCalledWith("Execution mode updated to fast", "success");
-      await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Execution mode: fast" })).toHaveAttribute("aria-pressed", "true");
-      });
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("reverts inline execution mode when active-task replan fails after update", async () => {
+    it("reverts to fast when the retained fast-to-standard replan fails after update", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       const addToast = vi.fn();
-      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: "fast" }) as Task);
+      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: null }) as Task);
       mockRebuild.mockRejectedValueOnce(new Error("Replan failed"));
 
       render(
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({ id: "FN-001", column: "todo", executionMode: "standard" })}
+          task={makeTask({ id: "FN-001", column: "todo", executionMode: "fast" })}
           onClose={noop}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
@@ -1595,16 +1661,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
-        expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
+        expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: null }, undefined);
         expect(mockRebuild).toHaveBeenCalledWith("FN-001", undefined);
       });
-      await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Execution mode: standard" })).toHaveAttribute("aria-pressed", "false");
-      });
-      expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Replan failed", "error");
+      await waitFor(() => expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Replan failed", "error"));
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toHaveAttribute("aria-pressed", "true");
     });
 
     it("disables inline execution mode toggle while save is in-flight", async () => {
@@ -1626,9 +1692,12 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const toggle = screen.getByRole("button", { name: "Execution mode: standard" });
+      openTaskDetailActionsMenu();
+      const toggle = screen.getByTestId("detail-execution-mode-toggle");
       fireEvent.click(toggle);
-      expect(toggle).toBeDisabled();
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toBeDisabled();
 
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
@@ -2581,10 +2650,10 @@ describe("TaskDetailModal", () => {
       expect(screen.getByText("Runtime status")).toBeInTheDocument();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
       expectSingleStatsRuntimeStatus("executing");
-      expect(screen.getByText((1200).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((450).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((210).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((1860).toLocaleString())).toBeInTheDocument();
+      expect(screen.getAllByText((1200).toLocaleString()).length).toBeGreaterThan(0);
+      expect(screen.getAllByText((450).toLocaleString()).length).toBeGreaterThan(0);
+      expect(screen.getAllByText((210).toLocaleString()).length).toBeGreaterThan(0);
+      expect(screen.getAllByText((1860).toLocaleString()).length).toBeGreaterThan(0);
       const firstUsed = document.querySelector('time[datetime="2026-04-24T09:00:00.000Z"]');
       const lastUsed = document.querySelector('time[datetime="2026-04-24T10:15:00.000Z"]');
       expect(firstUsed).toBeTruthy();
@@ -2611,7 +2680,7 @@ describe("TaskDetailModal", () => {
         updatedAt: "2026-01-01T00:00:00Z",
       };
 
-      mockFetch.mockResolvedValueOnce({
+      mockFetch.mockResolvedValue({
         ...strippedTask,
         prompt: "# Spec",
         log: [
@@ -3426,7 +3495,7 @@ describe("TaskDetailModal", () => {
   });
 });
 
-describe("TaskDetailModal inline action row parity (FN-8194)", () => {
+describe("TaskDetailModal footer quick-action parity (FN-8194)", () => {
   const renderDetail = (task: Task) => render(
     <TaskDetailModal
       initialTab="details"
@@ -3442,16 +3511,19 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
   it("uses the existing file input and preserves Quick Add action order", async () => {
     renderDetail(makeTask({ id: "FN-8194", column: "todo", plannerOversightLevel: "observe" }));
 
-    const controls = screen.getByTestId("detail-meta-inline-controls");
+    const menu = openTaskDetailActionsMenu();
     const attach = screen.getByTestId("detail-inline-attach");
     const github = screen.getByTestId("detail-inline-github-toggle");
-    const oversight = await screen.findByTestId("detail-oversight-menu-trigger");
-    const priority = screen.getByTestId("detail-priority-trigger").parentElement!;
-    const fast = screen.getByRole("button", { name: "Execution mode: standard" });
+    const oversight = await screen.findByTestId("detail-actions-oversight-heading");
+    const priority = screen.getByTestId("detail-actions-priority-heading");
+    const fast = screen.getByTestId("detail-execution-mode-toggle");
     const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
     const fileInputClick = vi.spyOn(fileInput, "click");
 
-    expect([...controls.children]).toEqual([attach, github, oversight.parentElement, priority, fast]);
+    for (const [before, after] of [[attach, github], [github, oversight], [oversight, priority], [priority, fast]]) {
+      expect(before.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    expect(menu).toContainElement(attach);
     fireEvent.click(attach);
     expect(fileInputClick).toHaveBeenCalledOnce();
   });
@@ -3473,6 +3545,7 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
     expect(fileInputs).toHaveLength(1);
     const fileInputClick = vi.spyOn(fileInputs[0], "click");
 
+    openTaskDetailActionsMenu();
     fireEvent.click(screen.getByTestId("detail-inline-attach"));
 
     expect(fileInputClick).toHaveBeenCalledOnce();
@@ -3485,16 +3558,16 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
 
     renderDetail(makeTask({ id: "FN-8194", column: "todo", githubTracking: { enabled: false } }));
 
+    openTaskDetailActionsMenu();
     const toggle = screen.getByTestId("detail-inline-github-toggle");
     expect(toggle).toHaveAttribute("aria-pressed", "false");
-    expect(toggle).not.toHaveClass("btn-primary");
     fireEvent.click(toggle);
 
     await waitFor(() => {
       expect(mockUpdate).toHaveBeenCalledWith("FN-8194", { githubTracking: { enabled: true } }, undefined);
     });
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(toggle).toHaveClass("btn-primary");
+    openTaskDetailActionsMenu();
+    await waitFor(() => expect(screen.getByTestId("detail-inline-github-toggle")).toHaveAttribute("aria-pressed", "true"));
   });
 
   it("enables GitHub tracking for Ideas intake tasks after workflow metadata fails", async () => {
@@ -3505,6 +3578,7 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
 
     renderDetail(makeTask({ id: "FN-ideas", column: "ideas", githubTracking: { enabled: false } }));
 
+    openTaskDetailActionsMenu();
     const toggle = screen.getByTestId("detail-inline-github-toggle");
     expect(toggle).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(toggle);
@@ -3512,7 +3586,8 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
     await waitFor(() => {
       expect(mockUpdate).toHaveBeenCalledWith("FN-ideas", { githubTracking: { enabled: true } }, undefined);
     });
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    openTaskDetailActionsMenu();
+    await waitFor(() => expect(screen.getByTestId("detail-inline-github-toggle")).toHaveAttribute("aria-pressed", "true"));
   });
 
   it("shows the GitHub toggle after Coding (Ideas) workflow metadata resolves", async () => {
@@ -3522,19 +3597,21 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
       defaultWorkflowId: "builtin:coding",
       workflows: [
         { id: "builtin:coding", name: "Coding", columns: [{ id: "done", name: "Done", flags: {} }] },
-        { id: "builtin:coding-ideas", name: "Coding (Ideas)", columns: [{ id: "done", name: "Done", flags: {} }] },
+        { id: "builtin:coding-ideas-v2", name: "Coding (Ideas)", columns: [{ id: "done", name: "Done", flags: {} }] },
       ],
-      taskWorkflowIds: { "FN-ideas-workflow": "builtin:coding-ideas" },
+      taskWorkflowIds: { "FN-ideas-workflow": "builtin:coding-ideas-v2" },
     });
 
     renderDetail(makeTask({ id: "FN-ideas-workflow", column: "done", githubTracking: { enabled: false } }));
 
+    openTaskDetailActionsMenu();
     expect(screen.queryByTestId("detail-inline-github-toggle")).not.toBeInTheDocument();
     expect(await screen.findByTestId("detail-inline-github-toggle")).toHaveAttribute("aria-pressed", "false");
   });
 
   it("hides the GitHub toggle for unrelated and GitLab-tracked tasks", () => {
     const { unmount } = renderDetail(makeTask({ id: "FN-8194", column: "done", githubTracking: { enabled: true } }));
+    openTaskDetailActionsMenu();
     expect(screen.queryByTestId("detail-inline-github-toggle")).not.toBeInTheDocument();
     unmount();
 
@@ -3552,6 +3629,7 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
         },
       },
     }) as Task);
+    openTaskDetailActionsMenu();
     expect(screen.queryByTestId("detail-inline-github-toggle")).not.toBeInTheDocument();
   });
 });

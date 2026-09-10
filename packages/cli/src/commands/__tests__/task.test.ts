@@ -126,7 +126,6 @@ vi.mock("@fusion/core", async (importActual) => {
 
 // Mock @fusion/engine
 vi.mock("@fusion/engine", () => ({
-  installBaselineArchiveWorktreeDisposer: vi.fn(),
   aiMergeTask: vi.fn(),
   runAiMerge: vi.fn(),
   landWorkspaceTask: vi.fn(),
@@ -258,10 +257,10 @@ vi.mock("../../project-context.js", () => {
 });
 
 import { createInterface } from "node:readline/promises";
-import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate, TaskIsLiveError } from "@fusion/core";
+import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, MAX_TASK_MESSAGE_LENGTH, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate } from "@fusion/core";
 import { watchFile, unwatchFile, statSync, existsSync, readFileSync } from "node:fs";
 import { exec } from "node:child_process";
-import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskArchive, runTaskUnarchive, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, type LogsOptions } from "../task.js";
+import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, type LogsOptions } from "../task.js";
 import {
   getCurrentRepo,
   isGhAuthenticated,
@@ -1311,87 +1310,6 @@ describe("project-aware task command behavior", () => {
 
     expect(pauseTask).toHaveBeenNthCalledWith(1, "FN-123", true, undefined, { userPaused: true });
     expect(pauseTask).toHaveBeenNthCalledWith(2, "FN-123", false);
-  });
-
-  it("runTaskArchive and runTaskUnarchive use resolved project store", async () => {
-    const archiveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "archived" }));
-    const unarchiveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "done" }));
-
-    vi.mocked(resolveProject).mockResolvedValue({
-      projectId: "proj_test",
-      projectPath: "/test",
-      projectName: "demo-project",
-      isRegistered: true,
-      store: { archiveTask, unarchiveTask } as unknown as TaskStore,
-    });
-
-    await runTaskArchive("FN-123", "demo-project");
-    await runTaskUnarchive("FN-123", "demo-project");
-
-    expect(archiveTask).toHaveBeenCalledWith("FN-123", {liveExecutionGuard: "refuse"});
-    expect(unarchiveTask).toHaveBeenCalledWith("FN-123");
-  });
-
-  it("refuses a live archive before calling the store and exits non-zero", async () => {
-    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "in-progress" }));
-    const archiveTask = vi.fn();
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`process.exit:${code}`);
-    }) as (code?: number) => never);
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    vi.mocked(resolveProject).mockResolvedValue({
-      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
-      store: { getTask, archiveTask } as unknown as TaskStore,
-    });
-
-    try {
-      await expect(runTaskArchive("FN-123", "demo-project")).rejects.toThrow("process.exit:1");
-      expect(archiveTask).not.toHaveBeenCalled();
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Refusing to archive live task FN-123"));
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("--force"));
-      expect(exitSpy).toHaveBeenCalledWith(1);
-    } finally {
-      errorSpy.mockRestore();
-      exitSpy.mockRestore();
-    }
-  });
-
-  it("allows the human --force archive escape hatch for a live task", async () => {
-    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "in-progress" }));
-    const archiveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "archived" }));
-    vi.mocked(resolveProject).mockResolvedValue({
-      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
-      store: { getTask, archiveTask } as unknown as TaskStore,
-    });
-
-    await runTaskArchive("FN-123", "demo-project", { force: true });
-
-    expect(archiveTask).toHaveBeenCalledWith("FN-123", { liveExecutionGuard: "off" });
-  });
-
-  it("formats a raced transactional live refusal without a raw error", async () => {
-    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "todo" }));
-    const archiveTask = vi.fn().mockRejectedValue(new TaskIsLiveError("FN-123", ["wip-lane"]));
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`process.exit:${code}`);
-    }) as (code?: number) => never);
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    vi.mocked(resolveProject).mockResolvedValue({
-      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
-      store: { getTask, archiveTask } as unknown as TaskStore,
-    });
-
-    try {
-      await expect(runTaskArchive("FN-123", "demo-project")).rejects.toThrow("process.exit:1");
-      expect(archiveTask).toHaveBeenCalledWith("FN-123", { liveExecutionGuard: "refuse" });
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Refusing to archive live task FN-123"));
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("--force"));
-      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("Task FN-123 is live"));
-      expect(exitSpy).toHaveBeenCalledWith(1);
-    } finally {
-      errorSpy.mockRestore();
-      exitSpy.mockRestore();
-    }
   });
 
   it("runTaskRetry uses resolved project store", async () => {
@@ -2766,24 +2684,26 @@ describe("runTaskRefine", () => {
     exitSpy.mockRestore();
   });
 
-  it("exits when feedback exceeds 2000 characters", async () => {
+  it("exits when feedback exceeds the shared task-message limit", async () => {
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as (code?: number) => never);
 
-    await runTaskRefine("FN-001", "A".repeat(2001));
+    await runTaskRefine("FN-001", "A".repeat(MAX_TASK_MESSAGE_LENGTH + 1));
 
-    expect(errorSpy).toHaveBeenCalledWith("Feedback must be 2000 characters or less");
+    expect(errorSpy).toHaveBeenCalledWith(`Feedback must be ${MAX_TASK_MESSAGE_LENGTH} characters or less`);
     expect(exitSpy).toHaveBeenCalledWith(1);
 
     exitSpy.mockRestore();
   });
 
-  it("allows feedback at exactly 2000 characters", async () => {
-    const longFeedback = "A".repeat(2000);
+  it("allows feedback above the former limit and at the shared boundary", async () => {
+    const overFormerLimit = "A".repeat(2001);
+    const atSharedLimit = "B".repeat(MAX_TASK_MESSAGE_LENGTH);
 
-    await runTaskRefine("FN-001", longFeedback);
+    await runTaskRefine("FN-001", overFormerLimit);
+    await runTaskRefine("FN-001", atSharedLimit);
 
-    expect(mockRefineTask).toHaveBeenCalledOnce();
-    expect(mockRefineTask).toHaveBeenCalledWith("FN-001", longFeedback);
+    expect(mockRefineTask).toHaveBeenNthCalledWith(1, "FN-001", overFormerLimit);
+    expect(mockRefineTask).toHaveBeenNthCalledWith(2, "FN-001", atSharedLimit);
   });
 
   it("throws when task not in done or in-review", async () => {
@@ -2986,6 +2906,21 @@ describe("runTaskComment", () => {
     expect(logSpy).toHaveBeenCalledWith("  ✓ Comment added to FN-001");
   });
 
+  it("forwards comments above the former limit without truncation", async () => {
+    const longComment = "A".repeat(5_000);
+    const addTaskComment = vi.fn().mockResolvedValue(makeTask({
+      comments: [{ id: "c1", text: longComment, author: "alice", createdAt: new Date().toISOString() }],
+    }));
+    (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      init: vi.fn(),
+      addTaskComment,
+    }));
+
+    await runTaskComment("FN-001", longComment, "alice");
+
+    expect(addTaskComment).toHaveBeenCalledWith("FN-001", longComment, "alice");
+  });
+
   it("lists task comments", async () => {
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
@@ -3054,6 +2989,7 @@ describe("runTaskRetry", () => {
       baseBranch: null,
       baseCommitSha: null,
       nextRecoveryAt: null,
+      sessionContentionWaitReason: null,
       /*
       FNXC:CliTests 2026-07-17-10:57:
       The exact manual retry reset contract now clears bulk-completion refusal
@@ -3068,6 +3004,7 @@ describe("runTaskRetry", () => {
       planReviewReplanCount: 0,
       stuckKillCount: 0,
       recoveryRetryCount: 0,
+      sessionContentionHoldCount: 0,
       taskDoneRetryCount: 0,
       worktreeSessionRetryCount: 0,
       workflowStepRetries: 0,
@@ -3147,6 +3084,7 @@ describe("runTaskRetry", () => {
       baseBranch: null,
       baseCommitSha: null,
       nextRecoveryAt: null,
+      sessionContentionWaitReason: null,
       /*
       FNXC:CliTests 2026-07-17-10:57:
       The exact manual retry reset contract now clears bulk-completion refusal
@@ -3161,6 +3099,7 @@ describe("runTaskRetry", () => {
       planReviewReplanCount: 0,
       stuckKillCount: 0,
       recoveryRetryCount: 0,
+      sessionContentionHoldCount: 0,
       taskDoneRetryCount: 0,
       worktreeSessionRetryCount: 0,
       workflowStepRetries: 0,
@@ -3405,6 +3344,55 @@ describe("runTaskLogs", () => {
     expect(calls[4]).toContain("[ERROR]");
   });
 
+  it("renders multiline tool arguments as one indented terminal block", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({
+        type: "tool",
+        text: "fn_run_verification",
+        detail: "command=pnpm lint\nallowFullSuite=false",
+      }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const formatted = logSpy.mock.calls[0]?.[0] as string;
+    expect(formatted).toContain("[TOOL] fn_run_verification");
+    expect(formatted).toContain("\n\x1b[2m\x1b[90m    command=pnpm lint\n    allowFullSuite=false");
+  });
+
+  it("renders multiline results and errors as indented blocks while retaining the red error header", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({ type: "tool_result", text: "bash", detail: "stdout line one\nstdout line two" }),
+      makeAgentLogEntry({ type: "tool_error", text: "bash", detail: "stderr line one\nstderr line two" }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    const [result, error] = logSpy.mock.calls.map((call) => call[0] as string);
+    expect(result).toContain("[RESULT] bash\n\x1b[2m\x1b[90m    stdout line one");
+    expect(error).toMatch(/^\x1b\[31m.*\[ERROR] bash/);
+    expect(error).toContain("\n\x1b[2m\x1b[90m    stderr line one");
+  });
+
+  it("keeps short single-line tool detail inline and omits an empty detail block", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({ type: "tool", text: "read", detail: "path/to/file.ts" }),
+      makeAgentLogEntry({ type: "tool_result", text: "read" }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    const [tool, result] = logSpy.mock.calls.map((call) => call[0] as string);
+    expect(tool).toContain("[TOOL] read (path/to/file.ts)");
+    expect(tool).not.toContain("\n");
+    expect(result).toContain("[RESULT] read");
+    expect(result).not.toContain("\n");
+  });
+
   it("displays agent role when present", async () => {
     mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
     mockGetAgentLogs.mockResolvedValueOnce([
@@ -3590,6 +3578,31 @@ describe("runTaskLogs", () => {
     sigintHandlers.forEach((handler) => handler());
   });
 
+  it("formats multiline tool detail from follow-mode JSONL through the shared formatter", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([]);
+    mockStatSync.mockReturnValue({ size: 0 });
+
+    runTaskLogs("FN-001", { follow: true });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const watchCallback = mockWatchFile.mock.calls[0]?.[2] as () => void;
+    mockStatSync.mockReturnValueOnce({ size: 200 });
+    mockReadFileSync.mockReturnValueOnce(`${JSON.stringify(makeAgentLogEntry({
+      type: "tool_result",
+      text: "fn_run_verification",
+      detail: "result line one\nresult line two",
+    }))}\n`);
+    watchCallback();
+
+    const followed = logSpy.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("[RESULT] fn_run_verification"),
+    )?.[0] as string | undefined;
+    expect(followed).toContain("\n\x1b[2m\x1b[90m    result line one");
+
+    sigintHandlers.forEach((handler) => handler());
+  });
+
   it("applies type filter in follow mode", async () => {
     mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
     mockGetAgentLogs.mockResolvedValueOnce([]);
@@ -3737,7 +3750,7 @@ describe("runTaskPrCreate", () => {
       nodes: [],
       edges: [],
       // Exactly what synthesizeDefaultColumns emits: every column, NO traits.
-      columns: ["todo", "in-progress", "in-review", "done", "archived"].map((id) => ({ id, name: id, traits: [] })),
+      columns: ["todo", "in-progress", "in-review", "done"].map((id) => ({ id, name: id, traits: [] })),
     };
     const selection = { workflowId: "wf-v1-upgraded", stepIds: [] };
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({

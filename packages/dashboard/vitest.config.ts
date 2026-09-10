@@ -93,7 +93,7 @@ const qualityAppFoundationUiTests = [
 const qualityAppHooksAndUtilsTests = [
   // Hooks and utilities are fast, user-visible state/formatting behavior.
   "app/context/**/*.test.tsx",
-  "app/hooks/__tests__/{useAgents,useAgentLogs,useAgentLogs.resume-instrumentation,useAppSettings,useAuthOnboarding,useConfirm,useCurrentProject,useNavigationHistory,useNodes,useNodes.resume-instrumentation,useNodeSettingsSync,useProjects,useProjects.resume-instrumentation,useMeshState.resume-instrumentation,useManagedDockerNodes.resume-instrumentation,usePrChecksStream.resume-instrumentation,useDevServerLogs.resume-instrumentation,useResearch.resume-instrumentation,useBackgroundSessions.resume-instrumentation,useQuickChat,useTasks,useTasks.resume-instrumentation,useChatRooms,useTerminalSessions,useTheme,useToast,useUsageData,useViewportMode,useViewState,useMergeAdvanceNotice}.test.{ts,tsx}",
+  "app/hooks/__tests__/{useAgents,useAgentLogs,useAgentLogs.resume-instrumentation,useAppSettings,useAuthOnboarding,useConfirm,useCurrentProject,useNavigationHistory,useNodes,useNodes.resume-instrumentation,useNodeSettingsSync,useProjects,useProjects.resume-instrumentation,useMeshState.resume-instrumentation,useManagedDockerNodes.resume-instrumentation,usePrChecksStream.resume-instrumentation,useDevServerLogs.resume-instrumentation,useResearch.resume-instrumentation,useBackgroundSessions.resume-instrumentation,useQuickChat,useTasks,useTasks.resume-instrumentation,useChatRooms,useTerminalSessions,useTheme,useToast,useUsageData,useViewportMode,useViewState,useMergeAdvanceNotice,useVirtualizedChatTranscript,useVirtualizedList,useAutoPaginationSentinel,listSurfaceInventory}.test.{ts,tsx}",
   "app/utils/**/*.test.{ts,tsx}",
 ];
 
@@ -247,6 +247,8 @@ FNXC:ChatNavigation 2026-08-19-21:10:
 FN-054 requires the focused Chat lane to collect every suite that protects shared list-to-detail navigation. Keep responsive, history, creation, and mount contracts together so the task command cannot silently omit stale selector or split-pane assertions.
 */
 const qualityAppChatOnlyTests = [
+  // FNXC:ChatComposerFocus 2026-09-01-01:04: Cross-host composer focus belongs in the shared list-to-detail Chat lane so pointer, touch, and retained Quick Chat ownership regressions run together.
+  "app/components/__tests__/ChatView.composer-focus.test.tsx",
   "app/components/__tests__/ChatView.content-search.test.tsx",
   "app/components/__tests__/ChatView.core.test.tsx",
   "app/components/__tests__/ChatView.core-contracts.test.tsx",
@@ -254,6 +256,7 @@ const qualityAppChatOnlyTests = [
   "app/components/__tests__/ChatView.mobile.test.tsx",
   "app/components/__tests__/ChatView.mobile-render.test.tsx",
   "app/components/__tests__/ChatView.new-chat-default.test.tsx",
+  "app/components/__tests__/ChatView.open-at-latest.test.tsx",
   "app/components/__tests__/ChatView.sessions-rooms.test.tsx",
   "app/components/__tests__/ChatView.swipe-back.test.tsx",
   "app/components/__tests__/overflowViewRegistry.chat.test.tsx",

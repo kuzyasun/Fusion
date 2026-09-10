@@ -98,11 +98,11 @@ pgDescribe("refineTask / duplicateTask backend mode (PostgreSQL)", () => {
   it("routes Coding (Ideas) refinements to Planning and preserves selection and seed", async () => {
     const h = await makeHarness();
     try {
-      await h.store.updateSettings({ refinementTaskWorkflowId: "builtin:coding-ideas" } as never);
+      await h.store.updateSettings({ refinementTaskWorkflowId: "builtin:coding-ideas-v2" } as never);
       const source = await h.store.createTask({
         title: "Ideas source",
         description: "Completed work selected in Coding (Ideas)",
-        workflowId: "builtin:coding-ideas",
+        workflowId: "builtin:coding-ideas-v2",
         column: "done",
       } as never);
 
@@ -116,7 +116,7 @@ pgDescribe("refineTask / duplicateTask backend mode (PostgreSQL)", () => {
       expect(fetched.sourceParentTaskId).toBe(source.id);
       expect(fetched.dependencies).toEqual([source.id]);
       expect(await h.store.getTaskWorkflowSelectionAsync(refined.id)).toMatchObject({
-        workflowId: "builtin:coding-ideas",
+        workflowId: "builtin:coding-ideas-v2",
       });
       expect(prompt).toBe(buildRefinementSeedPrompt(refined.title ?? refined.id, refined.description));
     } finally {
@@ -143,7 +143,6 @@ pgDescribe("refineTask / duplicateTask backend mode (PostgreSQL)", () => {
             */
             { id: "working", name: "Working", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
             { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
-            { id: "filed", name: "Filed", traits: [{ trait: "archived" }] },
           ],
           nodes: [
             { id: "start", kind: "start", column: "capture" },
@@ -422,6 +421,107 @@ pgDescribe("refineTask / duplicateTask backend mode (PostgreSQL)", () => {
         column: "in-progress",
       });
       await expect(h.store.refineTask(source.id, "too early")).rejects.toThrow(/must be in 'done' or 'in-review'/);
+    } finally {
+      await teardown();
+    }
+  });
+
+  it("duplicateTask inherits the source workflow and its intake column", async () => {
+    const h = await makeHarness();
+    try {
+      const workflow = await h.store.createWorkflowDefinition({
+        name: "Duplicate source workflow",
+        kind: "workflow",
+        ir: {
+          version: "v2",
+          name: "Duplicate source workflow",
+          columns: [
+            { id: "source-capture", name: "Capture", traits: [{ trait: "intake", config: { autoTriage: true } }] },
+            { id: "source-done", name: "Done", traits: [{ trait: "complete" }] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "source-capture" },
+            { id: "end", kind: "end", column: "source-done" },
+          ],
+          edges: [{ from: "start", to: "end" }],
+        },
+      } as never);
+      const source = await h.store.createTask({
+        description: "Task pinned away from the project default",
+        workflowId: workflow.id,
+      });
+
+      const duplicate = await h.store.duplicateTask(source.id);
+
+      expect(duplicate.column).toBe("source-capture");
+      expect(await h.store.getTaskWorkflowSelectionAsync(duplicate.id)).toEqual({
+        workflowId: workflow.id,
+        stepIds: [],
+      });
+    } finally {
+      await teardown();
+    }
+  });
+
+  it("duplicateTask honors an explicit workflow including intake and default-on groups", async () => {
+    const h = await makeHarness();
+    try {
+      const target = await h.store.createWorkflowDefinition({
+        name: "Explicit duplicate target",
+        kind: "workflow",
+        ir: {
+          version: "v2",
+          name: "Explicit duplicate target",
+          columns: [
+            { id: "target-capture", name: "Capture", traits: [{ trait: "intake", config: { autoTriage: true } }] },
+            { id: "target-done", name: "Done", traits: [{ trait: "complete" }] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "target-capture" },
+            {
+              id: "target-review",
+              kind: "optional-group",
+              config: {
+                name: "Target review",
+                defaultOn: true,
+                template: { nodes: [{ id: "review", kind: "prompt", config: { prompt: "Review" } }], edges: [] },
+              },
+            },
+            { id: "end", kind: "end", column: "target-done" },
+          ],
+          edges: [
+            { from: "start", to: "target-review" },
+            { from: "target-review", to: "end" },
+          ],
+        },
+      } as never);
+      const source = await h.store.createTask({ description: "Source on the default workflow" });
+
+      const duplicate = await h.store.duplicateTask(source.id, { workflowId: target.id });
+
+      expect(duplicate.column).toBe("target-capture");
+      expect(duplicate.enabledWorkflowSteps).toEqual(["target-review"]);
+      expect(await h.store.getTaskWorkflowSelectionAsync(duplicate.id)).toEqual({
+        workflowId: target.id,
+        stepIds: ["target-review"],
+      });
+    } finally {
+      await teardown();
+    }
+  });
+
+  it("duplicateTask rejects an unknown explicit workflow before creating a row", async () => {
+    const h = await makeHarness();
+    try {
+      const source = await h.store.createTask({ description: "Do not duplicate onto a retired workflow" });
+      const beforeIds = (await h.store.listTasks({ includeArchived: false })).map((task) => task.id);
+
+      await expect(h.store.duplicateTask(source.id, { workflowId: "WF-UNKNOWN" })).rejects.toMatchObject({
+        name: "DuplicateWorkflowSelectionError",
+        requestedWorkflowId: "WF-UNKNOWN",
+      });
+
+      expect((await h.store.listTasks({ includeArchived: false })).map((task) => task.id)).toEqual(beforeIds);
     } finally {
       await teardown();
     }

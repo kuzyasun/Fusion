@@ -118,6 +118,11 @@ export const COLOR_THEMES = [
   "glass",
   // FNXC:DashboardTheming 2026-07-01-00:00: Glass Silver is the silver/gray frosted sibling of Glass; keep this id in lockstep with dashboard/desktop validators and selector metadata so persisted explicit choices survive startup.
   "glass-silver",
+  /*
+  FNXC:LiquidGlassTheme 2026-09-09-15:50:
+  Liquid Glass is a separate persisted preset rather than a remap of either historical Glass theme. Keep this ID synchronized with selector metadata and both first-paint validators so an explicit choice survives web and Electron startup.
+  */
+  "liquid-glass",
   "horizon",
   "vitesse",
   "outrun",
@@ -160,6 +165,8 @@ export const COLOR_THEMES = [
   "iceberg",
   // FNXC:DashboardTheming 2026-08-27-04:23: Flexoki is persisted immediately after Iceberg; keep this ID and order synchronized across core, selector metadata, both first-paint validators, token blocks, and swatch CSS so saved selections survive pre-hydration validation.
   "flexoki",
+  // FNXC:DashboardTheming 2026-08-28-07:45: Cozy Cartoon must stay order-synchronized across core, selector metadata, both first-paint validators, token blocks, and swatch CSS so persisted selections survive startup without a fallback flash.
+  "cozy-cartoon",
   // FNXC:DashboardTheming 2026-07-31-20:39: Factory Dark must stay order-synchronized across core, selector metadata, and both first-paint validators so saved preferences survive pre-hydration validation.
   "factory-dark",
   // FNXC:DashboardTheming 2026-07-31-23:51: Factory Light must stay order-synchronized across core, selector metadata, and both first-paint validators so saved preferences survive pre-hydration validation.

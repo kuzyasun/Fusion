@@ -1,5 +1,15 @@
 import type { WorkflowReviewFinding, WorkflowReviewFindingResolution, WorkflowReviewFindingSeverity, WorkflowStepResult } from "../types.js";
 
+export const WORKFLOW_STEP_NOT_RUN_REASONS = ["not-configured", "tooling-unavailable", "execution-mode-skip", "repository-context-unresolved"] as const;
+export type WorkflowStepNotRunReason = (typeof WORKFLOW_STEP_NOT_RUN_REASONS)[number];
+
+/** A not-run result is terminal and honest only when its fixed reason accompanies `skipped`. */
+export function isWorkflowStepNotRun(result: WorkflowStepResult): boolean {
+  return result.status === "skipped"
+    && typeof result.notRunReason === "string"
+    && (WORKFLOW_STEP_NOT_RUN_REASONS as readonly string[]).includes(result.notRunReason);
+}
+
 export const WORKFLOW_REVIEW_FINDING_SEVERITIES = ["low", "medium", "high", "critical"] as const;
 export const WORKFLOW_REVIEW_FINDING_RESOLUTIONS = ["open", "resolved-in-review", "superseded", "dispute-upheld"] as const;
 /** Values an untrusted reviewer response may assign; automatic dispute closure is Fusion-owned. */
@@ -234,13 +244,25 @@ export function toSnapshot(result: WorkflowStepResult): WorkflowStepResult {
  * its clean-slate contract. A skipped carrier is non-blocking but hands a single-level snapshot to
  * the next upsert; this blanket helper is intentionally incapable of writing arbitration metadata.
  */
+/*
+FNXC:ReviewRemediation 2026-09-05-22:31:
+FN-295: `workflowStepIds` scopes the archive to the gate whose remediation is actually running. The
+blanket form contradicted its own call sites — "archive ITS failed review result" — and archived every
+terminal failure on the card, including a stale row from an unrelated gate. An archived carrier is an
+unconditional merge veto (`evaluatePreMergeApprovals`) that no reseed, reroute, or operator bypass can
+select, so one gate's remediation could permanently wedge a card on another gate's row. Omitting the
+scope preserves the historical blanket behaviour for callers that genuinely mean "all".
+*/
 export function archiveTerminalWorkflowStepFailures(
   results: WorkflowStepResult[] | undefined,
   archivedAt: string = new Date().toISOString(),
+  options: { workflowStepIds?: ReadonlySet<string> } = {},
 ): WorkflowStepResult[] | undefined {
-  if (!results?.some(isTerminalFailure)) return results;
+  const inScope = (result: WorkflowStepResult): boolean =>
+    isTerminalFailure(result) && (!options.workflowStepIds || options.workflowStepIds.has(result.workflowStepId));
+  if (!results?.some(inScope)) return results;
   return results.map((result) => {
-    if (!isTerminalFailure(result)) return result;
+    if (!inScope(result)) return result;
     const snapshot = toSnapshot(result);
     const priorAttempts = [snapshot, ...(result.priorAttempts ?? [])].slice(0, MAX_WORKFLOW_STEP_PRIOR_ATTEMPTS);
     const {
@@ -396,6 +418,45 @@ graph executor and unit tests share one lease implementation.
  *  with no terminal result is presumed crashed and may be reclaimed. Mirrors the
  *  FN-6736 staleness-floor standard for durable single-owner leases. */
 export const PLAN_REVIEW_LEASE_STALENESS_MS = 15 * 60 * 1000;
+
+/** FN-267 uses the same conservative floor for an in-flight automatic remediation attempt. */
+export const REMEDIATION_ATTEMPT_CLAIM_STALENESS_MS = 15 * 60 * 1000;
+
+export type RemediationAttemptClaimDisposition =
+  | { kind: "absent" }
+  | { kind: "signature-moved" }
+  | { kind: "refused"; reason: NonNullable<WorkflowStepResult["remediationRefusedReason"]> }
+  | { kind: "owned"; result: WorkflowStepResult }
+  | { kind: "held"; owner: string }
+  | { kind: "reclaimable" }
+  | { kind: "claimable"; result: WorkflowStepResult };
+
+/**
+ * FNXC:LifecycleContainment 2026-08-30-12:57:
+ * This is deliberately pure and clock-injected like classifyReviewLease. Admission, resolution,
+ * and the self-healing advisory filter use one step-id-addressed vocabulary; the engine supplies
+ * `liveSignature` because review-input normalization belongs to its review protocol, not core.
+ */
+export function classifyRemediationAttemptClaim(
+  results: readonly WorkflowStepResult[] | undefined,
+  input: { workflowStepId: string; signature: string; liveSignature: string | undefined; owner?: string; now: number; stalenessMs?: number },
+): RemediationAttemptClaimDisposition {
+  const result = results?.find((entry) => entry.workflowStepId === input.workflowStepId);
+  if (!result) return { kind: "absent" };
+  if (input.liveSignature !== input.signature) return { kind: "signature-moved" };
+  if (result.remediationAttemptSignature !== undefined && result.remediationAttemptSignature !== input.signature) {
+    return { kind: "signature-moved" };
+  }
+  if (result.remediationRefusedReason) return { kind: "refused", reason: result.remediationRefusedReason };
+  const owner = result.remediationAttemptOwner;
+  if (owner && input.owner === owner) return { kind: "owned", result };
+  if (!owner) return { kind: "claimable", result };
+  const claimedAt = result.remediationAttemptClaimedAt ? Date.parse(result.remediationAttemptClaimedAt) : Number.NaN;
+  if (!Number.isFinite(claimedAt) || input.now - claimedAt >= (input.stalenessMs ?? REMEDIATION_ATTEMPT_CLAIM_STALENESS_MS)) {
+    return { kind: "reclaimable" };
+  }
+  return { kind: "held", owner };
+}
 
 /**
  * Identity a caller supplies so {@link classifyReviewLease} can recognize leases left behind by a

@@ -6,11 +6,13 @@ Dashboard view ids, English fallback labels, and translation keys have one sourc
 export const DASHBOARD_VIEW_IDS = [
   "board",
   "list",
+  "patchnode",
   "graph",
   "agents",
   "missions",
   "chat",
-  "documents",
+  "notes",
+  "whiteboard",
   "research",
   "evals",
   "ideation",
@@ -32,7 +34,7 @@ export const DASHBOARD_VIEW_IDS = [
 ] as const;
 
 export type CanonicalDashboardViewId = (typeof DASHBOARD_VIEW_IDS)[number];
-export type BuiltInTaskView = CanonicalDashboardViewId | "devserver";
+export type BuiltInTaskView = CanonicalDashboardViewId | "devserver" | "documents" | "recommendations";
 
 export interface DashboardViewMetadata {
   id: CanonicalDashboardViewId;
@@ -53,11 +55,19 @@ export interface DashboardViewMetadata {
 export const DASHBOARD_VIEWS: readonly DashboardViewMetadata[] = [
   { id: "board", label: "Board", labelKey: "nav.board" },
   { id: "list", label: "List", labelKey: "nav.list" },
+  /*
+  FNXC:HistoryNaming 2026-09-04-09:35:
+  Operators call this destination History, and chat exposes it as `fn_history_read`. The `patchnode` view id, `nav.patchnode` key, `GET /api/patchnode` route, `project.patchnode_entries` table, and persisted mobile-navigation preferences intentionally remain unchanged.
+  */
+  { id: "patchnode", label: "History", labelKey: "nav.patchnode" },
   { id: "graph", label: "Graph" },
   { id: "agents", label: "Agents", labelKey: "nav.agents" },
   { id: "missions", label: "Missions", labelKey: "nav.missions" },
   { id: "chat", label: "Chat", labelKey: "nav.chat" },
-  { id: "documents", label: "Artifacts", labelKey: "nav.documents" },
+  /* FNXC:ProjectNotes 2026-09-09-17:08: Notes is one canonical project-scoped destination shared by metadata, deep links, desktop navigation, and mobile customization. */
+  { id: "notes", label: "Notes", labelKey: "nav.notes" },
+  /* FNXC:WhiteboardAlpha 2026-09-10-05:42: Whiteboard is one canonical default-off project destination shared by metadata, deep links, and every responsive navigation host. */
+  { id: "whiteboard", label: "Whiteboard", labelKey: "nav.whiteboard" },
   { id: "research", label: "Research", labelKey: "header.researchView" },
   { id: "evals", label: "Evals", labelKey: "header.evalsView" },
   /*
@@ -72,8 +82,16 @@ export const DASHBOARD_VIEWS: readonly DashboardViewMetadata[] = [
   FN-6886 promotes Planning Mode into a persisted top-level docked task view instead of treating it as a modal-only overlay.
   */
   { id: "planning", label: "Planning", labelKey: "nav.planning" },
-  { id: "skills", label: "Skills", labelKey: "header.skillsView" },
-  { id: "mailbox", label: "Mailbox", labelKey: "nav.mailbox" },
+  /*
+  FNXC:ChatSnippets 2026-09-03-16:32:
+  The existing `skills` route and persistence identity stay stable while every navigation label presents the combined Skills & Snippets destination.
+  */
+  { id: "skills", label: "Skills & Snippets", labelKey: "header.skillsView" },
+  /*
+  FNXC:MailboxNavigation 2026-09-09-20:02:
+  Artifacts and recommendations are mailbox categories rather than standalone dashboard destinations. Legacy persisted and linked ids remain aliases so old navigation state resolves to Mailbox instead of an orphaned route.
+  */
+  { id: "mailbox", label: "Mailbox", labelKey: "nav.mailbox", aliases: ["documents", "recommendations"] },
   { id: "insights", label: "Insights", labelKey: "header.insightsView" },
   { id: "memory", label: "Memory", labelKey: "header.memoryView" },
   { id: "command-center", label: "Dashboard", labelKey: "nav.commandCenter" },

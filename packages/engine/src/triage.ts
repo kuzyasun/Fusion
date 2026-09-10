@@ -21,6 +21,7 @@ import {
   buildTriageMemoryInstructions,
   isUnplannedSeedPrompt,
   isTaskAwaitingPlanning,
+  isFastExecutionMode,
   getTaskDuplicateLineage,
   resolveExplicitDuplicateMarker,
   resolveAgentPrompt,
@@ -41,7 +42,6 @@ import {
   resolveWorkflowIrForTaskWithProvenance,
   resolveProjectColumnsForRoles,
   isWorkflowAgentNodeForRole,
-  resolveWorktreeCapacityLimit,
   workflowHasColumn,
   getStepParser,
   computePlanApprovalFingerprint,
@@ -61,7 +61,9 @@ import {
   deriveFallbackTaskTitle,
   resolveTaskOutputLanguage,
   parsePlanningPlanMd,
+  matchStepHeadings,
   loadWorkspaceConfig,
+  isUnavailablePlanLockError,
   type NearDuplicateCandidate,
 } from "@fusion/core";
 
@@ -85,12 +87,27 @@ workflows; metadata is the only authoritative renamed-lane answer in this event 
 const LEGACY_PLANNER_WAKE_COLUMNS = new Set(["todo", "triage"]);
 const LEGACY_PLANNER_COLUMNS = new Set([...LEGACY_PLANNER_WAKE_COLUMNS, "in-progress"]);
 
-const PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY = "planning.lifecycleLockTransportFailure";
+/*
+FNXC:TriagePlanningState 2026-09-07-19:49:
+FN-9273 stores planning retry evidence on Task.planningFailure because workflow customFields reject
+planning.* identifiers on every workflow. That fail-fast rejection previously lost the retry hold.
+*/
+type PlanningSpecLockUnavailableFailure = NonNullable<NonNullable<Task["planningFailure"]>["specLockUnavailable"]>;
 
-type PlanningLifecycleLockTransportFailure = { message: string; at: string; attempt: number | null };
+function getPlanningSpecLockUnavailableFailure(task: Task): PlanningSpecLockUnavailableFailure | null {
+  const candidate = task.planningFailure?.specLockUnavailable;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+  const marker = candidate as Partial<PlanningSpecLockUnavailableFailure>;
+  return typeof marker.sourceHash === "string" && typeof marker.reason === "string" && typeof marker.at === "string" && Array.isArray(marker.sections)
+    && marker.sections.every((section) => typeof section === "string")
+    ? { sourceHash: marker.sourceHash, reason: marker.reason, sections: marker.sections, at: marker.at, attempt: typeof marker.attempt === "number" ? marker.attempt : null }
+    : null;
+}
+
+type PlanningLifecycleLockTransportFailure = NonNullable<NonNullable<Task["planningFailure"]>["lifecycleLockTransport"]>;
 
 function getPlanningLifecycleLockTransportFailure(task: Task): PlanningLifecycleLockTransportFailure | null {
-  const candidate = task.customFields?.[PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY];
+  const candidate = task.planningFailure?.lifecycleLockTransport;
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
   const marker = candidate as Partial<PlanningLifecycleLockTransportFailure>;
   return typeof marker.message === "string" && typeof marker.at === "string"
@@ -171,6 +188,12 @@ import { mergeEffectiveSettings } from "./project/effective-settings.js";
 import { detectDanglingTaskDocReferences, formatDanglingDiagnostic } from "./spec-validation/task-document-references.js";
 import { buildSessionSkillContext } from "./cli-runtime/session-skill-context.js";
 import {
+  extractCommandBinaries,
+  formatEnvironmentCapabilitiesSection,
+  probeEnvironmentCapabilities,
+  type EnvironmentCapabilityProbe,
+} from "./environment/environment-capabilities.js";
+import {
   PRIORITY_SPECIFY,
   computeTopLevelConcurrencyClaimedFromStore,
   formatAdmissionCapacityQueuedReason,
@@ -179,7 +202,7 @@ import {
   projectAdmissionCoordinator,
   registerPreHeldExecutorSlot,
   releasePreHeldAdmissionReservation,
-  resolveActiveTaskCapacityLimit,
+  resolveAgentCapacityLimit,
   takePreHeldExecutorSlot,
   recoverIdleSemaphoreLeakCandidate,
   type AgentSemaphore,
@@ -187,9 +210,10 @@ import {
 import { AgentLogger } from "./agents/agent-logger.js";
 import { attachAgentUsageTelemetry, emitAgentSessionStart } from "./agents/agent-usage-telemetry.js";
 import { emitApprovalMail } from "./agents/approval-mail.js";
-import { acquireActiveSessionPath, activeSessionRegistry } from "./agents/active-session-registry.js";
-import { PlanningResetFence } from "./planning-reset-fence.js";
+import { activeSessionRegistry } from "./agents/active-session-registry.js";
+import { isPlanningResetHoldClearingUpdate, PlanningResetFence } from "./planning-reset-fence.js";
 import { registerPlanningLivenessProbe } from "./agents/planning-liveness.js";
+import { isPlanningContinuationDispatchClaim } from "./agents/planning-execution-liveness.js";
 import {
   resolveAgentInstructions,
   resolveAgentInstructionsWithRatings,
@@ -214,9 +238,83 @@ import type { StuckTaskDetector } from "./healing/stuck-task-detector.js";
 /*
 */
 const STALE_PLANNING_STATUS_GRACE_MS = 20 * 60_000;
+export const PLANNING_CONTINUATION_LEASE_MS = 10 * 60_000;
+
+export interface PlanningDependencyInstructionTarget {
+  repository: string;
+  readiness: WorktreeDependencyReadiness;
+}
+
+/** Render only the exceptional dependency work that the planner must resolve before Plan Review. */
+export function buildPlanningDependencyInstallationInstruction(
+  targets: readonly PlanningDependencyInstructionTarget[],
+): string {
+  const blocking = targets.filter((target) =>
+    target.readiness.readiness === "unresolved" || target.readiness.readiness === "unrecognized",
+  );
+  if (blocking.length === 0) return "";
+  const lines = [
+    "## Dependency installation",
+    "",
+    "This task already holds an execution checkout from prior work. Resolve every item below through `fn_install_worktree_dependencies`; fresh checkout-free planning defers dependency readiness to execution acquisition.",
+  ];
+  for (const target of blocking) {
+    const { readiness } = target;
+    if (readiness.readiness === "unresolved") {
+      for (const row of readiness.unresolvedRepos) {
+        const entry = readiness.entries.find((candidate) => candidate.ecosystem === row.ecosystem);
+        const outcome = entry?.outcome ?? "not yet installed";
+        const reason = entry?.reason ?? entry?.rationale ?? outcome;
+        lines.push(`- \`${target.repository}\`: ${row.manifests.join(", ") || row.ecosystem}; command \`${row.command}\`; ${outcome}: ${reason}.`);
+        if (row.refusal === "configuration-required") lines.push("  Configure `worktreeInitCommand`, or call `fn_install_worktree_dependencies` with a command explicitly naming extras or groups. Re-running bare `uv sync --frozen` or recording `none` leaves this worktree unresolved.");
+      }
+    } else {
+      lines.push(`- \`${target.repository}\`: Fusion has no built-in command for ${readiness.evidence.join(", ")}. Determine the package manager and run its install command through \`fn_install_worktree_dependencies\`, or use its \`none\` action with a reason if no install step is genuinely required.`);
+    }
+  }
+  lines.push("", "Plan Review will return a REVISE beginning `Dependencies are not installed.` until these records are resolved.");
+  return lines.join("\n");
+}
+
+async function resolvePlanningDependencyInstruction(input: {
+  task: Task;
+  rootDir: string;
+  planningCwd: string;
+  settings: Settings;
+}): Promise<string> {
+  /*
+  FNXC:PlanningBoundary 2026-09-01-14:49:
+  Planning runs against the dependency-installed main checkout without shell access. Dependency
+  installation and readiness are execution-lane concerns handled by acquireTaskWorktree's init pass.
+  */
+  if (input.planningCwd === input.rootDir) return "";
+  const workspace = await loadWorkspaceConfig(input.rootDir).catch(() => null);
+  const targets: PlanningDependencyInstructionTarget[] = [];
+  const inspect = (repository: string, worktreePath: string) => {
+    if (!existsSync(worktreePath)) return;
+    const plan = detectWorktreeDependencyPlan(worktreePath, input.settings);
+    const evidence = detectUnrecognizedDependencyEvidence(worktreePath);
+    targets.push({ repository, readiness: resolveWorktreeDependencyReadiness(worktreePath, plan, evidence) });
+  };
+  try {
+    if (workspace?.repos.length) {
+      for (const repository of workspace.repos) {
+        const path = input.task.workspaceWorktrees?.[repository]?.worktreePath;
+        if (path) inspect(repository, path);
+      }
+    } else if (input.planningCwd !== input.rootDir) {
+      inspect("task worktree", input.planningCwd);
+    }
+  } catch {
+    // A missing/unreadable probe is intentionally not dependency evidence. Plan Review will retain
+    // its not-determined fallthrough rather than manufacture an unresolved worktree.
+    return "";
+  }
+  return buildPlanningDependencyInstallationInstruction(targets);
+}
 
 
-import { exec } from "node:child_process";
+import { execFile, type ExecFileOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -235,6 +333,7 @@ import {
   createTaskDocumentReadTool,
   createTaskDocumentWriteTool,
   createTaskPromptWriteTool,
+  createInstallWorktreeDependenciesTool,
   createWorkflowListTool,
   createWorkflowSelectTool,
   resolveTerminalColumnsForTasks,
@@ -243,8 +342,15 @@ import {
   getResearchGuidanceForSurface,
   isResearchToolSurfaceEnabled,
 } from "./execution/tool-availability.js";
-import { runGhostBugPreflight } from "./triage-domain/triage-preflight.js";
-import { archiveAsGhostBug } from "./self-healing.js";
+import { runGhostBugPreflight, type ExecResult, type ProbeExec } from "./triage-domain/triage-preflight.js";
+import { runConfiguredCommand } from "./executor/configured-command.js";
+import {
+  detectUnrecognizedDependencyEvidence,
+  detectWorktreeDependencyPlan,
+  resolveWorktreeDependencyReadiness,
+  type WorktreeDependencyReadiness,
+} from "./worktree/worktree-dependency-install.js";
+import { softDeleteAsGhostBug } from "./self-healing.js";
 import {
   TRIAGE_MARKER_CLEARED_REPLAN_LOG_ACTION,
   buildInactiveDuplicateClearFeedback,
@@ -291,6 +397,8 @@ export interface TriageProcessorOptions {
   */
   onSpecifyComplete?: (task: Task, report: PlanningHandoffReport) => void;
   onSpecifyError?: (task: Task, error: Error) => void;
+  /** Advisory execution-lane nudge after an admitted planning promise returns its slot. */
+  onPlanningSlotReleased?: () => void;
   onAgentText?: (taskId: string, delta: string) => void;
   /** AgentStore for resolving per-agent custom instructions. */
   agentStore?: import("@fusion/core").AgentStore;
@@ -302,16 +410,8 @@ export interface TriageProcessorOptions {
   messageStore?: import("@fusion/core").MessageStore;
   /** Plugin runner for runtime selection. When provided, enables plugin runtime lookup. */
   pluginRunner?: import("./plugins/plugin-runner.js").PluginRunner;
-  /*
-  FNXC:NodeWorktreeIsolation 2026-07-25-22:10:
-  Acquires (or reuses) the task-specific worktree so the planning session runs there instead of in the
-  shared main checkout. Planning uses the CODING tool surface, so running it at the repo root gave every
-  planner write tools in the operator's tree and made concurrent planners share one path. Optional: when
-  unwired (older callers, tests) or when it resolves null (workspace projects, acquisition failure),
-  planning falls back to the repo root exactly as before.
-  */
-  acquirePlanningWorktree?: (taskId: string) => Promise<string | null>;
 }
+
 
 /**
  * Processes tasks in the triage column by running an AI agent to generate
@@ -418,6 +518,39 @@ function isOrphanedLegacyTriageRow(column: string, declaresTriage: boolean): boo
   return column === "triage" && !declaresTriage;
 }
 
+export type GhostBugExecFile = (file: string, args: string[], options: ExecFileOptions) => Promise<{ stdout: string; stderr: string }>;
+
+/**
+ * FNXC:GhostBugPreflight 2026-09-07-17:01:
+ * The former command-string wiring ignored `timeoutMs` because child_process expects `timeout`.
+ * This bounded async adapter uses execFile without a shell, preserving plan text as argv data only.
+ */
+export function createGhostBugProbeExec(
+  runExecFile: GhostBugExecFile = async (file, args, options) => {
+    const result = await promisify(execFile)(file, args, options);
+    return { stdout: String(result.stdout), stderr: String(result.stderr) };
+  },
+): ProbeExec {
+  return async (argv, options): Promise<ExecResult> => {
+    try {
+      const result = await runExecFile(argv[0]!, argv.slice(1), {
+        cwd: options?.cwd,
+        timeout: options?.timeoutMs,
+        maxBuffer: 1024 * 1024,
+        shell: false,
+      });
+      return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
+    } catch (error) {
+      const result = error as { code?: unknown; stdout?: unknown; stderr?: unknown };
+      return {
+        stdout: typeof result.stdout === "string" ? result.stdout : "",
+        stderr: typeof result.stderr === "string" ? result.stderr : "",
+        ...(typeof result.code === "number" ? { exitCode: result.code } : {}),
+      };
+    }
+  };
+}
+
 export class TriageProcessor {
   private running = false;
   private polling = false;
@@ -442,6 +575,8 @@ export class TriageProcessor {
   private advancedRecoveryReservations = new Set<string>();
   /** Prevent a selected planner from reappearing before specifyTask claims it. */
   private readonly coordinatorAdmittedTaskIds = new Set<string>();
+  /** One visible planning-bypass record per Fast card prevents discovery-poll log spam. */
+  private readonly fastLanePlanningSkipLogged = new Set<string>();
   /** Durable planning provider keeps this lane visible to execute/merge polls. */
   private unregisterAdmissionProvider: (() => void) | null = null;
   /** Timestamps when tasks entered the `processing` set, for staleness detection. */
@@ -694,11 +829,11 @@ export class TriageProcessor {
           now,
         );
         return tasks.filter((task) => !this.coordinatorAdmittedTaskIds.has(task.id)).map((task) => ({
-          taskId: task.id, projectId: this.rootDir, lane: "planning", createdAt: task.createdAt,
+          taskId: task.id, projectId: this.rootDir, lane: "planning", consumesWorktree: false, createdAt: task.createdAt,
           reserve: () => registerPreHeldExecutorSlot(task.id, this.options.semaphore !== undefined),
           start: async () => {
             this.coordinatorAdmittedTaskIds.add(task.id);
-            void this.specifyTask(task);
+            this.startAdmittedPlanning(task);
           },
         }));
       },
@@ -815,8 +950,8 @@ export class TriageProcessor {
     */
     this.taskColumnWakeHandler = (task: Task, meta?: { lanes?: TaskMoveLanes }) => {
       if (!task?.id) return;
-      // Reset publication emits this durable state after its held lock commits, so a fresh planner is not delayed by the conservative reset TTL.
-      if (task.status === "needs-replan") this.resetFence.clearHold(task.id);
+      // Reset or graph-replan publication emits a durable clearing shape after its held lock commits, so a fresh planner is not delayed by the conservative reset TTL.
+      if (isPlanningResetHoldClearingUpdate(task)) this.resetFence.clearHold(task.id);
       const isPlannerWakeColumn = meta?.lanes
         ? task.column === meta.lanes.hold || task.column === meta.lanes.intake
         : LEGACY_PLANNER_WAKE_COLUMNS.has(task.column);
@@ -1397,6 +1532,10 @@ export class TriageProcessor {
    * Do not recover `needs-replan` / `plan-review-unavailable`.
    */
   async recoverApprovedTask(task: Task): Promise<boolean> {
+    if (isFastExecutionMode(task)) {
+      await this.recordFastLanePlanningSkip(task);
+      return false;
+    }
     /*
     FNXC:PlanningDependencyReseed 2026-08-04-00:30:
     A dependency reseed from older writers could clear status after the planner
@@ -1518,8 +1657,10 @@ export class TriageProcessor {
     }
 
     /*
-    FNXC:PlanApproval 2026-07-01-08:12:
-    Recovery finalizes an already-written PROMPT.md and must use the same merged project/workflow settings as fresh triage. The project planApprovalMode value stays project-scoped while workflow requirePlanApproval may overlay, so auto-approve-all still wins for ordinary plan approval.
+    FNXC:PlanApproval 2026-08-28-17:16:
+    Recovery finalizes an already-written PROMPT.md with the same merged project/workflow settings
+    as fresh triage. FN-234 removed task-level escalation, so only project planApprovalMode and the
+    workflow requirePlanApproval value decide whether this recovery needs manual approval.
     */
     const settings = await mergeEffectiveSettings(this.store, task, await this.store.getSettings());
     const approvalRequired = resolvePlanApprovalRequired(settings);
@@ -1733,9 +1874,6 @@ export class TriageProcessor {
       hasAdvancedPastPlanning(freshTask, plannerLanes.intake, {
         mergedPlanningColumn: plannerLanes.hold,
         lanes: plannerLanes,
-        archivedColumn: resolveLifecycleColumns(
-          await resolveWorkflowIrForTask(this.store, freshTask.id),
-        )?.archived,
       })
       || releasedToTodo
     ) {
@@ -1911,6 +2049,9 @@ export class TriageProcessor {
     };
 
     const candidates = allTasks.filter(couldBeCandidate);
+    for (const candidate of candidates) {
+      if (isFastExecutionMode(candidate)) void this.recordFastLanePlanningSkip(candidate);
+    }
     /*
     FNXC:WorkflowLifecycleColumns 2026-07-29-18:40 (U11 — STALL 3):
     Resolves the IR ONCE per candidate and derives both the lifecycle roles and the
@@ -2037,7 +2178,8 @@ export class TriageProcessor {
          `paused`, so a row carrying `userPaused` without `paused` slipped through —
          invisible before this change (an undeclared-column card was admitted by
          nothing at all) and reachable the moment the rescue widens admission. */
-      (t) => ((isAtIntakeColumn(t) && !isAtHoldColumn(t)) || isAtUndeclaredColumn(t))
+      (t) => !isFastExecutionMode(t)
+        && ((isAtIntakeColumn(t) && !isAtHoldColumn(t)) || isAtUndeclaredColumn(t))
         && t.userPaused !== true
         && isTaskStillInPlanningStage(t)
         && !this.advancedRecoveryReservations.has(t.id)
@@ -2046,7 +2188,8 @@ export class TriageProcessor {
         && !(t.nextRecoveryAt && new Date(t.nextRecoveryAt).getTime() > now),
     );
     const eligibleTodoTasksRaw = candidates.filter(
-      (t) => isAtHoldColumn(t) && !this.processing.has(t.id) && !this.hasLivePlanningWork(t.id) && !t.paused
+      (t) => !isFastExecutionMode(t)
+        && isAtHoldColumn(t) && !this.processing.has(t.id) && !this.hasLivePlanningWork(t.id) && !t.paused
         && t.status !== "awaiting-approval" && t.status !== "failed" && t.status !== "stuck-killed"
         && t.status !== "planning"
         && !(t.nextRecoveryAt && new Date(t.nextRecoveryAt).getTime() > now),
@@ -2136,6 +2279,48 @@ export class TriageProcessor {
     }, TriageProcessor.NUDGE_DEBOUNCE_MS);
     this.nudgeTimer.unref?.();
     return true;
+  }
+
+  /*
+  FNXC:ConcurrencyAdmission 2026-08-28-21:44:
+  Every admitted planning promise, including work selected through the durable coordinator provider, returns shared project capacity when it settles. Attach one common completion chain at both admission surfaces so success, rejection, and every pre-session early return immediately pull queued planning work and nudge execution rather than waiting for a timer.
+  */
+  /*
+  FNXC:FastLane 2026-08-29-02:55:
+  Fast tasks intentionally carry only the operator's bootstrap request, so planning discovery and
+  direct planner admission must record one durable explanation instead of opening a specification
+  session or producing a log entry on every poll.
+  */
+  private async recordFastLanePlanningSkip(task: Pick<Task, "id">): Promise<void> {
+    if (this.fastLanePlanningSkipLogged.has(task.id)) return;
+    this.fastLanePlanningSkipLogged.add(task.id);
+    const message = "Fast mode intentionally skips specification planning";
+    planLog.log(`${task.id}: ${message}`);
+    await this.store.logEntry(task.id, message).catch(() => undefined);
+  }
+
+  private startAdmittedPlanning(task: Task): void {
+    void this.specifyTask(task)
+      .catch(async (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        planLog.error(`${task.id}: admitted planning promise rejected:`, error);
+        await this.parkPlanningRecoveryWriteFailure(task, message, error);
+      })
+      .finally(() => this.notifyPlanningSlotReleased());
+  }
+
+  /*
+  FNXC:ConcurrencyAdmission 2026-08-28-21:24:
+  A settled planning promise returns shared project capacity. Pull the next queued planning card immediately and nudge execution at that event rather than waiting for a timer; this is advisory only, so the next poll still applies pause, seed-prompt, dependency, worktree, and admission-coordinator gates.
+  */
+  private notifyPlanningSlotReleased(): void {
+    if (!this.running) return;
+    this.requestImmediatePoll();
+    try {
+      this.options.onPlanningSlotReleased?.();
+    } catch (error) {
+      planLog.warn(`Planning-slot release listener failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /** Coalescing window for requestImmediatePoll, so a multi-card drag causes one poll, not N. */
@@ -2260,22 +2445,15 @@ export class TriageProcessor {
       registration (`reserve`), the release on drop, the leak-recovery path, and the
       two admission-reservation hand-offs. Only its use as an ADMISSION LIMIT is gone.
       */
-      const projectRoom = Math.max(0, maxConcurrent - claimed);
       /*
-      FNXC:WorktreeCapacity 2026-08-01-04:38:
-      Worktree slots follow the canonical LIVE-TASK count (`claimed`), not retained directory
-      metadata. A queued, paused, dependency-blocked, or terminal card may keep a worktree path for
-      reuse/cleanup without consuming admission capacity. Every newly admitted planner becomes live
-      and spends one slot below, even when it reuses an existing directory.
+      FNXC:CapacityModel 2026-09-01-14:49:
+      Planning consumes provider capacity but no execution checkout. Its admission budget therefore
+      uses only maxConcurrent; consulting maxWorktrees here would recreate the coupled FN-282 limit.
       */
-      const maxWorktrees = resolveWorktreeCapacityLimit(settings);
-      const activeTaskLimit = resolveActiveTaskCapacityLimit(settings);
-      const worktreeRoom = maxWorktrees === null
-        ? Number.POSITIVE_INFINITY
-        : Math.max(0, maxWorktrees - claimed);
-      const maxToStart = Math.min(projectRoom, worktreeRoom);
+      const projectRoom = Math.max(0, maxConcurrent - claimed);
+      const activeTaskLimit = resolveAgentCapacityLimit(settings);
 
-      if (maxToStart <= 0 && triageTasks.length > 0) {
+      if (projectRoom <= 0 && triageTasks.length > 0) {
         const processingIds = [...this.processing].slice(0, 5);
         const eligibleIds = triageTasks.slice(0, 5).map((t) => t.id);
         /*
@@ -2287,11 +2465,10 @@ export class TriageProcessor {
         queued?", and a named reason answers it even when there is only one — while
         a payload with no reason field at all would read as "unknown".
         */
-        const blockedBy = worktreeRoom <= 0 && projectRoom > 0 ? "worktree cap" : "running-agent cap";
+        const blockedBy = "running-agent cap";
         const capacityReason = formatAdmissionCapacityQueuedReason({
-          maxConcurrent,
-          maxWorktrees: settings.maxWorktrees,
-          worktreeLimitEnabled: settings.worktreeLimitEnabled,
+          gate: "maxConcurrent",
+          limit: maxConcurrent,
           claimed,
           holderTaskIds: await persistedTopLevelAgentTaskIdsFromStore(this.store, allTasks),
         });
@@ -2410,17 +2587,10 @@ export class TriageProcessor {
       // Keep handoff reservations visible even when a test/runtime wrapper delays
       // the planner's synchronous processing claim until after this poll returns.
       const admittedThisPoll = new Set<string>();
-      /*
-      FNXC:WorktreeCapacity 2026-08-01-04:38:
-      Each admitted planner becomes an active task and therefore spends one worktree-capacity slot.
-      Whether its directory is newly created or retained is deliberately irrelevant.
-      */
       let agentBudget = projectRoom;
-      let worktreeBudget = worktreeRoom;
       for (let i = 0; i < triageTasks.length; i++) {
-        if (agentBudget <= 0 || worktreeBudget <= 0) break;
+        if (agentBudget <= 0) break;
         agentBudget -= 1;
-        worktreeBudget -= 1;
         let freshClaimSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
         const getFreshClaimSnapshot = () => freshClaimSnapshot ??= (async () => {
           // Full rows are required here: a pending optional workflow-step lease can be the task's
@@ -2447,6 +2617,7 @@ export class TriageProcessor {
               taskId: task.id,
               projectId: this.rootDir,
               lane: "planning",
+              consumesWorktree: false,
               createdAt: task.createdAt,
               // FNXC:ConcurrencyAdmission 2026-08-05-10:00: the planner must
               // own the coordinator's real host reservation before it starts;
@@ -2455,7 +2626,7 @@ export class TriageProcessor {
               start: async () => {
                 admittedThisPoll.add(task.id);
                 this.coordinatorAdmittedTaskIds.add(task.id);
-                void this.specifyTask(task);
+                this.startAdmittedPlanning(task);
               },
             })),
         });
@@ -2620,6 +2791,12 @@ export class TriageProcessor {
   }
 
   async specifyTask(task: Task): Promise<void> {
+    if (isFastExecutionMode(task)) {
+      await this.recordFastLanePlanningSkip(task);
+      if (dropPreHeldExecutorSlot(task.id)) this.options.semaphore?.release();
+      this.coordinatorAdmittedTaskIds.delete(task.id);
+      return;
+    }
     if (this.resetFence.isResetHoldActive(task.id)) {
       if (dropPreHeldExecutorSlot(task.id)) this.options.semaphore?.release();
       return;
@@ -2658,18 +2835,14 @@ export class TriageProcessor {
     this.processing.add(task.id);
     this.processingSince.set(task.id, Date.now());
 
-    /*
-    FNXC:NodeWorktreeIsolation 2026-07-26-09:10:
-    Holds the worktree path this planning run published to `activeSessionRegistry`, so the outer
-    `finally` can release exactly what it registered (and nothing when planning ran in the shared
-    checkout). Declared at method scope because registration happens deep inside the try.
-    */
-    let registeredPlanningPath: string | null = null;
     let workflowCapacityAttemptId: string | undefined;
     let workflowCapacityProjectId: string | undefined;
     let planningWorkItemId: string | undefined;
+    let planningWorkItemLeaseOwner: string | undefined;
+    let planningWorkItemLeaseRenewal: ReturnType<typeof setInterval> | undefined;
     let planningAuthority: { workItemId: string; nodeInstanceId: string; principalAgentId: string; kind: "task-assignee" | "review-node-override"; isLive: () => Promise<boolean> } | undefined;
     let planningSessionCompleted = false;
+    let planningStateClaimAcquired = false;
 
     /*
     FNXC:DuplicateIntake 2026-07-26-10:40:
@@ -2704,10 +2877,7 @@ export class TriageProcessor {
       still carrying this status (until U9 adoption) simply re-plans through the
       normal path below; the graph re-runs Plan Review under a CAS lease.
       */
-      const isFast = task.executionMode === "fast";
-      // FN-6236: this is the only legacy executionMode="fast" bridge. Downstream
-      // triage policy reads resolved workflow flags instead of the raw string.
-      const leanPlanning = settings.leanPlanning === true || isFast;
+      const leanPlanning = settings.leanPlanning === true;
 
       const agentWork = async () => {
         // Set status only after the semaphore slot has been acquired, so
@@ -2723,7 +2893,8 @@ export class TriageProcessor {
         */
         let planningClaimed = false;
         try {
-          planningClaimed = await this.updatePlanningStateIfStillCurrent(task, { status: "planning" });
+          planningClaimed = await this.claimPlanningStateUnlessDispatchClaimed(task);
+          planningStateClaimAcquired ||= planningClaimed;
         } finally {
           releasePreHeldAdmissionReservation(task.id);
         }
@@ -2811,10 +2982,11 @@ export class TriageProcessor {
             constraint — so an active continuation left at another node (a stranded resume, or
             a hold from a prior run) makes this write RAISE instead of upserting. In the
             executor that raise deadlocked the board; here it fails planning with
-            `workflow-principal-fence-unavailable:triage`. Replace retires the predecessor and
-            installs this row in one locked transaction, so planning takes the slot over.
+            `workflow-principal-fence-unavailable:triage`. Replace retires an ordinary predecessor
+            and installs this row in one locked transaction; the shared installer below separately
+            refuses a durable dispatch claim, so planning never takes an executing slot over.
             */
-            await this.writePlanningContinuation({
+            const heldItem = await this.installPlanningContinuationUnlessDispatchClaimed({
               runId: triageRunContext.runId,
               taskId: task.id,
               nodeId: planningNode.id,
@@ -2828,6 +3000,7 @@ export class TriageProcessor {
               workflowRole: routed.role,
               authorityKind: currentTask.assignedAgentId ? "task-assignee" : null,
             });
+            if (!heldItem) return;
             await this.store.logEntry(task.id, `Planning held: workflow-principal-${routed.reason}:${routed.role}`);
             await this.updatePlanningStateIfStillCurrent(task, { status: "needs-replan" });
             return;
@@ -2861,20 +3034,56 @@ export class TriageProcessor {
               // FNXC:WorkflowAgentRouting 2026-08-07-23:50: same atomic-replace contract as the
               // held write above — a predecessor continuation at another node must be retired,
               // not collided with.
-              const item = await this.writePlanningContinuation({
+              const planningLeaseOwner = `triage:${task.id}:${triageRunContext.runId}`;
+              /*
+              FNXC:PlanningContinuationLease 2026-09-06-00:29:
+              `listDueWorkflowWorkItems` selects NULL or expired leases. A future durable expiry removes
+              a live planner's row from recovery even in another process, while the in-memory liveness
+              probe protects only this process. Renewal below half-life keeps long plans honest; after a
+              crash the timer disappears and natural expiry restores the existing bounded recovery.
+
+              FNXC:PlanningContinuationLease 2026-09-06-01:28:
+              The lease owner identifies this planning attempt, not merely the task. Both renewal and
+              finalization compare it atomically because a reclaimed row can be `running` again under a
+              successor; a state-only CAS would let the old timer seize and later complete that new run.
+              */
+              /*
+              FNXC:PlanningContinuationDispatch 2026-09-06-01:28:
+              Planner ownership installation shares the planning lifecycle lock with the drain's
+              last-moment continuation check. This serializes the only window where an admitted graph
+              run and a newly starting planner could each believe it owns the next lifecycle action.
+              Minimal legacy test stores retain the prior direct-write fallback.
+
+              FNXC:PlanningContinuationDispatch 2026-09-06-01:58:
+              Lock ordering alone does not survive release. The shared installer now inspects the
+              durable dispatch claim while holding that lock and declines planning when graph dispatch
+              won first, so a late planner cannot replace the active continuation after launch.
+              */
+              const item = await this.installPlanningContinuationUnlessDispatchClaimed({
                 runId: triageRunContext.runId,
                 taskId: task.id,
                 nodeId: planningNode.id,
                 nodeInstanceId: planningNode.id,
-                kind: "task",
-                state: "running",
-                leaseOwner: `triage:${task.id}`,
-                leaseExpiresAt: null,
-                principalAgentId: assignedAgent.id,
+                kind: "task" as const,
+                state: "running" as const,
+                leaseOwner: planningLeaseOwner,
+                leaseExpiresAt: new Date(Date.now() + PLANNING_CONTINUATION_LEASE_MS).toISOString(),
+                principalAgentId: routed.route.agent.id,
                 workflowRole: routed.route.role,
                 authorityKind: routed.route.authority,
               });
+              if (!item) return;
               planningWorkItemId = item.id;
+              planningWorkItemLeaseOwner = planningLeaseOwner;
+              planningWorkItemLeaseRenewal = setInterval(() => {
+                void this.store.transitionWorkflowWorkItem(item.id, "running", {
+                  expectedState: "running",
+                  expectedLeaseOwner: planningLeaseOwner,
+                  leaseOwner: planningLeaseOwner,
+                  leaseExpiresAt: new Date(Date.now() + PLANNING_CONTINUATION_LEASE_MS).toISOString(),
+                }).catch(() => undefined);
+              }, PLANNING_CONTINUATION_LEASE_MS / 3);
+              planningWorkItemLeaseRenewal.unref?.();
               if (routed.route.authority === "task-assignee") {
                 const fencedPrincipal = routed.route.agent;
                 /*
@@ -2928,6 +3137,12 @@ export class TriageProcessor {
             triageRunContext,
             () => !this.resetFence.isStale(task.id, planningGeneration),
           ),
+          createInstallWorktreeDependenciesTool(this.store, task.id, {
+            rootDir: this.rootDir,
+            runConfiguredCommand,
+            getSettings: async () => this.store.getSettings(),
+            runContext: triageRunContext,
+          }),
           createWorkflowListTool(this.store),
           createWorkflowSelectTool(this.store, task.id),
           ...(isResearchToolSurfaceEnabled(settings)
@@ -3069,30 +3284,6 @@ export class TriageProcessor {
         // this a no-op there while still guaranteeing no dangling token leaks.
         const renderedBasePrompt = renderTriagePolicyPlaceholders(resolvedBasePrompt, triagePolicySettings);
         const duplicatePolicyInstruction = buildPlanningDuplicatePolicyInstruction();
-        /*
-        FNXC:RepositoryScope 2026-08-21-00:12:
-        Workspace plan persistence rejects a missing Repository Scope, so every planner that sees
-        repository intent must be explicitly instructed to emit the confirmed heading rather than
-        repeatedly producing a plan the authoritative writer cannot publish.
-        */
-        const triageLayers = buildPromptLayers({
-          basePrompt: renderedBasePrompt,
-          goalContext: triageGoalResolution.goalContext,
-          agentInstructions: [
-            triageIdentitySection,
-            duplicatePolicyInstruction,
-            task.repositoryScope
-              ? `## Workspace repository intent\nThis is a multi-repository workspace task. Your final PROMPT.md MUST include a non-empty \`## Repository Scope\` heading with a markdown bullet list of configured repository names. Confirm only repositories the task concerns; do not infer intent from acquired checkouts. File Scope entries must be qualified as \`repository/path\` when more than one repository is in scope.`
-              : "",
-            triageInstructions,
-            isResearchToolSurfaceEnabled(settings)
-              ? getResearchGuidanceForSurface("triage")
-              : "",
-          ].filter((section) => section.trim()).join("\n\n"),
-          pluginContributions: triagePluginContributions,
-        });
-
-        const triageSystemPromptFinal = collapsePromptLayers(triageLayers);
 
         // Build skill selection context (assigned agent skills take precedence over role fallback)
         const skillContext = await buildSessionSkillContext({
@@ -3148,75 +3339,42 @@ export class TriageProcessor {
           : { provider: undefined, modelId: undefined };
 
         /*
-        FNXC:TriagePromptPersistence 2026-07-21-17:50:
-        Planning must use the coding tool surface. The shared readonly policy filters
-        mutation tools, including fn_task_prompt_write, before the model sees them;
-        advertising that writer in the prompt while running readonly stranded triage
-        on the original PROMPT.md stub and sent the stub into Plan Review.
+        FNXC:TriagePromptPersistence 2026-09-01-14:49:
+        Planning reads the dependency-installed main checkout while a declared read-only boundary
+        refuses shell and verification commands and permits generic writes only under .fusion/.
+        This is stronger concurrent-planner isolation than private writable worktrees because sessions
+        that cannot modify source files cannot collide; plans publish through Fusion's durable writers.
         */
-        /*
-        FNXC:NodeWorktreeIsolation 2026-07-25-22:10:
-        Planning runs in the TASK's own worktree, not the shared main checkout. This session carries the
-        coding tool surface (see FNXC:TriagePromptPersistence above), so rooting it at `this.rootDir`
-        put write tools in the operator's tree and made every concurrent planner share one path — the
-        same shared-path shape behind the reported Plan Review session collision. The worktree acquired
-        here is the one Plan Review and the implementation session then reuse.
-        */
-        let planningCwd = (await this.options.acquirePlanningWorktree?.(task.id).catch(() => null)) || this.rootDir;
-        const workspacePlanningConfig = planningCwd === this.rootDir
-          ? await loadWorkspaceConfig(this.rootDir).catch(() => null)
-          : null;
-        const planningSessionBoundary = workspacePlanningConfig?.repos.length
-          ? { kind: "read-only-root" as const, writableRoot: null, projectRoot: this.rootDir, readOnlyRoots: [this.rootDir] }
-          : planningCwd === this.rootDir
-            ? undefined
-            : { kind: "task-worktree" as const, writableRoot: planningCwd, projectRoot: this.rootDir };
-        if (planningCwd !== this.rootDir) {
-          /*
-          FNXC:NodeWorktreeIsolation 2026-07-26-09:10:
-          Publish the planner's worktree as a live session for as long as this planning run owns it.
-          Registration is what makes `activeSessionRegistry.isPathActive()` true, which is the single
-          guard every worktree-removal path consults. Without it the self-healing reclaim sweep tore
-          the worktree out from under a running planner and paused the task
-          `branch-conflict-unrecoverable` (FN-8600). Registered ONLY for a real task worktree — the
-          shared `rootDir` fallback is the operator's checkout and must never be marked task-owned.
-          The reciprocal unregister lives in this method's outer `finally`, so an early throw between
-          here and there cannot leak a permanent entry that blocks later legitimate cleanup.
-          */
-          /*
-          FNXC:NodeWorktreeIsolation 2026-07-26-10:25:
-          Acquire through the reclaim-aware seam, not raw `registerPath`. `acquireActiveSessionPath`
-          is what lets a leaked entry from a crashed/dead holder be reclaimed instead of hard-failing
-          a legitimate new registration; raw `registerPath` throws on any foreign-held path, so one
-          stale record would wedge planning for that worktree until the engine restarted. The
-          executor already registers exclusively through this seam
-          (`TaskExecutor.acquireSessionRegistryPath`) — planning must not be the one holder that
-          bypasses it. `contended` means a genuinely live foreign holder, so planning falls back to
-          the shared checkout rather than running in a worktree someone else owns.
-          */
-          if (this.resetFence.isStale(task.id, planningGeneration)) return;
-          const acquired = acquireActiveSessionPath(activeSessionRegistry, planningCwd, {
-            taskId: task.id,
-            kind: "planning",
-            ownerKey: `planning:${task.id}`,
-          }, {
-            holderLiveProbe: (holderTaskId) => this.processing.has(holderTaskId) || this.hasLivePlanningWork(holderTaskId),
-          });
-          if (acquired.action === "contended") {
-            planLog.warn(
-              `${task.id}: planning worktree ${planningCwd} is held by live task ${acquired.holderTaskId} (${acquired.holderKind}) — planning in the shared checkout instead`,
-            );
-            planningCwd = this.rootDir;
-          } else {
-            if (acquired.action === "reclaimed-stale-foreign") {
-              planLog.warn(
-                `${task.id}: reclaimed a stale active-session entry on ${planningCwd} from dead task ${acquired.holderTaskId} (idle ${acquired.ageMs}ms)`,
-              );
-            }
-            registeredPlanningPath = planningCwd;
-          }
-          await this.store.logEntry(task.id, `Planning session running in task worktree ${planningCwd}`).catch(() => undefined);
-        }
+        const planningCwd = this.rootDir;
+        const planningSessionBoundary = {
+          kind: "read-only-root" as const,
+          writableRoot: null,
+          projectRoot: this.rootDir,
+          writableAllowlist: [join(this.rootDir, ".fusion")],
+        };
+
+        const planningDependencyInstruction = await resolvePlanningDependencyInstruction({
+          task: await this.store.getTask(task.id),
+          rootDir: this.rootDir,
+          planningCwd,
+          settings,
+        });
+        const triageLayers = buildPromptLayers({
+          basePrompt: renderedBasePrompt,
+          goalContext: triageGoalResolution.goalContext,
+          agentInstructions: [
+            triageIdentitySection,
+            duplicatePolicyInstruction,
+            planningDependencyInstruction,
+            triageInstructions,
+            isResearchToolSurfaceEnabled(settings)
+              ? getResearchGuidanceForSurface("triage")
+              : "",
+          ].filter((section) => section.trim()).join("\n\n"),
+          pluginContributions: triagePluginContributions,
+        });
+        const triageSystemPromptFinal = collapsePromptLayers(triageLayers);
+
         /*
         FNXC:TriagePlanningRetry 2026-08-03-00:02:
         Plan Review may only receive evidence from a clean planner attempt. Capture the root
@@ -3442,6 +3600,12 @@ export class TriageProcessor {
           const [planDocument, originalDescriptionDocument] = typeof getTaskDocument === "function"
             ? await Promise.all([getTaskDocument.call(this.store, task.id, "plan"), getTaskDocument.call(this.store, task.id, "original-description")])
             : [null, null];
+          const environmentCapabilities = await probeEnvironmentCapabilities({
+            extraCommands: [
+              ...extractCommandBinaries(settings?.testCommand),
+              ...extractCommandBinaries(settings?.buildCommand),
+            ],
+          }).catch((): EnvironmentCapabilityProbe => ({ capabilities: [], degraded: true }));
           const agentPrompt = buildSpecificationPrompt(
             detail,
             promptPath,
@@ -3453,6 +3617,7 @@ export class TriageProcessor {
               plan: typeof planDocument?.content === "string" ? planDocument.content : undefined,
               originalDescription: typeof originalDescriptionDocument?.content === "string" ? originalDescriptionDocument.content : undefined,
               planReviewFeedbackHistory,
+              environmentCapabilities,
             },
             assignedAgent,
           );
@@ -3687,7 +3852,7 @@ export class TriageProcessor {
               planLog.warn(`${task.id} ${retryMessage}`);
               await this.store.logEntry(task.id, retryMessage);
               await this.updatePlanningStateIfStillCurrent(task, {
-                status: this.restoreStatusAfterInterruptedTriageWork(task),
+                status: await this.resolvePlanningRetryHoldStatus(task, written),
                 error: null,
                 recoveryRetryCount: decision.nextState.recoveryRetryCount,
                 nextRecoveryAt: decision.nextState.nextRecoveryAt,
@@ -3698,17 +3863,13 @@ export class TriageProcessor {
             const failureMessage = `${failure} after ${MAX_RECOVERY_RETRIES} retries. Retry after adjusting the task prompt or model.`;
             planLog.error(`${task.id} clean planning attempt retry budget exhausted`);
             await this.store.logEntry(task.id, failureMessage);
-            if (await this.updatePlanningStateIfStillCurrent(task, (live) => {
-              const customFields = { ...(live.customFields ?? {}) };
-              delete customFields[PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY];
-              return {
-                status: "failed",
-                error: failureMessage,
-                recoveryRetryCount: null,
-                nextRecoveryAt: null,
-                customFields,
-              };
-            })) {
+            if (await this.updatePlanningStateIfStillCurrent(task, () => ({
+              status: "failed",
+              error: failureMessage,
+              recoveryRetryCount: null,
+              nextRecoveryAt: null,
+              planningFailure: null,
+            }))) {
               await this.backfillBlankTitleAfterTerminalTriageFailure(task);
             }
             return;
@@ -3728,9 +3889,13 @@ export class TriageProcessor {
                 `Generated plan failed deterministic validation (${deterministicSpecFailure}) — retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}.`;
               planLog.warn(`${task.id} ${retryMessage}`);
               await this.store.logEntry(task.id, retryMessage);
-              const restoreStatus = this.restoreStatusAfterInterruptedTriageWork(task);
+              await this.store.logEntry(
+                task.id,
+                "AI spec revision requested",
+                `Deterministic plan validation rejected the generated plan: ${deterministicSpecFailure}`,
+              ).catch(() => undefined);
               await this.updatePlanningStateIfStillCurrent(task, {
-                status: restoreStatus,
+                status: await this.resolvePlanningRetryHoldStatus(task, written),
                 error: null,
                 recoveryRetryCount: decision.nextState.recoveryRetryCount,
                 nextRecoveryAt: decision.nextState.nextRecoveryAt,
@@ -3831,6 +3996,20 @@ export class TriageProcessor {
       }
     } catch (err: unknown) {
       const { message: errorMessage, detail: errorDetail, stack: errorStack } = formatError(err);
+      /*
+      FNXC:PlanningContinuationDispatch 2026-09-06-02:28:
+      Recovery writes belong only to a planner that acquired the durable task-status claim. If the
+      dispatch-claim read fails first, triage must fail closed and leave the dispatcher's running row
+      and task state untouched; otherwise this losing attempt can mask the active graph with a retry
+      or failed planning status. Keep this ownership proof outside `agentWork` so every outer catch
+      branch is fenced, including transport and previously unclassified errors.
+      */
+      if (!planningStateClaimAcquired) {
+        planLog.warn(
+          `${task.id}: planning setup failed before status ownership was acquired; leaving task state unchanged: ${errorMessage}`,
+        );
+        return;
+      }
       // Race condition: task was deleted (e.g. as a duplicate) between listTasks()
       // and specifyTask(). The file is gone, so just log and skip — no point retrying.
       if ((err as Record<string, unknown>).code === "ENOENT") {
@@ -3917,6 +4096,62 @@ export class TriageProcessor {
           await this.backfillBlankTitleAfterTerminalTriageFailure(task);
           this.options.onSpecifyError?.(task, err instanceof Error ? err : new Error(errorMessage));
           return;
+        } else if (isUnavailablePlanLockError(err)) {
+          /*
+          FNXC:SpecLock 2026-09-07-05:09:
+          Parser failures are deterministic for a given source hash. Retrying that identical prompt
+          burns the planning budget without changing its structural verdict; retain the hash so a
+          changed prompt gets one ordinary recovery attempt while the repeat parks immediately.
+          */
+          const prior = getPlanningSpecLockUnavailableFailure(task);
+          const sections = err.unavailableSections.join(", ") || "unknown section";
+          const failureMessage = `PLANNING_FAILED_SPEC_LOCK_UNAVAILABLE: ${err.reason} (${sections})`;
+          if (prior?.sourceHash === err.sourceHash) {
+            await this.store.logEntry(task.id, `${failureMessage}; identical prompt parse verdict repeated. Operator description headings are not the cause.`).catch(() => undefined);
+            const persisted = await this.updatePlanningStateIfStillCurrent(task, () => ({
+              status: "failed", error: failureMessage, recoveryRetryCount: null, nextRecoveryAt: null, planningFailure: null,
+            })).catch(async (writeError: unknown) => {
+              await this.parkPlanningRecoveryWriteFailure(task, failureMessage, writeError);
+              return false;
+            });
+            if (!persisted) return;
+            await this.backfillBlankTitleAfterTerminalTriageFailure(task);
+            return;
+          }
+          const decision = computeRecoveryDecision({ recoveryRetryCount: task.recoveryRetryCount, nextRecoveryAt: task.nextRecoveryAt });
+          const retryMessage = `${failureMessage}; recording deterministic parser evidence and retrying once for changed prompt text. Operator description headings are not the cause.`;
+          await this.store.logEntry(task.id, retryMessage).catch(() => undefined);
+          if (decision.shouldRetry) {
+            const retryHoldStatus = await this.resolvePlanningRetryHoldStatus(task);
+            await this.updatePlanningStateIfStillCurrent(task, (live) => ({
+              planningFailure: {
+                ...(live.planningFailure ?? {}),
+                specLockUnavailable: {
+                  sourceHash: err.sourceHash,
+                  reason: err.reason,
+                  sections: err.unavailableSections,
+                  at: new Date().toISOString(),
+                  attempt: decision.nextState.recoveryRetryCount ?? null,
+                },
+              },
+              status: retryHoldStatus,
+              error: null,
+              recoveryRetryCount: decision.nextState.recoveryRetryCount,
+              nextRecoveryAt: decision.nextState.nextRecoveryAt,
+            })).catch(async (writeError: unknown) => {
+              await this.parkPlanningRecoveryWriteFailure(task, failureMessage, writeError);
+            });
+            return;
+          }
+          const persisted = await this.updatePlanningStateIfStillCurrent(task, () => ({
+            status: "failed", error: failureMessage, recoveryRetryCount: null, nextRecoveryAt: null, planningFailure: null,
+          })).catch(async (writeError: unknown) => {
+            await this.parkPlanningRecoveryWriteFailure(task, failureMessage, writeError);
+            return false;
+          });
+          if (!persisted) return;
+          await this.backfillBlankTitleAfterTerminalTriageFailure(task);
+          return;
         } else if (isPlanningLifecycleLockTransportError(err)) {
           /*
           FNXC:PlanningDependencyReseed 2026-08-09-21:53:
@@ -3930,12 +4165,12 @@ export class TriageProcessor {
             nextRecoveryAt: task.nextRecoveryAt,
           });
           const persistMarker = (live: Task) => ({
-            customFields: {
-              ...(live.customFields ?? {}),
-              [PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY]: {
+            planningFailure: {
+              ...(live.planningFailure ?? {}),
+              lifecycleLockTransport: {
                 message: errorMessage,
                 at: new Date().toISOString(),
-                attempt: decision.nextState.recoveryRetryCount,
+                attempt: decision.nextState.recoveryRetryCount ?? null,
               },
             },
           });
@@ -3943,21 +4178,26 @@ export class TriageProcessor {
             const retryMessage = `${failureMessage} — retry ${decision.nextState.recoveryRetryCount}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}.`;
             planLog.warn(`${task.id} ${retryMessage}`);
             await this.store.logEntry(task.id, retryMessage).catch(() => undefined);
+            const retryHoldStatus = await this.resolvePlanningRetryHoldStatus(task);
             await this.updatePlanningStateIfStillCurrent(task, (live) => ({
               ...persistMarker(live),
-              status: this.restoreStatusAfterInterruptedTriageWork(task),
+              status: retryHoldStatus,
               error: null,
               recoveryRetryCount: decision.nextState.recoveryRetryCount,
               nextRecoveryAt: decision.nextState.nextRecoveryAt,
-            }));
+            })).catch(async (writeError: unknown) => {
+              await this.parkPlanningRecoveryWriteFailure(task, failureMessage, writeError);
+            });
             return;
           }
           await this.store.logEntry(task.id, failureMessage).catch(() => undefined);
-          await this.updatePlanningStateIfStillCurrent(task, (live) => {
-            const customFields = { ...(live.customFields ?? {}) };
-            delete customFields[PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY];
-            return { status: "failed", error: failureMessage, recoveryRetryCount: null, nextRecoveryAt: null, customFields };
+          const persisted = await this.updatePlanningStateIfStillCurrent(task, () => ({
+            status: "failed", error: failureMessage, recoveryRetryCount: null, nextRecoveryAt: null, planningFailure: null,
+          })).catch(async (writeError: unknown) => {
+            await this.parkPlanningRecoveryWriteFailure(task, failureMessage, writeError);
+            return false;
           });
+          if (!persisted) return;
           await this.backfillBlankTitleAfterTerminalTriageFailure(task);
           return;
         } else if (isTransientError(errorMessage)) {
@@ -3978,7 +4218,7 @@ export class TriageProcessor {
                 planLog.warn(`${task.id}: failed to log transient-error retry entry: ${msg}`);
               });
             }
-            const restoreStatus = this.restoreStatusAfterInterruptedTriageWork(task);
+            const restoreStatus = await this.resolvePlanningRetryHoldStatus(task);
             await this.updatePlanningStateIfStillCurrent(task, {
               status: restoreStatus,
               recoveryRetryCount: decision.nextState.recoveryRetryCount,
@@ -4057,7 +4297,7 @@ export class TriageProcessor {
           });
           // For interrupted recovery states, restore the original triage-held status;
           // otherwise clear to null so the next poll can re-pick ordinary tasks up.
-          const restoreStatus = this.restoreStatusAfterInterruptedTriageWork(task);
+          const restoreStatus = await this.resolvePlanningRetryHoldStatus(task);
           await this.updatePlanningStateIfStillCurrent(task, {
             status: restoreStatus,
             recoveryRetryCount: genericDecision.nextState.recoveryRetryCount,
@@ -4100,34 +4340,11 @@ export class TriageProcessor {
       // early setup failure must return that untransferred host slot; after a
       // successful transfer this is intentionally a no-op.
       if (dropPreHeldExecutorSlot(task.id)) this.options.semaphore?.release();
-      /*
-      FNXC:NodeWorktreeIsolation 2026-07-26-09:10:
-      Release the planner's registry entry on EVERY exit path (success, planning failure, abort,
-      pause). A leaked entry is not merely untidy: `isPathActive` would stay true forever and
-      permanently veto legitimate reclaim/cleanup of that worktree, converting this fix into the
-      opposite stall. Unregister is keyed on what we registered, so it is a no-op for planning runs
-      that used the shared checkout.
-      */
-      if (registeredPlanningPath) {
-        /*
-        FNXC:NodeWorktreeIsolation 2026-07-26-10:20:
-        Release ONLY if this planning run still owns the record. A bare path delete would reintroduce
-        this fix's own symptom on the execution side: `finalizeApprovedTask` moves the card to `todo`
-        while still inside the try, and several awaited writes (log flush, token-usage record,
-        getTask/updateTask, dispose) run before this finally. The scheduler can dispatch in that
-        window and the executor registers the SAME worktree path — `registerPath` permits a same-task
-        overwrite, so the record becomes `kind:"executor"`. Deleting by path alone would then clear a
-        LIVE executor entry, making `isPathActive` false and handing the reclaim sweep the same
-        worktree it tore out from under a planner in FN-8600.
-        */
-        const record = activeSessionRegistry.lookupByPath(registeredPlanningPath);
-        if (record?.ownerKey === `planning:${task.id}`) {
-          activeSessionRegistry.unregisterPath(registeredPlanningPath);
-        }
-        registeredPlanningPath = null;
-      }
-      if (planningWorkItemId) {
+      if (planningWorkItemLeaseRenewal) clearInterval(planningWorkItemLeaseRenewal);
+      if (planningWorkItemId && planningWorkItemLeaseOwner) {
         await this.store.transitionWorkflowWorkItem(planningWorkItemId, planningSessionCompleted ? "succeeded" : "failed", {
+          expectedState: "running",
+          expectedLeaseOwner: planningWorkItemLeaseOwner,
           leaseOwner: null,
           leaseExpiresAt: null,
           lastError: planningSessionCompleted ? null : "planning-session-ended-before-completion",
@@ -4152,8 +4369,7 @@ export class TriageProcessor {
     const taskSearchParams = Type.Object({
       query: Type.String({ minLength: 1, description: "Search query" }),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50, description: "Max results (default 20, max 50)" })),
-      includeDone: Type.Optional(Type.Boolean({ description: "Include done tasks (default true)" })),
-      includeArchived: Type.Optional(Type.Boolean({ description: "Include archived tasks (default true)" })),
+      includeDone: Type.Optional(Type.Boolean({ description: "Include done tasks (default false)" })),
     });
     const taskCreateParams = Type.Object({
       title: Type.Optional(Type.String({ description: "Short child task title" })),
@@ -4228,7 +4444,7 @@ export class TriageProcessor {
       label: "Search Tasks",
       description:
         "Keyword search across active tasks by default. " +
-        "Done and archived history is opt-in and must not be used for duplicate detection.",
+        "Done history is opt-in and must not be used for duplicate detection.",
       parameters: taskSearchParams,
       execute: async (
         _callId: string,
@@ -4243,7 +4459,7 @@ export class TriageProcessor {
         }
         const results = await store.searchTasks(query, {
           slim: true,
-          includeArchived: params.includeArchived ?? false,
+          includeArchived: false,
           limit: params.limit ?? 20,
         });
         const includeDone = params.includeDone ?? false;
@@ -4345,11 +4561,51 @@ export class TriageProcessor {
     return [taskList, taskSearch, taskShow, taskCreate];
   }
 
-  /**
-   * Atomically preserve a task that advanced while this triage session awaited a
-   * provider response. `updateTaskAtomic` holds the task lock across the live-row
-   * predicate and patch, closing the scheduler-transition race.
-   */
+  /*
+  FNXC:PlanningContinuationDispatch 2026-09-06-01:58:
+  Both running planner rows and principal-routing holds pass through one admission boundary. Under
+  the planning lifecycle lock, a durable dispatch claim wins over triage and is never replaced;
+  without that point-of-use check, dispatch-first ordering could still launch the graph and then let
+  a planner retire its claim. Minimal stores without the lock retain their compatibility behavior.
+
+  FNXC:PlanningContinuationDispatch 2026-09-06-02:12:
+  Triage must inspect that same durable claim before publishing `status:"planning"`, not only before
+  installing its continuation later. A dispatch-first loser otherwise returns without a planning
+  work item, so no cleanup owns the status it already wrote and the active graph is hidden behind a
+  stale planning badge. Keep the inspection and status mutation inside one lifecycle-lock turn so a
+  dispatch claim and a planner claim cannot both publish.
+  */
+  private async hasPlanningContinuationDispatchClaim(taskId: string): Promise<boolean> {
+    const listItems = (this.store as Partial<TaskStore>).listWorkflowWorkItemsForTask;
+    if (typeof listItems !== "function") return false;
+    const items = await this.store.listWorkflowWorkItemsForTask(taskId, { kinds: ["task"] });
+    return items.some(isPlanningContinuationDispatchClaim);
+  }
+
+  private async claimPlanningStateUnlessDispatchClaimed(task: Task): Promise<boolean> {
+    const inspectAndClaim = async (): Promise<boolean> => {
+      if (await this.hasPlanningContinuationDispatchClaim(task.id)) return false;
+      return await this.updatePlanningStateIfStillCurrent(task, { status: "planning" });
+    };
+    const lifecycleLock = (this.store as Partial<TaskStore>).withPlanningLifecycleLock;
+    return typeof lifecycleLock === "function"
+      ? await this.store.withPlanningLifecycleLock(task.id, inspectAndClaim)
+      : await inspectAndClaim();
+  }
+
+  private async installPlanningContinuationUnlessDispatchClaimed(
+    input: Parameters<NonNullable<TaskStore["upsertWorkflowWorkItem"]>>[0] & { kind: "task" },
+  ): Promise<WorkflowWorkItem | null> {
+    const inspectAndInstall = async (): Promise<WorkflowWorkItem | null> => {
+      if (await this.hasPlanningContinuationDispatchClaim(input.taskId)) return null;
+      return await this.writePlanningContinuation(input);
+    };
+    const lifecycleLock = (this.store as Partial<TaskStore>).withPlanningLifecycleLock;
+    return typeof lifecycleLock === "function"
+      ? await this.store.withPlanningLifecycleLock(input.taskId, inspectAndInstall)
+      : await this.writePlanningContinuation(input);
+  }
+
   /**
    * FNXC:WorkflowAgentRouting 2026-08-07-23:50:
    * Persist a planning continuation through the atomic replace primitive.
@@ -4374,6 +4630,28 @@ export class TriageProcessor {
     return await this.store.upsertWorkflowWorkItem(input);
   }
 
+  /**
+   * A recovery write must not leave a card presenting as actively planning. The first write can
+   * fail for an unrelated store reason; preserve the original planning failure when parking it.
+   */
+  private async parkPlanningRecoveryWriteFailure(task: Task, failureMessage: string, writeError: unknown): Promise<void> {
+    const detail = writeError instanceof Error ? writeError.message : String(writeError);
+    planLog.warn(`${task.id}: planning recovery write failed: ${detail}`);
+    await this.updatePlanningStateIfStillCurrent(task, {
+      status: "failed",
+      error: failureMessage,
+      recoveryRetryCount: null,
+      nextRecoveryAt: null,
+    }).catch((secondaryError: unknown) => {
+      planLog.warn(`${task.id}: failed to park planning recovery write failure: ${secondaryError instanceof Error ? secondaryError.message : String(secondaryError)}`);
+    });
+  }
+
+  /**
+   * Atomically preserve a task that advanced while this triage session awaited a
+   * provider response. `updateTaskAtomic` holds the task lock across the live-row
+   * predicate and patch, closing the scheduler-transition race.
+   */
   private async updatePlanningStateIfStillCurrent(
     task: Task,
     patch: Parameters<TaskStore["updateTask"]>[1] | ((live: Task) => Parameters<TaskStore["updateTask"]>[1]),
@@ -4458,6 +4736,18 @@ export class TriageProcessor {
     return null;
   }
 
+  /*
+  FNXC:TriagePlanningRetry 2026-09-05-22:06:
+  A retry over a finished-looking PROMPT.md must hold `needs-replan`, matching scheduler validation
+  retries. Clearing status makes the card dispatchable and bypasses finalizeApprovedTask approval.
+  */
+  private async resolvePlanningRetryHoldStatus(task: Task, knownPromptContent?: string): Promise<Task["status"] | null> {
+    const restored = this.restoreStatusAfterInterruptedTriageWork(task);
+    if (restored) return restored;
+    const content = knownPromptContent ?? await this.readNonEmptyPromptDraft(task.id, "planning retry hold");
+    return content && !isTaskAwaitingPlanning(task, content) ? "needs-replan" : null;
+  }
+
   private async validateGeneratedPrompt(taskId: string, promptContent: string): Promise<string | null> {
     /*
     FNXC:PlanReview 2026-06-29-01:52:
@@ -4468,6 +4758,19 @@ export class TriageProcessor {
     */
     if (!promptContent.trim()) {
       return "PROMPT.md file not found or empty";
+    }
+
+    /*
+    FNXC:PlanValidation 2026-09-04-01:47:
+    Heading numbering is engine-provable structure because the number is the execution index, not
+    Plan Review's AI quality judgement. Reject bad sequences before they can misroute step sessions.
+    */
+    const headingNumbers = matchStepHeadings(promptContent).map((match) => match.headingNumber);
+    if (headingNumbers.length > 0 && !headingNumbers.every((heading, index) => heading === index)) {
+      const diagnostic = `Step headings must be contiguous 0-based execution indices (observed: ${headingNumbers.join(", ")}). Renumber from Step 0 and update prose cross-references.`;
+      planLog.warn(`${taskId}: ${diagnostic}`);
+      await this.store.logEntry(taskId, "Generated plan validation failed: invalid step heading numbering");
+      return diagnostic;
     }
 
     const danglingRefs = await detectDanglingTaskDocReferences(promptContent, {
@@ -4784,11 +5087,7 @@ export class TriageProcessor {
      * near-duplicate decision; keep removes the marker before the next real plan.
      */
     if (explicitDuplicateMarker) {
-      await this.updatePlanningStateIfStillCurrent(task, (live) => {
-        const customFields = { ...(live.customFields ?? {}) };
-        delete customFields[PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY];
-        return { customFields };
-      });
+      await this.updatePlanningStateIfStillCurrent(task, () => ({ planningFailure: null }));
       const canonicalId = explicitDuplicateMarker.canonicalId;
       const duplicateSource = duplicateResolution.source ?? "prompt";
       const canonicalTask = await this.store.getTask(canonicalId).catch(() => null);
@@ -4817,7 +5116,7 @@ export class TriageProcessor {
       if (isNearDuplicateCanonicalInactive(canonicalTask ?? undefined, canonicalFlags)) {
         if (canClearInactiveMarker) {
           /*
-          Completed and archived work is historical context, never an accepted duplicate verdict.
+          Completed or deleted work is historical context, never an accepted duplicate verdict.
           Clear the marker and require a fresh plan regardless of how the new task was created.
           */
           await this.clearDuplicateMarkerForReplan(
@@ -4859,10 +5158,6 @@ export class TriageProcessor {
           auditContext: { agentId: task.assignedAgentId ?? "triage", runId: generateSyntheticRunId("triage-delete", task.id), callerKind: "engine" },
         });
         if (!result.deleted) return;
-        await this.store.recordActivity({
-          type: "task:auto-archived-duplicate", taskId: task.id, taskTitle: task.title ?? "",
-          details: `Duplicate of ${canonicalId} — closed`, metadata: { canonicalTaskId: canonicalId, source: "explicit-marker" },
-        });
         return;
       }
       if (resolution === "prompt") {
@@ -4874,7 +5169,7 @@ export class TriageProcessor {
         });
         if (!applied) return;
         await this.store.logEntry(task.id, "Flagged as triage duplicate", `Duplicate marker points to ${canonicalId}; awaiting operator decision`);
-        await this.store.recordActivity({ type: "task:auto-archived-duplicate", taskId: task.id, details: "Flagged (not deleted) as triage-marker duplicate", metadata: { canonicalTaskId: canonicalId, source: "triage-marker-flagged" } });
+        await this.store.recordActivity({ type: "task:near-duplicate-flagged", taskId: task.id, details: "Flagged as triage-marker duplicate", metadata: { canonicalTaskId: canonicalId, source: "triage-marker-flagged" } });
         return;
       }
       // resolution === "keep" (and any other non-prompt/delete policy that drops the marker)
@@ -5081,30 +5376,18 @@ export class TriageProcessor {
           written,
           {
             cwd: this.rootDir,
-            exec: promisify(exec),
+            exec: createGhostBugProbeExec(),
           },
         ),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 15_000)),
       ]);
 
-      if (preflightDecision && preflightDecision.decision === "archive") {
-        await archiveAsGhostBug(this.store, task.id, task.title ?? "", preflightDecision);
-        const auditor = createRunAuditor(this.store, {
-          taskId: task.id,
-          agentId: task.assignedAgentId ?? "triage",
-          runId: generateSyntheticRunId("triage", task.id),
-          phase: "triage",
-          source: "triage",
+      if (preflightDecision && preflightDecision.decision === "delete") {
+        await softDeleteAsGhostBug(this.store, task.id, preflightDecision, {
+          messageStore: this.options.messageStore,
+          taskTitle: task.title ?? undefined,
         });
-        await auditor.database({
-          type: "task:auto-archived-ghost-bug",
-          target: task.id,
-          metadata: {
-            reason: preflightDecision.reason,
-            findings: preflightDecision.findings.slice(0, 10),
-          },
-        });
-        planLog.log(`${task.id} auto-archived as ghost bug`);
+        planLog.log(`${task.id} auto-deleted as ghost bug`);
         return;
       }
     } catch (error: unknown) {
@@ -5262,8 +5545,8 @@ export class TriageProcessor {
     FNXC:PlanApproval 2026-06-26-00:00:
     Project planApprovalMode has precedence over the workflow-resolved requirePlanApproval value so operators can force auto-approval or manual approval for every task in this project.
 
-    FNXC:PlanApproval 2026-07-01-08:12:
-    This is the ordinary manual plan-approval gate only, after release authorization and Workflow Plan Review have already made their independent decisions. Always call resolvePlanApprovalRequired with the merged settings object so project auto-approve-all can override workflow requirePlanApproval without weakening non-plan safety gates.
+    FNXC:PlanApproval 2026-08-28-17:16:
+    This is the ordinary manual plan-approval gate only, after release authorization and Workflow Plan Review have already made their independent decisions. FN-234 removed task-level escalation; always resolve from the merged settings object so project auto-approve-all can override workflow requirePlanApproval without weakening non-plan safety gates.
 
     FNXC:PlanApproval 2026-07-04-12:15:
     FN-7526 re-verified this invariant end to end: every finalizeApprovedTask caller (specifyTask, recoverApprovedTask, retryUnavailablePlanReview, tryFinalizeExplicitDuplicateMarker) already derives `settings` from mergeEffectiveSettings so planApprovalMode (never a MOVED_SETTINGS_KEYS/workflow-owned key) survives any stored workflow requirePlanApproval overlay untouched. No production defect was found; regression tests were added across every surface to lock the invariant so a future bare-settings call site (e.g. `{ requirePlanApproval }` without planApprovalMode) is caught immediately instead of silently reintroducing the reported parking behavior.
@@ -5419,11 +5702,7 @@ export class TriageProcessor {
     in the bookkeeping that follows does not un-hand-off a card that has already moved.
     */
     report.outcome = "released";
-    await this.updatePlanningStateIfStillCurrent(task, (live) => {
-      const customFields = { ...(live.customFields ?? {}) };
-      delete customFields[PLANNING_LIFECYCLE_LOCK_TRANSPORT_FAILURE_KEY];
-      return { customFields };
-    });
+    await this.updatePlanningStateIfStillCurrent(task, () => ({ planningFailure: null }));
 
     /*
     FNXC:TriageStuckKill 2026-07-18-21:05:
@@ -5656,7 +5935,12 @@ export function buildSpecificationPrompt(
   attachmentContents?: AttachmentContent[],
   existingPrompt?: string,
   feedback?: string,
-  planningContext?: { plan?: string; originalDescription?: string; planReviewFeedbackHistory?: string[] },
+  planningContext?: {
+    plan?: string;
+    originalDescription?: string;
+    planReviewFeedbackHistory?: string[];
+    environmentCapabilities?: EnvironmentCapabilityProbe;
+  },
   memoryAgent?: Agent | null,
 ): string {
   const hasFeedback = Boolean(feedback?.trim());
@@ -5678,6 +5962,10 @@ export function buildSpecificationPrompt(
     lines.push("Use these exact commands in testing/verification steps.");
     commandsSection = "\n\n" + lines.join("\n");
   }
+
+  const environmentCapabilitiesSection = planningContext?.environmentCapabilities
+    ? formatEnvironmentCapabilitiesSection(planningContext.environmentCapabilities)
+    : "";
 
   const completionDocumentationMode = settings?.completionDocumentationMode ?? "off";
   let completionDocumentationSection = "";
@@ -5843,5 +6131,5 @@ ${task.dependencies.length > 0 ? `- **Dependencies:** ${task.dependencies.join("
 ## Instructions
 ${isRevision ? "1. Read the existing specification and revision feedback carefully\n2. Apply surgical PROMPT.md edits that fully resolve every blocking feedback item — do not rewrite from title/description alone\n3. Keep structure stable unless feedback requires rethink; preserve uncriticized content\n4. Keep `## Original Description` at the top (after title/metadata) with the operator description **verbatim**\n5. Ensure the revised specification is still detailed enough for an AI agent to execute" : isFreshRespecification ? "1. Read the project structure to understand context (package.json, source files, etc.)\n2. Treat the current task title and description as mandatory primary inputs for a new spec\n3. Produce a fresh complete PROMPT.md specification following the format in your system prompt\n4. Include `## Original Description` near the top with the exact Original Request text above (verbatim, never plan.md)\n5. Address the revision feedback without inventing extra scope\n6. Name actual files, functions, and patterns from the codebase — be specific" : "1. Read the project structure to understand context (package.json, source files, etc.)\n2. Produce a complete PROMPT.md specification following the format in your system prompt\n3. Include `## Original Description` immediately after title/`Created`/`Size` with the exact Original Request text above (verbatim — do not paraphrase; never use plan.md)\n4. The specification must be detailed enough for an autonomous AI agent to implement without asking questions\n5. Name actual files, functions, and patterns from the codebase — be specific"}
 
-Call \`fn_task_prompt_write\` after the complete final specification is ready. If it returns an error, correct the problem and retry; do not finish planning until the tool confirms the authoritative PROMPT.md read-back. Do not use the generic filesystem write tool for PROMPT.md.${commandsSection}${completionDocumentationSection}${memorySection}${taskDefinitionLanguageSection}${attachmentsSection}${userCommentsSection}`;
+Call \`fn_task_prompt_write\` after the complete final specification is ready. If it returns an error, correct the problem and retry; do not finish planning until the tool confirms the authoritative PROMPT.md read-back. Do not use the generic filesystem write tool for PROMPT.md.${commandsSection}${environmentCapabilitiesSection ? `\n\n${environmentCapabilitiesSection}` : ""}${completionDocumentationSection}${memorySection}${taskDefinitionLanguageSection}${attachmentsSection}${userCommentsSection}`;
 }

@@ -3,9 +3,8 @@ FNXC:WorkflowLifecycleColumns 2026-07-27-23:50 (Phase B / slice B2):
 
 merger-ai decides two things by literal column id:
 
-  1. runAiMerge's already-finalized short circuit (`task.column === "done" ||
-     task.column === "archived"`) — the COMPLETE and ARCHIVED roles. Under a
-     renamed workflow this stops matching and the already-finalized card falls
+  1. runAiMerge's already-finalized short circuit once compared only with `done`.
+     Under a renamed workflow this stops matching and the already-finalized card falls
      through to `getTaskMergeBlocker`, which throws
      `Cannot merge FN-1: task is in 'shipped', must be in 'in-review'`.
 
@@ -37,6 +36,7 @@ asserted is that each site is reachable under a renamed workflow. That gap is
 reported in the PR rather than papered over.
 */
 import { describe, expect, it, vi } from "vitest";
+import "@fusion/core";
 import type { Task, TaskStore, WorkflowIr } from "@fusion/core";
 
 import { runAiMerge, resolveFinalizeReboundColumn } from "../merge/merger-ai.js";
@@ -59,7 +59,7 @@ function task(overrides: Partial<Task> = {}): Task {
   } as Task;
 }
 
-/** No `todo`, no `done`, no `archived` — every role renamed. */
+/** No `todo` or `done` — every active lifecycle role is renamed. */
 function renamedIr(): WorkflowIr {
   return {
     version: "v2",
@@ -70,9 +70,8 @@ function renamedIr(): WorkflowIr {
       { id: "inbox", label: "Inbox", traits: [{ trait: "intake" }] },
       { id: "drafting", label: "Drafting", traits: [{ trait: "hold", config: { release: "capacity" } }] },
       { id: "building", label: "Building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
-      { id: "reviewing", label: "Reviewing", traits: [{ trait: "mergeOrchestration" }] },
+      { id: "reviewing", label: "Reviewing", traits: [{ trait: "merge" }] },
       { id: "shipped", label: "Shipped", traits: [{ trait: "complete" }] },
-      { id: "retired", label: "Retired", traits: [{ trait: "archived" }] },
     ],
   } as unknown as WorkflowIr;
 }
@@ -87,9 +86,8 @@ function defaultIr(): WorkflowIr {
       { id: "triage", label: "Triage", traits: [{ trait: "intake" }] },
       { id: "todo", label: "Todo", traits: [{ trait: "hold", config: { release: "capacity" } }] },
       { id: "in-progress", label: "In Progress", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
-      { id: "in-review", label: "In Review", traits: [{ trait: "mergeOrchestration" }] },
+      { id: "in-review", label: "In Review", traits: [{ trait: "merge" }] },
       { id: "done", label: "Done", traits: [{ trait: "complete" }] },
-      { id: "archived", label: "Archived", traits: [{ trait: "archived" }] },
     ],
   } as unknown as WorkflowIr;
 }
@@ -130,16 +128,6 @@ describe("merger-ai under a renamed column vocabulary", () => {
       expect(result.reason).toBe("already-finalized");
     });
 
-    it("short-circuits a card resting in the RENAMED archived column", async () => {
-      const current = task({ column: "retired" });
-      const store = storeWith(current, renamedIr());
-
-      const result = await runAiMerge(store, "/tmp/root", "FN-1");
-
-      expect(result.noOp).toBe(true);
-      expect(result.reason).toBe("already-finalized");
-    });
-
     it("does NOT short-circuit a card still in the renamed merge lane", async () => {
       /* The negative half: otherwise a conversion that returned "finalized" for
          everything would pass the two tests above. */
@@ -154,7 +142,7 @@ describe("merger-ai under a renamed column vocabulary", () => {
       expect(reason).not.toBe("already-finalized");
     });
 
-    it.each(["done", "archived"] as const)(
+    it.each(["done"] as const)(
       "still short-circuits the builtin workflow's %s column (regression floor)",
       async (column) => {
         const current = task({ column });
@@ -167,9 +155,9 @@ describe("merger-ai under a renamed column vocabulary", () => {
       },
     );
 
-    it("still short-circuits done/archived when the workflow cannot be resolved", async () => {
+    it("still short-circuits Done when the workflow cannot be resolved", async () => {
       /* Conservative fallback — an unresolvable workflow must keep the legacy
-         terminal ids rather than losing the guard entirely. Losing it would
+         completion id rather than losing the guard entirely. Losing it would
          re-merge a finished card, which is the worse direction to fail. */
       const current = task({ column: "done" });
       const store = storeWith(current, undefined);
@@ -179,21 +167,6 @@ describe("merger-ai under a renamed column vocabulary", () => {
       expect(result.reason).toBe("already-finalized");
     });
 
-    /*
-    FNXC:WorkflowLifecycleColumns 2026-07-28-02:10 (PR #2471 review, P1):
-    PARTIAL role declaration. The first cut of `isAlreadyFinalizedColumn`
-    swapped the legacy pair for the resolved set WHOLESALE — `if
-    (resolved.length > 0) terminal = resolved`. A workflow declaring `complete`
-    but not `archived` therefore resolved to a ONE-element set and silently
-    dropped the archived short-circuit: an archived card fell through to
-    `getTaskMergeBlocker` and threw "must be in 'in-review'".
-
-    The fallback has to be PER-ROLE, not per-set — `complete` falls back to
-    `done` and `archived` falls back to `archived` independently — so a
-    partially-declared workflow keeps both halves of the guard. Both directions
-    are covered below because the two roles fail independently and a per-set fix
-    would pass whichever one happened to be declared.
-    */
     function partialIr(columns: Array<Record<string, unknown>>): WorkflowIr {
       return {
         version: "v2",
@@ -202,31 +175,20 @@ describe("merger-ai under a renamed column vocabulary", () => {
         edges: [],
         columns: [
           { id: "drafting", label: "Drafting", traits: [{ trait: "hold", config: { release: "capacity" } }] },
-          { id: "reviewing", label: "Reviewing", traits: [{ trait: "mergeOrchestration" }] },
+          { id: "reviewing", label: "Reviewing", traits: [{ trait: "merge" }] },
           ...columns,
         ],
       } as unknown as WorkflowIr;
     }
 
-    it("keeps the legacy archived fallback when the workflow declares complete but NOT archived", async () => {
+    it("uses the declared renamed complete column", async () => {
       const ir = partialIr([{ id: "shipped", label: "Shipped", traits: [{ trait: "complete" }] }]);
-
-      // The declared role still works…
       const shipped = storeWith(task({ column: "shipped" }), ir);
       expect((await runAiMerge(shipped, "/tmp/root", "FN-1")).reason).toBe("already-finalized");
-
-      // …and the UNdeclared one must not be lost with it.
-      const archived = storeWith(task({ column: "archived" }), ir);
-      expect((await runAiMerge(archived, "/tmp/root", "FN-1")).reason).toBe("already-finalized");
     });
 
-    it("keeps the legacy done fallback when the workflow declares archived but NOT complete", async () => {
-      const ir = partialIr([{ id: "retired", label: "Retired", traits: [{ trait: "archived" }] }]);
-
-      const retired = storeWith(task({ column: "retired" }), ir);
-      expect((await runAiMerge(retired, "/tmp/root", "FN-1")).reason).toBe("already-finalized");
-
-      const done = storeWith(task({ column: "done" }), ir);
+    it("keeps the legacy Done fallback when a workflow declares no complete column", async () => {
+      const done = storeWith(task({ column: "done" }), partialIr([]));
       expect((await runAiMerge(done, "/tmp/root", "FN-1")).reason).toBe("already-finalized");
     });
 
@@ -243,25 +205,22 @@ describe("merger-ai under a renamed column vocabulary", () => {
   });
 
   describe("finalize-blocked rebound target", () => {
-    it("resolves the workflow's hold column, not the literal todo", async () => {
-      const store = storeWith(task(), renamedIr());
-      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("drafting");
+    it("returns a renamed review card to the workflow's WIP lane", async () => {
+      const store = storeWith(task({ column: "reviewing" }), renamedIr());
+      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("building");
     });
 
-    it("resolves todo for the builtin coding workflow (regression floor)", async () => {
+    it("returns builtin review work to in-progress instead of Planning", async () => {
       const store = storeWith(task(), defaultIr());
-      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("todo");
+      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("in-progress");
     });
 
-    it("falls back to the legacy todo when the workflow cannot be resolved", async () => {
+    it("contains the card in review when the workflow cannot be resolved", async () => {
       const store = storeWith(task(), undefined);
-      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("todo");
+      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("in-progress");
     });
 
-    it("falls back to the legacy todo when resolution throws", async () => {
-      /* A finalize-blocked rebound parks work for an operator. It must not be
-         abandoned because a workflow lookup failed — the card would otherwise
-         be left stranded in the merge lane with no owner. */
+    it("contains the card in its live column when resolution throws", async () => {
       const store = {
         ...storeWith(task(), renamedIr()),
         getTaskWorkflowSelectionAsync: vi.fn(async () => {
@@ -272,7 +231,7 @@ describe("merger-ai under a renamed column vocabulary", () => {
         }),
       } as unknown as TaskStore;
 
-      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("todo");
+      await expect(resolveFinalizeReboundColumn(store, "FN-1")).resolves.toBe("in-progress");
     });
   });
 });

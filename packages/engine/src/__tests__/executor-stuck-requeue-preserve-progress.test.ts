@@ -1,375 +1,818 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import "./executor-test-helpers.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Task } from "@fusion/core";
+import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
-import { removeWorktree } from "../worktree/worktree-pool.js";
+import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
+import { markStuckAborted } from "../executor/mark-stuck-aborted.js";
 import {
   createMockStore,
+  createWorkflowRoutingAgentStore,
   mockCleanup,
   mockExecuteAll,
   mockedCreateFnAgent,
-  mockedDescribeRegisteredWorktrees,
-  mockedExecSync,
+  mockedStepSessionExecutor,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
 
-const mockedRemoveWorktree = vi.mocked(removeWorktree);
-
-/*
-FNXC:EngineTests 2026-07-19-16:05 (U10b):
-Requirement under test is unchanged: a force-requeue with preserveProgress must never leave the
-board claiming work that the discarded worktree took with it. What changed is WHO owns the step
-list. Under the workflow graph the `parse-steps` node re-materializes `task.steps` from PROMPT.md
-at the start of every run, so the executor's step statuses at abort time are the graph's, not a
-hand-seeded fixture. The fixture prompt therefore has to BE the step source (see
-`createMutableStore`'s `getTaskDocument`), and the assertions read the materialized list.
-*/
-const STEP_PROMPT =
-  "# test\n## Steps\n### Step 0: Preflight\n- [ ] check\n### Step 1: Implement\n- [ ] code\n### Step 2: Verify\n- [ ] verify";
-
-/*
-FNXC:EngineTests 2026-07-19-16:05 (U10b):
-The graph drives its own step transitions through the same `updateStep` seam, tagged
-`{ source: "graph" }`. The lost-work reconciliation (`resetStepsIfWorkLost`) writes untagged. Split
-them so "reset exactly the steps whose work was lost" stays measurable now that the graph shares
-the seam — a bare call count would measure the graph, not the reconciliation.
-*/
-function reconciliationStepResets(store: { updateStep: { mock: { calls: unknown[][] } } }): unknown[][] {
-  return store.updateStep.mock.calls.filter((call) => call[3] === undefined);
-}
-
-function createTask(overrides: Partial<Task> = {}): Task {
+function task(overrides: Partial<Task> = {}): Task {
   return {
-    id: "FN-7174",
-    title: "Preserve stuck progress",
-    description: STEP_PROMPT,
-    prompt: STEP_PROMPT,
+    id: "FN-217-STUCK",
+    title: "Resume stuck work",
+    description: "",
     column: "in-progress",
-    dependencies: [],
+    status: "failed",
+    error: "old session error",
+    effectiveNodeId: "steps#0:step-execute",
+    currentStep: 1,
     steps: [
-      { name: "Step 0", status: "done" },
-      { name: "Step 1", status: "in-progress" },
-      { name: "Step 2", status: "pending" },
+      { name: "Implemented", status: "done" },
+      { name: "Continue", status: "in-progress" },
     ],
-    currentStep: 2,
+    worktree: "/tmp/fn-217-stuck",
+    branch: "fusion/fn-217-stuck",
+    dependencies: [],
     log: [],
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    worktree: "/tmp/test/.worktrees/fn-7174-worktree",
-    branch: "fusion/fn-7174",
-    baseCommitSha: "base-sha",
-    enabledWorkflowSteps: [],
+    createdAt: "2026-08-28T00:00:00.000Z",
+    updatedAt: "2026-08-28T00:00:00.000Z",
     ...overrides,
+  } as Task;
+}
+
+function harness(subject: Task) {
+  const reexecuteTaskInPlace = vi.fn(async () => undefined);
+  const store = {
+    getTask: vi.fn(async () => subject),
+    getSettings: vi.fn(async () => ({})),
+    updateTask: vi.fn(async (_id: string, patch: Partial<Task>) => Object.assign(subject, patch)),
+    logEntry: vi.fn(async () => undefined),
   };
-}
-
-function installGitResult(kind: "uncommitted-only" | "committed") {
-  mockedExecSync.mockImplementation((cmd: string) => {
-    if (cmd.includes("git rev-parse --is-inside-work-tree")) return "true\n";
-    if (cmd.includes("git merge-base")) return "base-sha\n";
-    if (cmd.includes("git rev-parse")) {
-      return kind === "uncommitted-only" ? "base-sha\n" : "branch-sha\n";
-    }
-    return "";
-  });
-}
-
-/*
-FNXC:StuckRequeue 2026-08-02-00:20:
-The branch-durability PROOF in resetStepsIfWorkLost runs `git merge-base "<task-branch>" HEAD`; only
-THAT proof must fail for this scenario. Setup's contamination/diff base uses `git merge-base HEAD main`
-(and origin/main), which must still resolve — otherwise execution short-circuits before the agent
-session ever starts and the stuck-requeue cleanup under test is never reached (the test then hangs on
-startedPromise). Scope the failure to the task-branch merge-base and leave the main-base lookups intact.
-*/
-function installGitProofFailure() {
-  mockedExecSync.mockImplementation((cmd: string) => {
-    if (cmd.includes("git rev-parse --is-inside-work-tree")) return "true\n";
-    // Branch-durability PROOF (resetStepsIfWorkLost): `git merge-base "<task-branch>" HEAD`.
-    // Only this proof fails; every setup lookup mirrors the uncommitted-only fixture so execution
-    // still reaches the running session before the stuck kill.
-    if (cmd.includes("git merge-base") && cmd.includes("fusion/missing-fn-7174")) {
-      throw new Error("fatal: not a valid object name fusion/missing-fn-7174");
-    }
-    if (cmd.includes("git merge-base")) return "base-sha\n";
-    if (cmd.includes("git rev-parse")) return "base-sha\n";
-    return "";
-  });
-}
-
-function createMutableStore(task: Task, settings: Record<string, unknown> = {}) {
-  const store = createMockStore();
-  store.getSettings.mockResolvedValue({
-    maxConcurrent: 2,
-    maxWorktrees: 4,
-    pollIntervalMs: 15000,
-    groupOverlappingFiles: false,
-    autoMerge: false,
-    ...settings,
-  });
-  store.getTask.mockImplementation(async () => task);
-  /*
-  FNXC:EngineTests 2026-07-19-16:05 (U10b):
-  Point the graph's PROMPT.md artifact read at this fixture's own prompt so the materialized step
-  list is the three steps this file reasons about, instead of the shared harness's single-step
-  default.
-  */
-  store.getTaskDocument.mockImplementation(async (_id: string, key: string) =>
-    key === "PROMPT.md" ? { content: task.prompt } : undefined,
-  );
-  store.updateStep.mockImplementation(async (_taskId: string, stepIndex: number, status: Task["steps"][number]["status"]) => {
-    task.steps[stepIndex].status = status;
-    return task;
-  });
-  store.updateTask.mockImplementation(async (_taskId: string, updates: Partial<Task>) => {
-    Object.assign(task, updates);
-    return task;
-  });
-  store.moveTask.mockImplementation(async (_taskId: string, column: Task["column"]) => {
-    task.column = column;
-    return task;
-  });
-  return store;
-}
-
-function installSingleSession(resolvePrompt: () => Promise<void> | void = async () => {}) {
-  let started!: () => void;
-  const startedPromise = new Promise<void>((resolve) => {
-    started = resolve;
-  });
-  const session = {
-    prompt: vi.fn().mockImplementation(async () => {
-      started();
-      await resolvePrompt();
-    }),
-    dispose: vi.fn(),
-    subscribe: vi.fn(),
-    on: vi.fn(),
-    setThinkingLevel: vi.fn(),
-    sessionManager: { getLeafId: vi.fn().mockReturnValue("leaf-1") },
-    getSessionStats: vi.fn().mockReturnValue({ tokens: {} }),
+  const deps = {
+    store,
+    activeStepExecutors: new Map(),
+    stuckAborted: new Map<string, boolean>(),
+    executing: new Set([subject.id]),
+    loopRecoveryState: new Map(),
+    terminateAllChildren: vi.fn(async () => undefined),
+    prepareAbortInFlightTaskWork: vi.fn(() => ({ complete: vi.fn(async () => undefined) })),
+    clearPausedAborted: vi.fn(),
+    reexecuteTaskInPlace,
   };
-  mockedCreateFnAgent.mockResolvedValue({ session, sessionFile: "/tmp/session.json" } as any);
-  return { session, startedPromise };
+  return { deps, store, reexecuteTaskInPlace };
 }
 
-/*
-FNXC:EngineTests 2026-07-19-16:05 (U10b):
-`beforeAbort` runs after the agent session exists but before the stuck kill, which is the only
-window where a test can stage state the graph has already written past — the graph's own column
-boundary move and its step-0 in-progress transition both land before the kill. Simulating a
-concurrent recovery or a no-work session by pre-seeding the fixture no longer works.
-*/
-async function runSingleSessionStuckRequeue(
-  task: Task,
-  settings: Record<string, unknown> = {},
-  beforeAbort?: (live: Task) => void,
-) {
-  const store = createMutableStore(task, settings);
-  let releasePrompt!: () => void;
-  const promptRelease = new Promise<void>((resolve) => {
-    releasePrompt = resolve;
-  });
-  const { startedPromise } = installSingleSession(() => promptRelease);
-  const executor = new TaskExecutor(store as any, "/tmp/test", {});
+beforeEach(() => {
+  resetExecutorMocks();
+});
 
-  const executePromise = executor.execute(task);
-  await startedPromise;
-  beforeAbort?.(task);
-  executor.markStuckAborted(task.id, true);
-  releasePrompt();
-  await executePromise;
-  return { store, executor };
-}
+afterEach(() => {
+  vi.useRealTimers();
+  executingTaskLock._clearForTest();
+});
 
-async function runStepSessionStuckRequeue(task: Task, settings: Record<string, unknown> = {}) {
-  const store = createMutableStore(task, {
-    runStepsInNewSessions: true,
-    maxParallelSteps: 2,
-    ...settings,
-  });
-  let release!: () => void;
-  mockExecuteAll.mockReturnValue(new Promise<void>((resolve) => {
-    release = resolve;
-  }));
-  const executor = new TaskExecutor(store as any, "/tmp/test", {});
-
-  const executePromise = executor.execute(task);
-  await vi.waitFor(() => expect((executor as any).activeStepExecutors.has(task.id)).toBe(true));
-  executor.markStuckAborted(task.id, true);
-  release();
-  await executePromise;
-  return { store, executor };
-}
-
-describe("TaskExecutor stuck requeue preserve-progress reconciliation", () => {
-  beforeEach(() => {
-    resetExecutorMocks();
-    mockedRemoveWorktree.mockResolvedValue(undefined as any);
-    mockedDescribeRegisteredWorktrees.mockResolvedValue({
-      rawOutput: "worktree /tmp/test/.worktrees/fn-7174-worktree\nbranch refs/heads/fusion/fn-7174\n",
-      canonicalized: ["/tmp/test/.worktrees/fn-7174-worktree"],
-    });
-    mockCleanup.mockResolvedValue(undefined);
-    installGitResult("uncommitted-only");
-  });
-
-  it("reproduces the default preserve-progress corruption case and resets uncommitted-only steps before removing the worktree", async () => {
-    const task = createTask();
-    const { store } = await runSingleSessionStuckRequeue(task);
-
-    expect(task.steps.map((step) => step.status)).toEqual(["pending", "pending", "pending"]);
-    expect(task.currentStep).toBe(0);
-    // Every step the discarded worktree was mid-way through is reset — here the graph's step 0.
-    expect(reconciliationStepResets(store)).toEqual([[task.id, 0, "pending"]]);
-    expect(mockedRemoveWorktree).toHaveBeenCalledWith(expect.objectContaining({
-      worktreePath: "/tmp/test/.worktrees/fn-7174-worktree",
-      taskId: task.id,
-      expectedOwnerTaskId: task.id,
-    }));
-    expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-      worktree: null,
-      branch: null,
-    }));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
-  });
-
-  it("resets steps when git cannot prove a stale branch has durable commits before cleanup", async () => {
-    installGitProofFailure();
-    const task = createTask({ branch: "fusion/missing-fn-7174" });
-    const { store } = await runSingleSessionStuckRequeue(task);
-
-    expect(task.steps.map((step) => step.status)).toEqual(["pending", "pending", "pending"]);
-    expect(task.currentStep).toBe(0);
-    expect(reconciliationStepResets(store)).toEqual([[task.id, 0, "pending"]]);
-    expect(mockedRemoveWorktree).toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
-  });
-
-  it("keeps committed step progress unchanged on preserve-progress stuck requeue", async () => {
-    installGitResult("committed");
-    const task = createTask();
-    const { store } = await runSingleSessionStuckRequeue(task);
-
-    // Committed work is durable: the graph's in-flight step keeps its status and currentStep stands.
-    expect(task.steps.map((step) => step.status)).toEqual(["in-progress", "pending", "pending"]);
-    expect(task.currentStep).toBe(2);
-    expect(reconciliationStepResets(store)).toEqual([]);
-    expect(mockedRemoveWorktree).toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
-  });
-
-  it("keeps preserveProgress=false reset behavior while moving without preserve options", async () => {
-    const task = createTask();
-    const { store } = await runSingleSessionStuckRequeue(task, { preserveProgressOnStuckRequeue: false });
-
-    expect(task.steps.map((step) => step.status)).toEqual(["pending", "pending", "pending"]);
-    expect(task.currentStep).toBe(0);
-    expect(reconciliationStepResets(store)).toEqual([[task.id, 0, "pending"]]);
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", undefined);
-  });
-
-  /*
-  FNXC:EngineTests 2026-07-19-16:05 (U10b):
-  A session that recorded no step progress must not be "reconciled" at all — there is nothing to
-  lose, so the requeue writes no step statuses. Post-cutover the all-pending state has to be staged
-  at kill time (the graph marks its first step in-progress before the session starts), so the
-  no-work condition is asserted against the reconciliation's own writes rather than the seam's.
-  */
-  it("does nothing for no-work tasks with no completed or in-progress steps", async () => {
-    const task = createTask();
-    const { store } = await runSingleSessionStuckRequeue(task, {}, (live) => {
-      for (const step of live.steps) step.status = "pending";
-    });
-
-    expect(reconciliationStepResets(store)).toEqual([]);
-    expect(task.steps.map((step) => step.status)).toEqual(["pending", "pending", "pending"]);
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
-  });
-
-  /*
-  FNXC:EngineTests 2026-07-19-16:05 (U10b):
-  The guard is the reason this file exists: if a concurrent recovery has already carried the task
-  past in-progress/todo, the stuck requeue must abandon its cleanup rather than destroy the
-  worktree that recovery now depends on and clobber the card back to todo. The graph moves the card
-  itself during the run, so the concurrent recovery is now staged at kill time via `beforeAbort`
-  instead of by seeding `column` before `execute()`.
-
-  FNXC:EngineTests 2026-07-19-16:05 (U10b):
-  "Never moved to todo" is no longer the guard's contract — the graph, as a separate authority,
-  rebounds its own failed run for execution resume (`{ moveSource: "engine", recoveryRehome: true }`)
-  and that move is not destructive. What the guard must suppress is the stuck-requeue's own
-  bare-`{preserveProgress:true}` move plus the cleanup that goes with it: step resets, worktree
-  removal, and the worktree/branch clear.
-  */
-  it("preserves the concurrent-recovery guard without removing worktree or clearing the checkout", async () => {
-    const task = createTask();
-    const { store } = await runSingleSessionStuckRequeue(task, {}, (live) => {
-      live.column = "in-review";
-    });
-
-    expect(reconciliationStepResets(store)).toEqual([]);
-    expect(mockedRemoveWorktree).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalledWith(task.id, expect.objectContaining({
-      worktree: null,
-      branch: null,
-    }));
-    expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
-    expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "todo");
-  });
-
-  it("applies the same lost-work reconciliation to the step-session requeue path", async () => {
-    const task = createTask();
-    const { store } = await runStepSessionStuckRequeue(task);
-
-    expect(task.steps.map((step) => step.status)).toEqual(["pending", "pending", "pending"]);
-    expect(task.currentStep).toBe(0);
-    expect(reconciliationStepResets(store)).toEqual([[task.id, 0, "pending"]]);
-    expect(mockedRemoveWorktree).toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
-  });
-
-  it("applies the same lost-work reconciliation to the force-requeue grace-timeout path", async () => {
+describe("stuck-session in-place resume", () => {
+  it("resumes the same column, node, and step while preserving checkout and progress", async () => {
     vi.useFakeTimers();
-    const task = createTask();
-    const store = createMutableStore(task);
-    /*
-    FNXC:StuckRequeue 2026-08-23-22:35:
-    A completion BARRIER, not a wait-and-hope. The grace-timeout callback is async past its timer:
-    `resetStepsIfWorkLost` awaits `loadWorkspaceConfig(rootDir)`, which is REAL async fs I/O, and
-    `vi.advanceTimersByTimeAsync` only drains timers and microtasks — it returns while that I/O leg
-    is still outstanding. Asserting straight after the advance therefore read the graph's
-    `step 0 = in-progress` before the reconciliation's reset landed (deterministic in isolation;
-    order-dependent, and observed flaking, in a whole-file run). The product is correct: the reset,
-    the currentStep clear, and the requeue all happen, in that order, and the requeue move is LAST.
-    Awaiting it is the exact, poll-free point at which every assertion below is observable.
-    */
-    const forceRequeued = new Promise<void>((resolve) => {
-      store.moveTask.mockImplementation(async (_taskId: string, column: Task["column"], options?: { preserveProgress?: boolean }) => {
-        task.column = column;
-        if (column === "todo" && options?.preserveProgress) resolve();
-        return task;
-      });
-    });
-    let releasePrompt!: () => void;
-    const promptRelease = new Promise<void>((resolve) => {
-      releasePrompt = resolve;
-    });
-    const { startedPromise } = installSingleSession(() => promptRelease);
-    const executor = new TaskExecutor(store as any, "/tmp/test", {});
+    const subject = task();
+    const before = {
+      column: subject.column,
+      effectiveNodeId: subject.effectiveNodeId,
+      currentStep: subject.currentStep,
+      steps: structuredClone(subject.steps),
+      worktree: subject.worktree,
+      branch: subject.branch,
+    };
+    const { deps, reexecuteTaskInPlace } = harness(subject);
+    expect(executingTaskLock.claim(subject.id)).not.toBeNull();
 
-    const executePromise = executor.execute(task);
-    await startedPromise;
-    executor.markStuckAborted(task.id, true);
+    markStuckAborted(deps as never, subject.id);
     await vi.advanceTimersByTimeAsync(60_000);
-    await forceRequeued;
 
-    expect(task.steps.map((step) => step.status)).toEqual(["pending", "pending", "pending"]);
-    expect(task.currentStep).toBe(0);
-    expect(mockedRemoveWorktree).toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true });
+    expect(subject).toMatchObject({ ...before, status: null, error: null });
+    expect(reexecuteTaskInPlace).toHaveBeenCalledOnce();
+    expect(reexecuteTaskInPlace).toHaveBeenCalledWith(subject.id);
+    expect(deps.executing.has(subject.id)).toBe(false);
+  });
 
-    releasePrompt();
-    await executePromise;
+  it("invalidates before a late unwind can persist or clear the resumed attempt", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      effectiveNodeId: "steps#6:step-execute",
+      currentStep: 6,
+      steps: [
+        { name: "Earlier", status: "done" },
+        { name: "Testing", status: "in-progress" },
+      ],
+    });
+    const { deps, store, reexecuteTaskInPlace } = harness(subject);
+    const oldLease = executingTaskLock.claim(subject.id);
+    if (!oldLease) throw new Error("old execution lease missing");
+    let finishAbort!: () => void;
+    const abortGate = new Promise<void>((resolve) => { finishAbort = resolve; });
+    deps.prepareAbortInFlightTaskWork = vi.fn(() => ({ complete: vi.fn(async () => abortGate) }));
+    let successorLease: ReturnType<typeof executingTaskLock.claim> = null;
+    reexecuteTaskInPlace.mockImplementation(async () => {
+      successorLease = executingTaskLock.claim(subject.id);
+      deps.executing.add(subject.id);
+    });
+    const staleMove = vi.fn(async () => undefined);
+
+    markStuckAborted(deps as never, subject.id);
+    vi.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    const staleUnwind = executingTaskLock.runIfOwner(oldLease, staleMove);
+    finishAbort();
+    await vi.runAllTimersAsync();
+
+    expect(await staleUnwind).toEqual({ executed: false });
+    expect(staleMove).not.toHaveBeenCalled();
+    expect(reexecuteTaskInPlace).toHaveBeenCalledOnce();
+    expect(successorLease).not.toBeNull();
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      effectiveNodeId: "steps#6:step-execute",
+      currentStep: 6,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+    expect(store.logEntry.mock.calls.flat().join(" ")).not.toMatch(/parent moved|unattributed automatic move|no further action needed/i);
+  });
+
+  it("waits for destructive step cleanup already in the FIFO before starting a real successor", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      id: "FN-312-STEP",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Earlier\n- [x] done\n### Step 1: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: true,
+      maxParallelSteps: 1,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    let rejectSteps!: (error: Error) => void;
+    mockExecuteAll
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSteps = reject; }))
+      .mockResolvedValueOnce(undefined);
+    let releaseOldCleanup!: () => void;
+    mockCleanup
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseOldCleanup = resolve; }))
+      .mockResolvedValueOnce(undefined);
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(mockExecuteAll).toHaveBeenCalledOnce());
+    rejectSteps(new Error("step-session failure"));
+    await vi.waitFor(() => expect(mockCleanup).toHaveBeenCalledOnce());
+
+    (executor as any).markStuckAborted(subject.id);
+    vi.advanceTimersByTime(60_000);
+    await Promise.resolve();
+
+    expect(mockExecuteAll).toHaveBeenCalledTimes(1);
+    expect(executingTaskLock.claim(subject.id)).toBeNull();
+    releaseOldCleanup();
+    await oldRun;
+    await vi.runAllTimersAsync();
+    await vi.waitFor(() => expect(mockExecuteAll).toHaveBeenCalledTimes(3));
+
+    // One old step-session plus the real successor's two planned step sessions.
+    expect(mockCleanup).toHaveBeenCalledTimes(3);
+    expect(store.moveTask).not.toHaveBeenCalledWith(subject.id, "todo", expect.anything());
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      effectiveNodeId: "steps#0:step-execute",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+  });
+
+  it("skips late destructive step cleanup after invalidation starts a real successor", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      id: "FN-312-STEP-STALE",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Earlier\n- [x] done\n### Step 1: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: true,
+      maxParallelSteps: 1,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    let rejectOldSteps!: (error: Error) => void;
+    mockExecuteAll
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOldSteps = reject; }))
+      .mockResolvedValue(undefined);
+    mockCleanup.mockResolvedValue(undefined);
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(mockExecuteAll).toHaveBeenCalledOnce());
+    (executor as any).markStuckAborted(subject.id);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(mockExecuteAll).toHaveBeenCalledTimes(3));
+
+    const cleanupCountAfterSuccessor = mockCleanup.mock.calls.length;
+    rejectOldSteps(new Error("late old step-session rejection"));
+    await oldRun;
+
+    expect(cleanupCountAfterSuccessor).toBe(2);
+    expect(mockCleanup).toHaveBeenCalledTimes(cleanupCountAfterSuccessor);
+    expect(store.moveTask).not.toHaveBeenCalledWith(subject.id, "todo", expect.anything());
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+  });
+
+  it("rejects real stale step callbacks after invalidation installs a successor", async () => {
+    const subject = task({
+      id: "FN-312-STALE-STEP-CALLBACK",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Earlier\n- [x] done\n### Step 1: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: true,
+      maxParallelSteps: 1,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    let finishOldSteps!: () => void;
+    const oldStepsGate = new Promise<unknown[]>((resolve) => {
+      finishOldSteps = () => resolve([]);
+    });
+    mockExecuteAll.mockImplementation(() => oldStepsGate);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(mockExecuteAll).toHaveBeenCalledTimes(2));
+    const callbacks = mockedStepSessionExecutor.mock.calls[0]?.[0] as any;
+    const oldLease = executingTaskLock.currentLease(subject.id);
+    if (!oldLease) throw new Error("old execution lease missing");
+    expect(await executingTaskLock.invalidate(oldLease)).toMatchObject({ executed: true });
+    const successorLease = executingTaskLock.claim(subject.id);
+    if (!successorLease) throw new Error("successor execution lease missing");
+    const startCount = store.startStep.mock.calls.length;
+    const completeCount = store.updateStep.mock.calls.length;
+    const tokenWriteCount = store.updateTask.mock.calls.length;
+
+    await expect(callbacks.onStepStart(1)).resolves.toBe(false);
+    await callbacks.onStepComplete(1, {
+      success: true,
+      retries: 0,
+      tokenUsage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+    });
+
+    expect(store.startStep).toHaveBeenCalledTimes(startCount);
+    expect(store.updateStep).toHaveBeenCalledTimes(completeCount);
+    expect(store.updateTask).toHaveBeenCalledTimes(tokenWriteCount);
+    expect(executingTaskLock.owns(successorLease)).toBe(true);
+
+    finishOldSteps();
+    await oldRun;
+    executingTaskLock.release(subject.id, successorLease);
+  });
+
+  it("holds invalidation until a real entered step callback finishes token persistence", async () => {
+    const subject = task({
+      id: "FN-312-ENTERED-STEP-CALLBACK",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: true,
+      maxParallelSteps: 1,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    let finishOldSteps!: () => void;
+    const oldStepsGate = new Promise<unknown[]>((resolve) => {
+      finishOldSteps = () => resolve([]);
+    });
+    mockExecuteAll.mockImplementation(() => oldStepsGate);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(mockExecuteAll).toHaveBeenCalledOnce());
+    const callbacks = mockedStepSessionExecutor.mock.calls[0]?.[0] as any;
+    const oldLease = executingTaskLock.currentLease(subject.id);
+    if (!oldLease) throw new Error("old execution lease missing");
+    let finishTokenWrite!: () => void;
+    const tokenWriteGate = new Promise<void>((resolve) => { finishTokenWrite = resolve; });
+    const updateCount = store.updateTask.mock.calls.length;
+    store.updateTask.mockImplementationOnce(async () => {
+      await tokenWriteGate;
+      return subject;
+    });
+
+    const completion = callbacks.onStepComplete(0, {
+      success: true,
+      retries: 0,
+      tokenUsage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+    });
+    await vi.waitFor(() => expect(store.updateTask.mock.calls.length).toBe(updateCount + 1));
+    let invalidationSettled = false;
+    const invalidation = executingTaskLock.invalidate(oldLease).then((result) => {
+      invalidationSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+
+    expect(invalidationSettled).toBe(false);
+    expect(executingTaskLock.claim(subject.id)).toBeNull();
+    finishTokenWrite();
+    await completion;
+    expect(await invalidation).toMatchObject({ executed: true });
+    expect(executingTaskLock.claim(subject.id)).not.toBeNull();
+
+    finishOldSteps();
+    await oldRun;
+    const successorLease = executingTaskLock.currentLease(subject.id);
+    if (successorLease) executingTaskLock.release(subject.id, successorLease);
+  });
+
+  it("keeps a successor agent session intact when the real old runImplementation prompt settles late", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      id: "FN-312-SESSION",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Done\n- [x] done",
+      steps: [{ name: "Done", status: "done" }],
+      currentStep: 0,
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: false,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    let releaseOldPrompt!: () => void;
+    let releaseSuccessorPrompt!: () => void;
+    const oldSession = {
+      prompt: vi.fn(() => new Promise<void>((resolve) => { releaseOldPrompt = resolve; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const successorSession = {
+      prompt: vi.fn(() => new Promise<void>((resolve) => { releaseSuccessorPrompt = resolve; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: oldSession } as never)
+      .mockResolvedValueOnce({ session: successorSession } as never);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(oldSession.prompt).toHaveBeenCalledOnce());
+
+    (executor as any).markStuckAborted(subject.id);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(successorSession.prompt).toHaveBeenCalledOnce());
+    const successorLease = executingTaskLock.currentLease(subject.id);
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+    const writerCountAfterSuccessor = store.updateTask.mock.calls.length + store.moveTask.mock.calls.length;
+
+    releaseOldPrompt();
+    await oldRun;
+
+    expect((executor as any).activeSessions.get(subject.id)?.session).toBe(successorSession);
+    const successorRegistryPaths = activeSessionRegistry.pathsForTask(subject.id);
+    expect(successorRegistryPaths).toHaveLength(1);
+    expect(activeSessionRegistry.lookupByPath(successorRegistryPaths[0]!)).toMatchObject({
+      taskId: subject.id,
+      kind: "executor",
+    });
+    expect((executor as any).executing.has(subject.id)).toBe(true);
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+    expect(store.updateTask.mock.calls.length + store.moveTask.mock.calls.length).toBe(writerCountAfterSuccessor);
+    expect(store.logEntry.mock.calls.flat().join(" ")).not.toMatch(
+      /parent moved|unattributed automatic move|no further action needed/i,
+    );
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      currentStep: 0,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+
+    releaseSuccessorPrompt();
+    await vi.waitFor(() => expect(executingTaskLock.has(subject.id)).toBe(false));
+  });
+
+  it("ignores the old stuck timer after graceful unwind starts a real successor", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      id: "FN-312-STALE-STUCK-TIMER",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Continue\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: false,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    let releaseOldPrompt!: () => void;
+    let releaseSuccessorPrompt!: () => void;
+    const oldSession = {
+      prompt: vi.fn(() => new Promise<void>((resolve) => { releaseOldPrompt = resolve; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const successorSession = {
+      prompt: vi.fn(() => new Promise<void>((resolve) => { releaseSuccessorPrompt = resolve; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: oldSession } as never)
+      .mockResolvedValueOnce({ session: successorSession } as never);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    const prepareAbort = vi.spyOn(executor as any, "prepareAbortInFlightTaskWork");
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(oldSession.prompt).toHaveBeenCalledOnce());
+    (executor as any).markStuckAborted(subject.id);
+
+    releaseOldPrompt();
+    await oldRun;
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(successorSession.prompt).toHaveBeenCalledOnce());
+    const successorLease = executingTaskLock.currentLease(subject.id);
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(prepareAbort).not.toHaveBeenCalled();
+    expect(successorSession.dispose).not.toHaveBeenCalled();
+    expect((executor as any).activeSessions.get(subject.id)?.session).toBe(successorSession);
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+
+    releaseSuccessorPrompt();
+    await vi.waitFor(() => expect(executingTaskLock.has(subject.id)).toBe(false));
+  });
+
+  it("waits for entered single-session cleanup before starting its real successor", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      id: "FN-312-SESSION-ENTERED",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: false,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    let rejectOldPrompt!: (error: Error) => void;
+    let releaseSuccessorPrompt!: () => void;
+    const oldSession = {
+      prompt: vi.fn(() => new Promise<void>((_resolve, reject) => { rejectOldPrompt = reject; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const successorSession = {
+      prompt: vi.fn(() => new Promise<void>((resolve) => { releaseSuccessorPrompt = resolve; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: oldSession } as never)
+      .mockResolvedValueOnce({ session: successorSession } as never);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    let releaseEnteredCleanup!: () => void;
+    const enteredCleanup = new Promise<void>((resolve) => { releaseEnteredCleanup = resolve; });
+    const terminateAllChildren = vi.fn()
+      .mockImplementationOnce(async () => enteredCleanup)
+      .mockResolvedValue(undefined);
+    (executor as any).terminateAllChildren = terminateAllChildren;
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(oldSession.prompt).toHaveBeenCalledOnce());
+    (executor as any).pausedAborted.add(subject.id);
+    rejectOldPrompt(new Error("engine abort while entering cleanup"));
+    await vi.waitFor(() => expect(terminateAllChildren).toHaveBeenCalledOnce());
+
+    (executor as any).markStuckAborted(subject.id);
+    vi.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    expect(successorSession.prompt).not.toHaveBeenCalled();
+    expect(executingTaskLock.claim(subject.id)).toBeNull();
+
+    releaseEnteredCleanup();
+    await oldRun;
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(successorSession.prompt).toHaveBeenCalledOnce());
+    const successorLease = executingTaskLock.currentLease(subject.id);
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+    expect(terminateAllChildren).toHaveBeenCalledTimes(2);
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+
+    releaseSuccessorPrompt();
+    await vi.waitFor(() => expect(executingTaskLock.has(subject.id)).toBe(false));
+  });
+
+  it("keeps a gracefully settled engine pause abort in WIP without rebounding to hold", async () => {
+    const subject = task({
+      id: "FN-312-PAUSE-GRACEFUL",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Earlier\n- [x] done\n### Step 1: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: false,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn(async () => {
+          (executor as any).pausedAborted.add(subject.id);
+        }),
+        dispose: vi.fn(),
+        subscribe: vi.fn(() => vi.fn()),
+      },
+    } as never);
+
+    await (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.updateTask.mock.calls).not.toContainEqual([
+      subject.id,
+      expect.objectContaining({ worktree: null }),
+    ]);
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+    expect(store.logEntry.mock.calls).toContainEqual([
+      subject.id,
+      "Execution interrupted — session state preserved for in-place resume",
+    ]);
+  });
+
+  it("waits for an entered post-prompt writer before invalidating and starting the successor", async () => {
+    vi.useFakeTimers();
+    const subject = task({
+      id: "FN-312-CONTINUATION-WRITER",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Earlier\n- [x] done\n### Step 1: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: false,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    let releaseSuccessorPrompt!: () => void;
+    const oldSession = {
+      prompt: vi.fn(async () => undefined),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const successorSession = {
+      prompt: vi.fn(() => new Promise<void>((resolve) => { releaseSuccessorPrompt = resolve; })),
+      dispose: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: oldSession } as never)
+      .mockResolvedValueOnce({ session: successorSession } as never);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    const persistTokenUsage = vi.fn()
+      .mockImplementationOnce(async () => writerGate)
+      .mockResolvedValue(undefined);
+    (executor as any).persistTokenUsage = persistTokenUsage;
+
+    const oldRun = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(persistTokenUsage).toHaveBeenCalledOnce());
+
+    (executor as any).markStuckAborted(subject.id);
+    vi.advanceTimersByTime(60_000);
+    await Promise.resolve();
+
+    expect(successorSession.prompt).not.toHaveBeenCalled();
+    expect(executingTaskLock.claim(subject.id)).toBeNull();
+
+    releaseWriter();
+    await oldRun;
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(successorSession.prompt).toHaveBeenCalledOnce());
+    const successorLease = executingTaskLock.currentLease(subject.id);
+    expect(successorLease && executingTaskLock.owns(successorLease)).toBe(true);
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+
+    releaseSuccessorPrompt();
+    await vi.waitFor(() => expect(executingTaskLock.has(subject.id)).toBe(false));
+  });
+
+  it("keeps a real engine pause abort in WIP without removing resumable state", async () => {
+    const subject = task({
+      id: "FN-312-PAUSE",
+      enabledWorkflowSteps: [],
+      prompt: "# Task\n## Steps\n### Step 0: Earlier\n- [x] done\n### Step 1: Testing\n- [ ] work",
+      baseCommitSha: "base-sha",
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(subject);
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      runStepsInNewSessions: false,
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+    });
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn(async () => {
+          (executor as any).pausedAborted.add(subject.id);
+          throw new Error("engine pause abort");
+        }),
+        dispose: vi.fn(),
+        subscribe: vi.fn(() => vi.fn()),
+      },
+    } as never);
+
+    await (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.updateTask.mock.calls).not.toContainEqual([
+      subject.id,
+      expect.objectContaining({ worktree: null }),
+    ]);
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+    });
+    expect(store.logEntry.mock.calls).toContainEqual([
+      subject.id,
+      "Execution interrupted — session state preserved for in-place resume",
+      undefined,
+      expect.anything(),
+    ]);
+  });
+
+  it("repeated silence repeatedly resumes and never terminalizes or asks for approval", async () => {
+    vi.useFakeTimers();
+    const subject = task();
+    const { deps, store, reexecuteTaskInPlace } = harness(subject);
+
+    for (let round = 0; round < 2; round += 1) {
+      deps.executing.add(subject.id);
+      expect(executingTaskLock.claim(subject.id)).not.toBeNull();
+      markStuckAborted(deps as never, subject.id);
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+
+    expect(reexecuteTaskInPlace).toHaveBeenCalledTimes(2);
+    expect(subject.status).toBeNull();
+    expect(subject.error).toBeNull();
+    expect(subject.paused).not.toBe(true);
+    expect(subject).not.toHaveProperty("awaitingApprovalReason");
+    expect(JSON.stringify(store.updateTask.mock.calls)).not.toMatch(/STUCK_(?:LOOP_EXHAUSTED|NO_PROGRESS_CHURN)|decompose/i);
+  });
+
+  it.each([
+    { globalPause: true, enginePaused: false },
+    { globalPause: false, enginePaused: true },
+  ])("preserves the forced-resume continuation without dispatch while engine execution is paused", async (settings) => {
+    vi.useFakeTimers();
+    const subject = task();
+    const { deps, store, reexecuteTaskInPlace } = harness(subject);
+    store.getSettings.mockResolvedValue(settings);
+    expect(executingTaskLock.claim(subject.id)).not.toBeNull();
+
+    markStuckAborted(deps as never, subject.id);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(reexecuteTaskInPlace).not.toHaveBeenCalled();
+    expect(executingTaskLock.has(subject.id)).toBe(false);
+    expect(deps.executing.has(subject.id)).toBe(false);
+    expect(subject).toMatchObject({
+      column: "in-progress",
+      effectiveNodeId: "steps#0:step-execute",
+      currentStep: 1,
+      worktree: "/tmp/fn-217-stuck",
+      branch: "fusion/fn-217-stuck",
+      status: null,
+      error: null,
+    });
+    expect(store.logEntry).toHaveBeenCalledWith(
+      subject.id,
+      "Forced stuck-session ownership invalidated — continuation preserved until engine execution resumes",
+    );
+  });
+
+  it("invalidates ownership but refuses dispatch when a control read rejects", async () => {
+    vi.useFakeTimers();
+    const subject = task({ id: "FN-312-CONTROL-READ-FAILURE" });
+    const { deps, store, reexecuteTaskInPlace } = harness(subject);
+    store.getTask.mockRejectedValueOnce(new Error("task store unavailable"));
+    const oldLease = executingTaskLock.claim(subject.id);
+    expect(oldLease).not.toBeNull();
+
+    markStuckAborted(deps as never, subject.id);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(oldLease && executingTaskLock.owns(oldLease)).toBe(false);
+    expect(executingTaskLock.has(subject.id)).toBe(false);
+    expect(deps.executing.has(subject.id)).toBe(false);
+    expect(reexecuteTaskInPlace).not.toHaveBeenCalled();
+    const successor = executingTaskLock.claim(subject.id);
+    expect(successor).not.toBeNull();
+    if (successor) executingTaskLock.release(subject.id, successor);
+  });
+
+  it("leaves a user-paused task under manual control", async () => {
+    vi.useFakeTimers();
+    const subject = task({ paused: true, userPaused: true, status: "paused" });
+    const { deps, store, reexecuteTaskInPlace } = harness(subject);
+    expect(executingTaskLock.claim(subject.id)).not.toBeNull();
+
+    markStuckAborted(deps as never, subject.id);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(reexecuteTaskInPlace).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(deps.executing.has(subject.id)).toBe(false);
+    expect(executingTaskLock.has(subject.id)).toBe(false);
+    expect(subject).toMatchObject({ column: "in-progress", paused: true, userPaused: true, status: "paused" });
   });
 });

@@ -42,6 +42,8 @@ export interface SessionBoundaryDescriptor {
   writableRoot: string | null;
   projectRoot: string;
   readOnlyRoots?: readonly string[];
+  /** Absolute roots writable under an otherwise read-only boundary. */
+  writableAllowlist?: readonly string[];
   repoRoots?: readonly { repoRelPath: string; repoRootDir: string }[];
 }
 
@@ -125,6 +127,7 @@ export interface AgentRuntimeOptions {
   onText?: (delta: string) => void;
   /** Callback for thinking/thought output from the agent */
   onThinking?: (delta: string) => void;
+  onTextBlockBoundary?: () => void;
   /** Callback when a tool starts execution */
   onToolStart?: (name: string, args?: Record<string, unknown>) => void;
   /** Callback when a tool finishes execution */
@@ -180,6 +183,9 @@ export interface AgentRuntimeOptions {
    * logging server contents.
    */
   mcpServers?: AgentRuntimeMcpServerConfig[];
+  /** Read-only MCP opt-in and server narrowing; MCP-incapable runtimes ignore both without logging definitions. */
+  allowMcpToolsInReadonly?: boolean;
+  readonlyMcpServerAllowlist?: string[];
   /** Optional task-scoped environment variables for session-local subprocesses. */
   taskEnv?: NodeJS.ProcessEnv;
   /**

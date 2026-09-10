@@ -20,7 +20,8 @@ import type {LegacyAutoMergeStampReconcileResult} from "../store.js";
 import {randomUUID} from "node:crypto";
 import {mkdir, readFile, writeFile, rename, unlink} from "node:fs/promises";
 import {join} from "node:path";
-import {existsSync} from "node:fs";
+import { getTaskActivityLogEntryLimit } from "./comments.js";
+import type { TaskLogEntry } from "../types.js";
 import type {Task, TaskCreateInput, TaskAttachment, BoardConfig, ActivityLogEntry, ActivityEventType, Artifact, ArtifactCreateInput, RunMutationContext, MergeQueueEntry, BranchGroup, BranchGroupUpdate, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemKind, PrEntity, PrEntityUpdate, TaskRecommendation, WorkspaceWorktreeEntry, TaskRepositoryScope} from "../types.js";
 import { CONFIG_CHANGED_BY_SYSTEM } from "../types.js";
 import {validateSettingValuePatch, WorkflowSettingRejectionError} from "../workflows/workflow-settings.js";
@@ -32,8 +33,6 @@ import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {assertSafeGitBranchName} from "../task-store/shell-safety.js";
 import {isFusionDeletableBranch} from "../branch/branch-assignment.js";
 import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, resolveActiveTaskWedgeEpisodeRow} from "../task-store/async/async-persistence.js";
-import {upsertArchivedTaskEntry} from "./async/async-archive-lineage.js";
-import {purgeTaskWorkflowSelectionRowsAsyncImpl} from "./workflow-definitions.js";
 import * as schema from "../postgres/schema/index.js";
 import {and, asc, eq, inArray, isNotNull, isNull, sql} from "drizzle-orm";
 import {recoverExpiredMergeQueueLeases as recoverExpiredMergeQueueLeasesAsync} from "../task-store/async/async-merge-coordination.js";
@@ -49,7 +48,7 @@ import {publishSettingsUpdated} from "./settings-ops.js";
 import {loadWorkspaceConfig} from "../git/git-repository.js";
 import { mergeRestoredProjectSettings } from "../config/settings-schema.js";
 import type {ConfigChangedBy, ConfigurationRevision} from "../types.js";
-import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
+import { ARCHIVED_SENTINEL_LANES } from "../project-lane-vocabulary.js";
 import { acquireTaskAdvisoryXactLock } from "./task-advisory-lock.js";
 import { invalidateSupersededRepositoryScopeReviews } from "../tasks/repository-scope.js";
 
@@ -70,7 +69,7 @@ export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, li
       "tokenUsageInputTokens", "tokenUsageOutputTokens", "tokenUsageCachedTokens", "tokenUsageCacheWriteTokens", "tokenUsageTotalTokens", "tokenUsageFirstUsedAt", "tokenUsageLastUsedAt", "tokenUsageModelProvider", "tokenUsageModelId", "tokenUsagePerModel", "tokenBudgetSoftAlertedAt", "tokenBudgetHardAlertedAt", "tokenBudgetOverride",
       "createdAt", "updatedAt", "columnMovedAt", "firstExecutionAt", "cumulativeActiveMs", "cumulativePlanningMs", "planningStartedAt", "executionStartedAt", "executionCompletedAt",
       "dependencies", "steps", "customFields", "attachments", "steeringComments",
-      "comments", "review", "reviewState", "workflowStepResults", "prInfo", "prInfos", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "sourceIssueClosedAt", "mergeDetails", "workspaceWorktrees", "repositoryScope",
+      "comments", "review", "reviewState", "workflowStepResults", "prInfo", "prInfos", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "sourceIssueClosedAt", "mergeDetails", "workspaceWorktrees", "repositoryScope", "externalBlock", "planningFailure",
       "noCommitsExpected", "enabledWorkflowSteps", "modifiedFiles", "declaredSymbols",
       "missionId", "sliceId", "scopeOverride", "scopeOverrideReason", "scopeAutoWiden", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata",
@@ -195,7 +194,7 @@ export async function writeConfigImpl(store: TaskStore, config: BoardConfig, opt
     }
   }
 
-export async function _maybeAutoArchiveSameAgentDuplicateBackendImpl(store: TaskStore, task: Task, input: TaskCreateInput,): Promise<void> {
+export async function _resolveSameAgentDuplicateIntakeBackendImpl(store: TaskStore, task: Task, input: TaskCreateInput,): Promise<void> {
   // Keep the production backend as wiring only: policy lives in the shared resolver.
   return resolveSameAgentDuplicateIntake(store, task, input);
 }
@@ -263,8 +262,8 @@ export async function listTasksForGithubTrackingReconcileImpl(store: TaskStore, 
  * FNXC:GitLabTracking 2026-07-02-00:00:
  * GitLab-tracking reconcile, cloned from listTasksForGithubTrackingReconcileImpl
  * with githubTracking → gitlabTracking. Returns soft-deleted tasks carrying
- * gitlab_tracking JSONB, paginated by updatedAt ASC. Archived tasks are skipped
- * in backend mode (AsyncArchiveLineage is a separate async subsystem).
+ * gitlab_tracking JSONB, paginated by updatedAt ASC. Cold historical snapshots are
+ * outside this deletion-reconciliation scan.
  */
 export async function listTasksForGitlabTrackingReconcileImpl(store: TaskStore, options?: { offset?: number; limit?: number }): Promise<{ tasks: Task[]; hasMore: boolean }> {
     const reconcileScanLimit = 200;
@@ -382,6 +381,299 @@ export async function updateTaskAtomicImpl(store: TaskStore, id: string, updater
       return store.updateTaskUnlocked(id, updates, runContext);
     });
   }
+
+export type FencedWorkflowStepResultsPatch = Pick<
+  Task,
+  "workflowStepResults"
+  | "approvedPlanFingerprint"
+  | "reviewConvergenceStage"
+  | "reviewConvergenceEscalationCount"
+>;
+
+export type WorkflowStepResultsFencedCompute = (
+  current: Task,
+) => FencedWorkflowStepResultsPatch | null;
+
+export type WorkflowStepResultsFencedUpdateResult =
+  | { applied: true; task: Task }
+  | {
+    applied: false;
+    reason: "refused" | "no-op" | "unavailable" | "task-missing" | "task-deleted";
+  };
+
+export type ReviewRemediationPublicationPatch = Partial<Pick<
+  Task,
+  "steps" | "currentStep" | "prompt" | "log" | "postReviewFixCount"
+>>;
+
+export type ReviewRemediationPublicationCompute = (
+  current: Task,
+) => ReviewRemediationPublicationPatch | null;
+
+export type ReviewRemediationPublicationResult = WorkflowStepResultsFencedUpdateResult;
+
+export type InReviewStallObservationPatch = Partial<Pick<
+  Task,
+  "paused" | "pausedReason" | "status" | "error"
+>> & { logEntry: TaskLogEntry };
+
+export type InReviewStallObservationCompute = (
+  current: Task,
+) => InReviewStallObservationPatch | null;
+
+export type InReviewStallObservationResult = WorkflowStepResultsFencedUpdateResult;
+
+/*
+FNXC:WorkflowStepResults 2026-08-29-02:04:
+FN-249 makes durable graph step-result writes contend with resetTaskPublicationImpl's exact
+transaction-scoped task advisory lock. withTaskLock and updateTaskAtomic are in-process promise
+chains and do not order against Reset; the planning lifecycle lock is also disjoint because Reset
+never takes it. Acquire the advisory lock before reading or writing the task row, then compute the
+field-bounded patch from that in-transaction row. This primitive deliberately does not take
+withTaskWorkflowSerialization because it touches no workflow-work-item rows.
+
+The compute callback is synchronous and pure. It executes while the task lock and PostgreSQL
+transaction are open, so awaiting a store method can deadlock on the non-reentrant task lock or
+starve the connection pool. The engine supplies the abort re-check and startedAt attempt CAS in
+this closure, after Reset's transaction has either committed or released its lock.
+*/
+/*
+FNXC:InReviewStallProgress 2026-09-10-08:09:
+A stall observation and any resulting disposition are one durable decision over the live task row.
+Serialize that decision with workflow-result and remediation publishers on the project-scoped task
+advisory lock; a stale sweep may select a candidate, but it cannot overwrite a newer review episode.
+The synchronous callback performs no nested store work while the transaction owns the lock.
+*/
+export async function applyInReviewStallObservationFencedImpl(
+  store: TaskStore,
+  id: string,
+  compute: InReviewStallObservationCompute,
+): Promise<InReviewStallObservationResult> {
+  const layer = store.asyncLayer;
+  if (!layer) return { applied: false, reason: "unavailable" };
+
+  return store.withTaskLock(id, async () => {
+    const outcome = await layer.transactionImmediate(async (tx): Promise<InReviewStallObservationResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) return { applied: false, reason: "task-missing" };
+      if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const patch = compute(current);
+      if (patch === null) return { applied: false, reason: "refused" };
+      const log = [...(current.log ?? []), patch.logEntry];
+      const entryLimit = getTaskActivityLogEntryLimit();
+      if (log.length > entryLimit) log.splice(0, log.length - entryLimit);
+
+      const values: Partial<typeof schema.project.tasks.$inferInsert> = {
+        log: toJson(log),
+        updatedAt: new Date().toISOString(),
+      };
+      if (Object.prototype.hasOwnProperty.call(patch, "paused")) values.paused = patch.paused ? 1 : 0;
+      if (Object.prototype.hasOwnProperty.call(patch, "pausedReason")) values.pausedReason = patch.pausedReason ?? null;
+      if (Object.prototype.hasOwnProperty.call(patch, "status")) values.status = patch.status ?? null;
+      if (Object.prototype.hasOwnProperty.call(patch, "error")) values.error = patch.error ?? null;
+
+      const [updatedRow] = await tx.update(schema.project.tasks).set(values).where(and(
+        eq(schema.project.tasks.id, id),
+        taskProjectScope(layer),
+        isNull(schema.project.tasks.deletedAt),
+      )).returning();
+      if (!updatedRow) return { applied: false, reason: "task-missing" };
+      return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)) };
+    });
+
+    if (outcome.applied) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
+export async function updateWorkflowStepResultsFencedImpl(
+  store: TaskStore,
+  id: string,
+  compute: WorkflowStepResultsFencedCompute,
+): Promise<WorkflowStepResultsFencedUpdateResult> {
+  const layer = store.asyncLayer;
+  if (!layer) return { applied: false, reason: "unavailable" };
+
+  return store.withTaskLock(id, async () => {
+    const outcome = await layer.transactionImmediate(async (tx): Promise<WorkflowStepResultsFencedUpdateResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) return { applied: false, reason: "task-missing" };
+      if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const patch = compute(current);
+      if (patch === null) return { applied: false, reason: "refused" };
+      const patchKeys = Object.keys(patch) as Array<keyof FencedWorkflowStepResultsPatch>;
+      if (patchKeys.length === 0) return { applied: false, reason: "no-op" };
+
+      const values: {
+        workflowStepResults?: Task["workflowStepResults"];
+        approvedPlanFingerprint?: string | null;
+        reviewConvergenceStage?: number | null;
+        reviewConvergenceEscalationCount?: number | null;
+        updatedAt: string;
+      } = { updatedAt: new Date().toISOString() };
+      if (Object.prototype.hasOwnProperty.call(patch, "workflowStepResults")) {
+        values.workflowStepResults = patch.workflowStepResults ?? [];
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "approvedPlanFingerprint")) {
+        values.approvedPlanFingerprint = patch.approvedPlanFingerprint ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "reviewConvergenceStage")) {
+        values.reviewConvergenceStage = patch.reviewConvergenceStage ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "reviewConvergenceEscalationCount")) {
+        values.reviewConvergenceEscalationCount = patch.reviewConvergenceEscalationCount ?? null;
+      }
+
+      const [updatedRow] = await tx.update(schema.project.tasks).set(values).where(and(
+        eq(schema.project.tasks.id, id),
+        taskProjectScope(layer),
+        isNull(schema.project.tasks.deletedAt),
+      )).returning();
+      if (!updatedRow) return { applied: false, reason: "task-missing" };
+      return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)) };
+    });
+
+    if (outcome.applied) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
+/*
+FNXC:ReviewRemediationBudget 2026-09-08-01:02:
+Executable review-remediation work and its budget charge are one project-scoped durable fact. This
+field-bounded writer serializes every producer on the task advisory transaction lock, computes from
+the live row without nested store work, and commits steps, placement, prompt, append-only log, and
+aggregate count together. A refusal or rollback publishes none of those fields.
+*/
+export async function publishReviewRemediationFencedImpl(
+  store: TaskStore,
+  id: string,
+  compute: ReviewRemediationPublicationCompute,
+): Promise<ReviewRemediationPublicationResult> {
+  const layer = store.asyncLayer;
+  if (!layer) return { applied: false, reason: "unavailable" };
+
+  return store.withTaskLock(id, async () => {
+    const outcome = await layer.transactionImmediate(async (tx): Promise<ReviewRemediationPublicationResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) return { applied: false, reason: "task-missing" };
+      if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const patch = compute(current);
+      if (patch === null) return { applied: false, reason: "refused" };
+      if (Object.keys(patch).length === 0) return { applied: false, reason: "no-op" };
+
+      const values: {
+        steps?: Task["steps"];
+        currentStep?: number;
+        prompt?: string;
+        log?: Task["log"];
+        postReviewFixCount?: number;
+        updatedAt: string;
+      } = { updatedAt: new Date().toISOString() };
+      if (Object.prototype.hasOwnProperty.call(patch, "steps")) values.steps = patch.steps ?? [];
+      if (Object.prototype.hasOwnProperty.call(patch, "currentStep")) values.currentStep = patch.currentStep ?? 0;
+      if (Object.prototype.hasOwnProperty.call(patch, "prompt")) values.prompt = patch.prompt ?? "";
+      if (Object.prototype.hasOwnProperty.call(patch, "log")) {
+        const log = [...(patch.log ?? [])];
+        const entryLimit = getTaskActivityLogEntryLimit();
+        if (log.length > entryLimit) log.splice(0, log.length - entryLimit);
+        values.log = log;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "postReviewFixCount")) {
+        values.postReviewFixCount = patch.postReviewFixCount ?? 0;
+      }
+
+      const [updatedRow] = await tx.update(schema.project.tasks).set(values).where(and(
+        eq(schema.project.tasks.id, id),
+        taskProjectScope(layer),
+        isNull(schema.project.tasks.deletedAt),
+      )).returning();
+      if (!updatedRow) return { applied: false, reason: "task-missing" };
+      return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)) };
+    });
+
+    if (outcome.applied) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
+/**
+ * FNXC:LifecycleContainment 2026-08-30-13:36:
+ * FN-267: a review-remediation refusal has two durable effects that must not separate — the marker
+ * that stops the card being re-attempted, and the entry that explains it to an operator. Writing
+ * them through two calls leaves a cross-process window in which a newer review round replaces the
+ * result, so an overtaken engine persists both for a round it no longer owns.
+ *
+ * This is deliberately a SEPARATE primitive rather than a `log` field on
+ * {@link updateWorkflowStepResultsFencedImpl}: that writer is the workflow graph's durable
+ * step-result path, and widening it would put a high-blast-radius seam inside this change. Both
+ * take the same advisory transaction lock, so they serialize against each other across processes.
+ */
+export async function updateWorkflowStepResultsWithLogFencedImpl(
+  store: TaskStore,
+  id: string,
+  compute: (current: Task) => { workflowStepResults: Task["workflowStepResults"]; logEntry: TaskLogEntry } | null,
+): Promise<WorkflowStepResultsFencedUpdateResult> {
+  const layer = store.asyncLayer;
+  if (!layer) return { applied: false, reason: "unavailable" };
+
+  return store.withTaskLock(id, async () => {
+    const outcome = await layer.transactionImmediate(async (tx): Promise<WorkflowStepResultsFencedUpdateResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) return { applied: false, reason: "task-missing" };
+      if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const patch = compute(current);
+      if (patch === null) return { applied: false, reason: "refused" };
+
+      const log = [...(current.log ?? []), patch.logEntry];
+      const entryLimit = getTaskActivityLogEntryLimit();
+      if (log.length > entryLimit) log.splice(0, log.length - entryLimit);
+
+      const [updatedRow] = await tx.update(schema.project.tasks).set({
+        workflowStepResults: patch.workflowStepResults ?? [],
+        log,
+        updatedAt: new Date().toISOString(),
+      }).where(and(
+        eq(schema.project.tasks.id, id),
+        taskProjectScope(layer),
+        isNull(schema.project.tasks.deletedAt),
+      )).returning();
+      if (!updatedRow) return { applied: false, reason: "task-missing" };
+      return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)) };
+    });
+
+    if (outcome.applied) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
 
 /**
  * FNXC:TaskRecommendations 2026-08-08-06:52:
@@ -573,7 +865,7 @@ export async function mergeWorkspaceWorktreeEntryImpl(
       FNXC:WorkspaceWorktree 2026-08-20-07:08: Persist the prepared entry only after the authoritative
       task row passes lifecycle revalidation under the database advisory lock. A cross-process move
       that wins during filesystem preparation therefore blocks the row update instead of attaching a
-      late worktree to review, complete, or archived state.
+      late worktree to review, Complete, or a deleted/historical sentinel row.
       */
       const updatedAt = new Date().toISOString();
       const [updatedRow] = await tx
@@ -607,41 +899,19 @@ export async function mergeWorkspaceWorktreeEntryImpl(
 }
 
 /*
-FNXC:RepositoryScope 2026-08-20-23:07:
-Scope changes are a project-scoped read-modify-write under the task advisory lock. This updates only
-repository_scope, so an operator scope decision cannot overwrite concurrent per-repository acquisition
-or landing entries.
+FNXC:RepositoryScope 2026-08-29-08:50:
+FN-258 removes per-task repository selection. This engine-only replacement writer re-synchronizes
+scope from workspace.json under the existing planning and advisory locks, preserving the review fence
+only when the complete configured set is unchanged.
 */
-export type TaskRepositoryScopeMutation = {
-  action: "add" | "remove" | "refuse";
-  repositories: string[];
-  reason: string;
-  actor: string;
-};
-
 export async function updateTaskRepositoryScopeImpl(
   store: TaskStore,
   id: string,
-  requestedScope: TaskRepositoryScope | TaskRepositoryScopeMutation | undefined,
+  requestedScope: TaskRepositoryScope | undefined,
 ): Promise<Task> {
-  const configuredRepositories = (await loadWorkspaceConfig(store.getRootDir()))?.repos ?? [];
-  const isMutation = requestedScope !== undefined && "action" in requestedScope;
-  const requestedRepositories = requestedScope && "repositories" in requestedScope
-    ? requestedScope.repositories
-    : undefined;
-  const normalizedRepositories = requestedRepositories
-    ? [...new Set(requestedRepositories.map((repo) => repo.trim()).filter(Boolean))].sort()
-    : undefined;
-  if (normalizedRepositories && configuredRepositories.length > 0) {
-    const unknown = normalizedRepositories.filter((repo) => !configuredRepositories.includes(repo));
-    if (unknown.length > 0) throw new Error(`Unknown workspace repository scope: ${unknown.join(", ")}`);
-  }
-  /*
-  FNXC:RepositoryScope 2026-08-21-01:53:
-  Scope intent shares planning lifecycle serialization with plan confirmation. Acquire that lock
-  before the task/advisory transaction so a delta always merges the current scope and appends its
-  event instead of restoring a stale client snapshot over a planner or executor extension.
-  */
+  const configuredRepositories = [...new Set(((await loadWorkspaceConfig(store.getRootDir()))?.repos ?? [])
+    .map((repository) => repository.trim())
+    .filter(Boolean))].sort();
   return store.withPlanningLifecycleLock(id, () => store.withTaskLock(id, async () => {
     const layer = store.asyncLayer!;
     const outcome = await layer.transactionImmediate(async (tx) => {
@@ -659,62 +929,25 @@ export async function updateTaskRepositoryScopeImpl(
           eq(schema.project.workspaceLandIntents.status, "pending"),
         ))
         .limit(1);
-      /*
-      FNXC:RepositoryScope 2026-08-21-00:12:
-      Repository intent becomes immutable once a land intent is pending or any repository has
-      landed. This transaction-level fence prevents an already-acquired clean checkout from
-      changing review or landing obligations after integration begins.
-      */
-      const now = new Date().toISOString();
       const currentRepositories = current.repositoryScope?.repositories ?? [];
-      const mutation = isMutation ? requestedScope as TaskRepositoryScopeMutation : undefined;
-      const nextRepositories = mutation?.action === "add"
-        ? [...new Set([...currentRepositories, ...normalizedRepositories!])].sort()
-        : mutation
-          ? currentRepositories.filter((repository) => !normalizedRepositories!.includes(repository))
-          : normalizedRepositories;
-      const repositoriesChanged = JSON.stringify([...currentRepositories].sort()) !== JSON.stringify(nextRepositories ?? []);
+      const repositoriesChanged = JSON.stringify([...currentRepositories].sort())
+        !== JSON.stringify(configuredRepositories);
       if ((pendingIntent || hasLandedRepository) && repositoriesChanged) {
         throw new Error(`Repository scope for ${id} cannot change after workspace landing has started`);
       }
-      const priorExtensions = current.repositoryScope?.extensions ?? [];
-      const mutationEvents = mutation
-        ? normalizedRepositories!.map((repository) => ({
-            repository,
-            requestedAt: now,
-            requestedBy: mutation.actor,
-            reason: mutation.reason,
-            status: mutation.action === "refuse" ? "refused" as const : "accepted" as const,
-            ...(mutation.action === "refuse" ? { refusedAt: now, refusedBy: mutation.actor, refusalReason: mutation.reason } : {}),
-          }))
-        : [];
-      const replacement = isMutation
-        ? {
-            ...(current.repositoryScope ?? {}),
-            repositories: nextRepositories ?? [],
+      const replacement = configuredRepositories.length === 0
+        ? undefined
+        : {
+            ...requestedScope,
+            repositories: configuredRepositories,
             state: "confirmed" as const,
-            confirmedAt: now,
-            confirmedBy: mutation!.actor === "operator" ? "operator" as const : current.repositoryScope?.confirmedBy,
-            extensions: [...priorExtensions, ...mutationEvents],
-          }
-        : requestedScope;
-      /*
-      FNXC:RepositoryScope 2026-08-21-02:48:
-      A repository-scope mutation invalidates the prior review episode. Never carry approval
-      evidence or a remediation target into a new revision: landing may only accept fingerprints
-      reviewed against the current confirmed repository set, and remediation must re-evaluate it.
-      */
+            confirmedBy: "workspace" as const,
+            confirmedAt: current.repositoryScope?.confirmedAt ?? new Date().toISOString(),
+          };
       const stateChanged = (current.repositoryScope?.state ?? "proposed") !== (replacement?.state ?? "proposed");
       const scopeChanged = repositoriesChanged || stateChanged;
-      /*
-      FNXC:RepositoryScope 2026-08-21-19:25:
-      FN-120 treats repository intent as a semantic set plus confirmation state. Republishing the
-      same normalized confirmed set must not churn its generation or erase a current approval;
-      only a real intent/state transition creates a new review episode.
-      */
-      const normalized = nextRepositories && replacement && {
+      const normalized = replacement && {
         ...replacement,
-        repositories: nextRepositories,
         revision: scopeChanged
           ? Math.max((current.repositoryScope?.revision ?? 0) + 1, replacement.revision ?? 0)
           : (current.repositoryScope?.revision ?? replacement.revision ?? 1),
@@ -776,6 +1009,71 @@ export async function updateWorkspaceReviewStateImpl(
       return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), updated: true };
     });
     if (outcome.updated) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
+export type PublishWorkspaceCodeReviewEvidenceInput = {
+  expectedScopeRevision: number;
+  reviewEvidence: NonNullable<TaskRepositoryScope["reviewEvidence"]>;
+  clearReviewRemediation: boolean;
+  modifiedFiles?: Task["modifiedFiles"];
+};
+
+export type PublishWorkspaceCodeReviewEvidenceResult = {
+  task: Task;
+  published: boolean;
+  reason?: "scope-superseded" | "scope-absent";
+};
+
+/*
+FNXC:WorkspaceReviewEvidence 2026-08-29-12:11:
+FN-259 requires workspace Code Review approval evidence to bypass updateTask. FN-258 deliberately
+removed repositoryScope from that generic path, so updateTaskAtomic silently discarded a valid
+approval while persisting only its modified-files companion. This writer commits both values through
+one project-scoped, revision-fenced transaction before publishing the normal task projection.
+*/
+export async function publishWorkspaceCodeReviewEvidenceImpl(
+  store: TaskStore,
+  id: string,
+  input: PublishWorkspaceCodeReviewEvidenceInput,
+): Promise<PublishWorkspaceCodeReviewEvidenceResult> {
+  return store.withTaskLock(id, async () => {
+    const layer = store.asyncLayer!;
+    const outcome = await layer.transactionImmediate(async (tx): Promise<PublishWorkspaceCodeReviewEvidenceResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) throw new TaskNotFoundError(id);
+      if (row.deletedAt) throw new TaskDeletedError(id, row.deletedAt as string);
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const currentScope = current.repositoryScope;
+      if (!currentScope) return { task: current, published: false, reason: "scope-absent" };
+      if (currentScope.revision !== input.expectedScopeRevision) {
+        return { task: current, published: false, reason: "scope-superseded" };
+      }
+
+      const repositoryScope: TaskRepositoryScope = {
+        ...currentScope,
+        reviewEvidence: input.reviewEvidence,
+        ...(input.clearReviewRemediation && currentScope.reviewRemediation?.scopeRevision === input.expectedScopeRevision
+          ? { reviewRemediation: undefined }
+          : {}),
+      };
+      const [updatedRow] = await tx.update(schema.project.tasks).set({
+        repositoryScope,
+        ...(input.modifiedFiles !== undefined ? { modifiedFiles: input.modifiedFiles } : {}),
+        updatedAt: new Date().toISOString(),
+      }).where(and(eq(schema.project.tasks.id, id), taskProjectScope(layer))).returning();
+      if (!updatedRow) throw new TaskNotFoundError(id);
+      return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), published: true };
+    });
+
+    if (outcome.published) {
       await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
@@ -1388,7 +1686,7 @@ export async function registerArtifactImpl(store: TaskStore, input: ArtifactCrea
         FNXC:SqliteDualPathCleanup 2026-07-26-14:07:
         Artifact row insert is PostgreSQL-only via insertArtifactRowAsync.
         */
-        return insertArtifactRowAsync(store.asyncLayer!, input, stored, await resolveArchivedLanes(store));
+        return insertArtifactRowAsync(store.asyncLayer!, input, stored, ARCHIVED_SENTINEL_LANES);
       } catch (error) {
         if (stored.absolutePath) {
           await unlink(stored.absolutePath).catch(() => undefined);
@@ -1472,77 +1770,6 @@ export async function unlinkGithubIssueImpl(store: TaskStore, id: string): Promi
       return task;
     });
   }
-
-export async function cleanupArchivedTasksImpl(store: TaskStore): Promise<string[]> {
-    /*
-    FNXC:PostgresOnlyDataAccess 2026-07-17-15:10:
-    Backend-mode port. `cleanupArchivedTasks` is the hard-removal path for tasks
-    already in the `archived` column (the CLI documents it as such): it snapshots
-    each to cold storage, hard-deletes the live project row, and removes the task
-    directory. In PostgreSQL, archived rows are soft-deleted (`deleted_at` set), so
-    enumeration MUST pass `includeDeleted`. The cold snapshot upsert is idempotent
-    (archive already holds it from archive time); the project-row DELETE fires the
-    ON DELETE CASCADE that purges the task's documents/artifacts, matching the
-    SQLite path's dir removal. Selection rows are purged via the async helper.
-    */
-        const layer = store.asyncLayer!;
-    /*
-    FNXC:PostgresOnlyDataAccess 2026-07-17-17:40:
-    Enumerate the archived rows with an EXPLICIT project predicate. `listTasks()`
-    derives its scope from `taskProjectScope(layer)`, which is a NO-OP when the
-    layer is unbound (projectId absent) — i.e. it would read archived rows across
-    every project, and this destructive sweep (snapshot + dir removal + cache
-    evict) would then touch tasks it must never own. Scoping the read here to the
-    same `projectId` the DELETE below uses keeps enumerate+delete lockstep: a bound
-    store sees only its project, an unbound store only the `__legacy_unscoped__`
-    quarantine partition.
-    */
-    const projectId = layer.projectId?.trim() || "__legacy_unscoped__";
-    /*
-    FNXC:WorkflowResolvedColumns 2026-07-31-23:59 DELIBERATE-LITERAL — STATE MARKER, DO NOT RESOLVE:
-    `"archived"` here is the marker `archiveTask` WROTE, not a board lane. This sweep enumerates rows
-    Fusion itself archived and then REMOVES THEIR DIRECTORIES (`rm` below). Widening it to the
-    resolved archived-lane set would feed cards merely RESTING in a board's archived-trait lane into
-    a filesystem delete — live work, destroyed.
-
-    Marked at the site because the classification previously lived only in
-    `archived-column-gate-parity.test.ts`, and a coordinated three-encoding conversion edits THIS
-    file. A converter working file-by-file would see the same `eq(column, "archived")` shape as the
-    six LANE sites and have nothing here telling them apart.
-
-    The sibling STATE site is `async-self-healing.ts`'s soft-deleted column-drift query; the LANE/
-    STATE split for all eight Drizzle sites is recorded in that parity test.
-    */
-    const archivedRows = await layer.db
-      .select()
-      .from(schema.project.tasks)
-      .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.column, "archived")));
-    const cleanedUpIds: string[] = [];
-    const { rm } = await import("node:fs/promises");
-
-    for (const row of archivedRows) {
-      const task = store.rowToTask(store.pgRowToTaskRow(row));
-      const dir = store.taskDir(task.id);
-      // Guarantee a cold-storage snapshot before the destructive delete.
-      const entry = await store.taskToArchiveEntry(task, task.deletedAt ?? new Date().toISOString());
-      await upsertArchivedTaskEntry(layer.db, entry, layer.projectId);
-
-      await purgeTaskWorkflowSelectionRowsAsyncImpl(store, task.id);
-      await layer.db
-        .delete(schema.project.tasks)
-        .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.id, task.id)));
-
-      if (existsSync(dir)) {
-        await rm(dir, { recursive: true, force: true });
-      }
-      if (store.isWatching) {
-        store.taskCache.delete(task.id);
-      }
-      cleanedUpIds.push(task.id);
-    }
-
-    return cleanedUpIds;
-}
 
 export function generatePromptFromArchiveEntryImpl(store: TaskStore, entry: import("../types.js").ArchivedTaskEntry): string {
     const deps =
@@ -1657,10 +1884,6 @@ export async function closeImpl(store: TaskStore): Promise<void> {
       store._db.close();
       store._db = null;
       store.taskIdStateReconciled = false;
-    }
-    if (store._archiveDb) {
-      store._archiveDb.close();
-      store._archiveDb = null;
     }
     if (store.secretsCentralCore) {
       /**

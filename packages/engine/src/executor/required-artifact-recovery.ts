@@ -1,11 +1,10 @@
 /**
  * FNXC:CodeOrganization 2026-08-03-21:35:
  * recoverMissingRequiredArtifacts peeled from TaskExecutor (U4).
- * Bounded replan recovery when required workflow artifacts are missing.
+ * In-place execution recovery when required workflow artifacts are missing.
  */
 import type { Task, TaskStore } from "@fusion/core";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
-import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "../execution/replan-target.js";
 import { generateSyntheticRunId, type EngineRunContext } from "../util/run-audit.js";
 import { emitBoundedRunAudit } from "./emit-bounded-run-audit.js";
 import { resolveTerminalColumnsFor } from "./lifecycle-columns.js";
@@ -20,15 +19,10 @@ export type RequiredArtifactRecoveryDeps = {
 /**
  * FNXC:WorkflowLifecycleColumns 2026-07-30-21:40 (fleet: made ASYNC to own its resolution):
  * This predicate protects a card from artifact-recovery replanning, and three of its conditions are
- * lifecycle columns: the terminal pair, and a review row whose auto-merge is off (a human owns it). As
- * literals they all read false on a renamed board — so a FINISHED card, or a review row a human was
- * holding, could be moved to the replan column and have its status rewritten to needs-replan.
- *
- * ASYNC rather than lane parameters: all four callers already `await store.getTask` immediately before
- * calling this, so there is no new I/O ordering, and a parameter list would put the resolution in four
- * places that must agree. The archived half is why the SYNC planner-lane resolver was not an option — it
- * exposes no archived lane — and widening a shared resolver from inside a call-site sweep is scope creep
- * that makes a conversion unreviewable.
+ * lifecycle columns: Complete, and a review row whose auto-merge is off (a human owns it). As literals
+ * they read false on a renamed board, so finished or human-held work could be moved backward to replan.
+ * Resolution stays async and centralized because every caller already performs a task read before this
+ * check, while a lane parameter would duplicate policy across four call sites.
  */
 export async function isRequiredArtifactRecoveryProtected(
   store: TaskStore,
@@ -62,7 +56,7 @@ export async function recoverMissingRequiredArtifacts(
   });
   const attempt = decision.nextState.recoveryRetryCount ?? MAX_RECOVERY_RETRIES;
   const context = deps.getRunContextFor(task.id);
-  const action = decision.shouldRetry ? "replan" : "park-failed";
+  const action = decision.shouldRetry ? "retry-in-place" : "park-failed";
 
   await emitBoundedRunAudit(deps.store, {
     taskId: task.id,
@@ -74,7 +68,7 @@ export async function recoverMissingRequiredArtifacts(
     metadata: {
       taskId: task.id,
       artifactKeys,
-      owner: "planning",
+      owner: "execution",
       source: source.source,
       action,
       attempt,
@@ -97,23 +91,16 @@ export async function recoverMissingRequiredArtifacts(
     return;
   }
 
-  const replanColumn = await resolveReplanTargetColumn(deps.store, task.id);
   await deps.store.logEntry(
     task.id,
-    `Required workflow artifact missing — moved to ${replanColumn} for automatic planning recovery (attempt ${attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)})`,
+    `Required workflow artifact missing — retrying repair in ${task.column} (attempt ${attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)})`,
     `Missing artifact keys: ${artifactKeys.join(", ")}`,
     context,
   );
-  deps.workflowLifecycleMovesInFlight.add(task.id);
-  try {
-    const liveTask = await deps.store.getTask(task.id).catch(() => null);
-    if (!liveTask || await deps.isRequiredArtifactRecoveryProtected(liveTask)) return;
-    await moveTaskToReplanColumn(deps.store, { id: task.id, column: liveTask.column }, replanColumn);
-  } finally {
-    deps.workflowLifecycleMovesInFlight.delete(task.id);
-  }
+  const liveTask = await deps.store.getTask(task.id).catch(() => null);
+  if (!liveTask || await deps.isRequiredArtifactRecoveryProtected(liveTask)) return;
   await deps.store.updateTask(task.id, {
-    status: "needs-replan",
+    status: null,
     error: null,
     recoveryRetryCount: decision.nextState.recoveryRetryCount,
     nextRecoveryAt: decision.nextState.nextRecoveryAt,

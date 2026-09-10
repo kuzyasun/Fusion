@@ -25,7 +25,6 @@ const defaultSettings: Settings = {
   pollIntervalMs: 15000,
   groupOverlappingFiles: false,
   autoMerge: true,
-  recycleWorktrees: false,
   worktreeInitCommand: "",
   testCommand: "",
   buildCommand: "",
@@ -74,9 +73,6 @@ const mockUseTasks = vi.fn(() => ({
   retryTask: vi.fn(),
   updateTask: vi.fn(),
   duplicateTask: vi.fn(),
-  archiveTask: vi.fn(),
-  unarchiveTask: vi.fn(),
-  archiveAllDone: vi.fn(),
   refreshTasks: vi.fn(),
 }));
 /*
@@ -308,9 +304,6 @@ describe("Board main-panel task-detail — mobile transition class gating (MainC
       retryTask: vi.fn(),
       updateTask: vi.fn(),
       duplicateTask: vi.fn(),
-      archiveTask: vi.fn(),
-      unarchiveTask: vi.fn(),
-      archiveAllDone: vi.fn(),
       refreshTasks: vi.fn(),
     }));
 
@@ -335,9 +328,6 @@ describe("Board main-panel task-detail — mobile transition class gating (MainC
       retryTask: vi.fn(),
       updateTask: vi.fn(),
       duplicateTask: vi.fn(),
-      archiveTask: vi.fn(),
-      unarchiveTask: vi.fn(),
-      archiveAllDone: vi.fn(),
       refreshTasks: vi.fn(),
     }));
 

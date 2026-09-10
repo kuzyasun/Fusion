@@ -1,6 +1,6 @@
 /**
  * FNXC:CodeOrganization 2026-07-16-12:00:
- * Task lifecycle client API (promote/delete/merge/pause/archive/plan) peeled from legacy.ts.
+ * Task lifecycle client API (promote/delete/merge/pause/plan) peeled from legacy.ts.
  */
 import type {
   Task,
@@ -12,21 +12,20 @@ import type {
 } from "@fusion/core";
 import { api } from "../client/client.js";
 import { withProjectId } from "../client/health.js";
-import type { DeleteTaskOptions, ArchiveTaskOptions } from "./tasks.js";
+import type { DeleteTaskOptions } from "./tasks.js";
 
 /**
  * Manually promote a held card out of its hold column (U9).
  *
- * FNXC:WorkflowScheduling 2026-07-25-04:55:
- * `force` waives the `unplanned-for-execution` gate (pending replan / pre-release
- * Plan Review) and starts execution anyway. It is only ever sent after the
- * operator confirms the override dialog the plain promote's rejection raises;
- * capacity is still enforced server-side, so a forced promote can still reject.
+ * FNXC:WorkflowScheduling 2026-08-29-00:24:
+ * FN-245 removes the browser client's force option. Every promote request is a
+ * normal release attempt, so an unplanned or approval-held card remains held
+ * until its planning gates genuinely complete.
  */
-export function promoteTask(id: string, projectId?: string, options?: { force?: boolean }): Promise<Task> {
+export function promoteTask(id: string, projectId?: string): Promise<Task> {
   return api<Task>(withProjectId(`/tasks/${id}/promote`, projectId), {
     method: "POST",
-    body: JSON.stringify({ force: options?.force === true }),
+    body: JSON.stringify({}),
   });
 }
 
@@ -37,7 +36,7 @@ export function promoteTask(id: string, projectId?: string, options?: { force?: 
  * `removeDependencyReferences` allows forced delete by first removing incoming dependency links.
  * `githubIssueAction` controls linked issue behavior (`close`, `delete`, or `leave`) during deletion.
  *
- * Hard removal is handled only by the archive-cleanup pipeline (after archival), not this endpoint.
+ * This endpoint never hard-removes the persisted row or task artifacts.
  */
 export function deleteTask(id: string, projectId?: string, options?: DeleteTaskOptions): Promise<Task> {
   const search = new URLSearchParams();
@@ -168,16 +167,39 @@ export function recoverBranchBinding(id: string, projectId?: string): Promise<Re
   return api<RecoverBranchBindingOutcome>(withProjectId(`/tasks/${id}/recover-branch-binding`, projectId), { method: "POST" });
 }
 
-export function resetTask(id: string, projectId?: string): Promise<Task> {
+export interface TaskResetOptions {
+  description?: string;
+}
+
+/*
+FNXC:TaskReset 2026-08-28-16:31:
+Reset deliberately uses the same options-second, projectId-last contract as duplicateTask and every host prop. The hook alone owns projectId; placing an options object in that slot would let withProjectId silently encode it as `[object Object]` while dropping the description from the request body.
+*/
+export function resetTask(
+  id: string,
+  options?: TaskResetOptions,
+  projectId?: string,
+): Promise<Task> {
+  const description = options?.description;
   return api<Task>(withProjectId(`/tasks/${id}/reset`, projectId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirm: true }),
+    body: JSON.stringify(description === undefined ? { confirm: true } : { confirm: true, description }),
   });
 }
 
-export function duplicateTask(id: string, projectId?: string): Promise<Task> {
-  return api<Task>(withProjectId(`/tasks/${id}/duplicate`, projectId), { method: "POST" });
+export function duplicateTask(
+  id: string,
+  options?: { workflowId?: string },
+  projectId?: string,
+): Promise<Task> {
+  const workflowId = options?.workflowId;
+  return api<Task>(withProjectId(`/tasks/${id}/duplicate`, projectId), {
+    method: "POST",
+    ...(workflowId
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workflowId }) }
+      : {}),
+  });
 }
 
 export function pauseTask(id: string, projectId?: string): Promise<Task> {
@@ -230,20 +252,6 @@ export function fetchPlannerInterventionTimeline(id: string, projectId?: string)
   return api<{ entries: PlannerInterventionEntry[] }>(withProjectId(`/tasks/${id}/overseer/interventions`, projectId), { method: "GET" });
 }
 
-export function archiveTask(id: string, projectId?: string, options?: ArchiveTaskOptions): Promise<Task> {
-  const search = new URLSearchParams();
-  if (options?.removeLineageReferences) {
-    search.set("removeLineageReferences", "true");
-  }
-
-  const suffix = search.size > 0 ? `?${search.toString()}` : "";
-  return api<Task>(withProjectId(`/tasks/${id}/archive${suffix}`, projectId), { method: "POST" });
-}
-
-export function unarchiveTask(id: string, projectId?: string): Promise<Task> {
-  return api<Task>(withProjectId(`/tasks/${id}/unarchive`, projectId), { method: "POST" });
-}
-
 /*
 FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
 Client-side contract for `POST /tasks/:id/revert` (route owned by FN-7523/
@@ -293,22 +301,6 @@ export function revertTask(id: string, projectId?: string, body?: RevertTaskOpti
     method: "POST",
     body: JSON.stringify(body ?? {}),
   });
-}
-
-export function archiveAllDone(projectId?: string): Promise<Task[]> {
-  /*
-  FNXC:ArchiveConfirmGate 2026-07-26-16:30:
-  The bulk archive route now requires an explicit `{ confirm: true }` body (400 without
-  it) so non-UI callers cannot silently sweep the Done column. The UI's own user-facing
-  confirmation happens before this client call; this body is the machine-level ack.
-  */
-  return api<{ archived: Task[] }>(withProjectId("/tasks/archive-all-done", projectId), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirm: true }),
-  }).then(
-    (response) => response.archived
-  );
 }
 
 export function approvePlan(id: string, projectId?: string): Promise<Task> {

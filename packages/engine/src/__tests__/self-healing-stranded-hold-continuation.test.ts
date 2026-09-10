@@ -17,7 +17,7 @@ vi.mock("../util/run-audit.js", async (importOriginal) => ({
   createRunAuditor: vi.fn(() => ({ database: recordRunAuditEventMock })),
 }));
 
-import { SelfHealingManager } from "../self-healing.js";
+import { SelfHealingManager, type SelfHealingOptions } from "../self-healing.js";
 import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
 import { WorkflowGraphExecutor } from "../workflows/workflow-graph-executor.js";
 import { evaluateStrandedHoldContinuation } from "../plan-review-continuation.js";
@@ -86,6 +86,25 @@ describe("FN-8592 stranded hold continuation recovery", () => {
     await writeFile(join(dir, "PROMPT.md"), text);
   }
 
+  it("defers re-seeding while planning owns the card, then recovers after release", async () => {
+    const task = strandedTask();
+    const store = storeFor(task);
+    store.getTasksDir.mockReturnValue(root);
+    await writePrompt(task.id);
+    const planningIds = new Set([task.id]);
+    const manager = new SelfHealingManager(store, {
+      rootDir: root,
+      getPlanningTaskIds: () => planningIds,
+    } as SelfHealingOptions);
+
+    await expect(manager.reconcileStrandedHoldContinuations()).resolves.toBe(0);
+    expect(store.seedStrandedPlanReviewContinuation).not.toHaveBeenCalled();
+
+    planningIds.clear();
+    await expect(manager.reconcileStrandedHoldContinuations()).resolves.toBe(1);
+    expect(store.seedStrandedPlanReviewContinuation).toHaveBeenCalledOnce();
+  });
+
   it("re-seeds a real-spec hold card and records ids-only recovery metadata", async () => {
     const task = strandedTask();
     const store = storeFor(task);
@@ -127,6 +146,24 @@ describe("FN-8592 stranded hold continuation recovery", () => {
       graceMs: 60_000,
       now: Date.now(),
     })).toMatchObject({ stranded: false, candidate: false, reason: "planning-recovery-owned" });
+  });
+
+  it("treats a Fast hold card as a non-candidate for Plan Review reseeding", () => {
+    const task = strandedTask({ executionMode: "fast" });
+
+    expect(evaluateStrandedHoldContinuation({
+      task,
+      columnFlags: { hold: true },
+      ir: workflow,
+      continuations: [],
+      stepResults: [],
+      effectiveSettings: {},
+      enginePaused: false,
+      promptContent: "# FN-8592-test: Real specification\n\nA Fast request",
+      live: false,
+      stalenessMs: 120_000,
+      graceMs: 60_000,
+    })).toMatchObject({ stranded: false, candidate: false, reason: "fast-lane" });
   });
 
   it("keeps ordinary null-status continuation recovery outside the conservative legacy shape", () => {

@@ -11,7 +11,10 @@ import { clearAuthToken } from "../../auth";
 
 const taskDetailSseSubscriptions = vi.hoisted(() => [] as Array<{
   url: string;
-  options: { events?: Record<string, (event: MessageEvent) => void> };
+  options: {
+    events?: Record<string, (event: MessageEvent) => void>;
+    onReconnect?: () => void;
+  };
 }>);
 
 export { taskDetailSseSubscriptions };
@@ -39,7 +42,10 @@ export function expectSingleStatsRuntimeStatus(status: string): void {
 }
 
 vi.mock("../../sse-bus", () => ({
-  subscribeSse: vi.fn((url: string, options: { events?: Record<string, (event: MessageEvent) => void> }) => {
+  subscribeSse: vi.fn((url: string, options: {
+    events?: Record<string, (event: MessageEvent) => void>;
+    onReconnect?: () => void;
+  }) => {
     taskDetailSseSubscriptions.push({ url, options });
     return vi.fn();
   }),
@@ -128,6 +134,7 @@ vi.mock("lucide-react", () => ({
   X: () => null,
   Maximize2: () => null,
   Minimize2: () => null,
+  WrapText: () => null,
   Loader2: (props: any) => React.createElement("svg", { "data-testid": "loader2-icon", ...props }),
   /*
   FNXC:TaskDetailTabPersistence 2026-07-20-19:10:
@@ -149,6 +156,8 @@ vi.mock("lucide-react", () => ({
   GitBranch: () => null,
   Gitlab: () => null,
   AlertTriangle: () => null,
+  AlertCircle: () => null,
+  FileCode: () => null,
   Play: () => null,
   Flag: () => null,
   ArrowDown: () => null,
@@ -232,12 +241,14 @@ vi.mock("../../hooks/usePluginUiSlots", () => ({
 export const mockConfirm = vi.fn();
 export const mockConfirmWithChoice = vi.fn();
 export const mockConfirmWithCheckbox = vi.fn();
+export const mockConfirmWithSelect = vi.fn();
 
 vi.mock("../../hooks/useConfirm", () => ({
   useConfirm: () => ({
     confirm: mockConfirm,
     confirmWithChoice: mockConfirmWithChoice,
     confirmWithCheckbox: mockConfirmWithCheckbox,
+    confirmWithSelect: mockConfirmWithSelect,
   }),
 }));
 
@@ -298,6 +309,20 @@ export const noopMerge = vi.fn(async () => ({ merged: false }) as MergeResult);
 export const noopRetry = vi.fn(async () => ({}) as Task);
 export const noopOpenDetail = vi.fn();
 
+export async function openTaskDetailActionsMenu(): Promise<HTMLElement> {
+  const trigger = await screen.findByRole("button", { name: "Actions" });
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+  }
+  await waitFor(() => expect(document.querySelector(".detail-actions-menu")).toBeInTheDocument());
+  return document.querySelector<HTMLElement>(".detail-actions-menu")!;
+}
+
+export async function findTaskDetailActionByTestId(testId: string): Promise<HTMLElement> {
+  const menu = await openTaskDetailActionsMenu();
+  return within(menu).findByTestId(testId);
+}
+
 export function getCssRuleBlock(css: string, selector: string): string {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const ruleMatch = css.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`));
@@ -329,9 +354,11 @@ export function setupTaskDetailModalHooks(): void {
     mockConfirm.mockReset();
     mockConfirmWithChoice.mockReset();
     mockConfirmWithCheckbox.mockReset();
+    mockConfirmWithSelect.mockReset();
     mockConfirm.mockResolvedValue(true);
     mockConfirmWithChoice.mockResolvedValue("primary");
     mockConfirmWithCheckbox.mockResolvedValue({ choice: "primary", checkboxValue: false });
+    mockConfirmWithSelect.mockResolvedValue({ choice: "primary", checkboxValue: false });
     clearAuthToken();
     localStorage.removeItem("fn.authToken");
     taskDetailSseSubscriptions.length = 0;

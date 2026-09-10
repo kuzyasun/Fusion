@@ -62,6 +62,7 @@ export {
   clearPauseAbortStateForManualRetry as clearPauseAbortStateForManualRetryImpl,
 } from "./stale-pause-abort.js";
 export { blockOuterDispatchWhenDependenciesUnmet as blockOuterDispatchWhenDependenciesUnmetImpl } from "./dependency-dispatch-gate.js";
+export { blockOuterDispatchWhenFileScopeLeaseHeld as blockOuterDispatchWhenFileScopeLeaseHeldImpl } from "./file-scope-lease-dispatch-gate.js";
 export { finalizeMergeConfirmedWorkflowGraphTask as finalizeMergeConfirmedWorkflowGraphTaskImpl } from "./merge-confirmed-finalize.js";
 export { holdForSessionContention as holdForSessionContentionImpl } from "./session-contention-hold.js";
 export {
@@ -89,6 +90,7 @@ export {
 } from "./persist-token-usage.js";
 export { resetMergeStateIfNeeded as resetMergeStateIfNeededImpl } from "./reset-merge-state.js";
 export { recoverFailedPreMergeWorkflowStep as recoverFailedPreMergeWorkflowStepImpl } from "./recover-failed-pre-merge-step.js";
+export { recoverFailedPreMergeWorkflowStepDetailed as recoverFailedPreMergeWorkflowStepDetailedImpl } from "./recover-failed-pre-merge-step.js";
 export { reconcileStepsFromGitHistory as reconcileStepsFromGitHistoryImpl } from "./reconcile-steps-from-git-history.js";
 export { clearPhantomExecutorBinding as clearPhantomExecutorBindingImpl } from "./clear-phantom-executor-binding.js";
 export { cleanupMergeStateForReverification as cleanupMergeStateForReverificationImpl } from "./cleanup-merge-state.js";
@@ -117,7 +119,10 @@ export { resumeOrphaned as resumeOrphanedImpl } from "./resume-orphaned.js";
 export { handleLoopDetected as handleLoopDetectedImpl } from "./handle-loop-detected.js";
 export { recoverCompletedTask as recoverCompletedTaskImpl } from "./recover-completed-task.js";
 export { markStuckAborted as markStuckAbortedImpl } from "./mark-stuck-aborted.js";
-export { awaitAbortInFlightTaskWork as awaitAbortInFlightTaskWorkImpl } from "./await-abort-in-flight.js";
+export {
+  awaitAbortInFlightTaskWork as awaitAbortInFlightTaskWorkImpl,
+  prepareAbortInFlightTaskWork as prepareAbortInFlightTaskWorkImpl,
+} from "./await-abort-in-flight.js";
 export { abortAllInFlight as abortAllInFlightImpl } from "./abort-all-in-flight.js";
 export { maybeDispatchWorkflowWorkEngine as maybeDispatchWorkflowWorkEngineImpl } from "./maybe-dispatch-workflow-work-engine.js";
 export { executeCore as executeCoreImpl } from "./execute-core.js";
@@ -207,7 +212,6 @@ export { acquireSessionRegistryPath as acquireSessionRegistryPathImpl } from "./
 export { shouldDeferCompletionForGlobalPause as shouldDeferCompletionForGlobalPauseImpl } from "./should-defer-completion-for-global-pause.js";
 export { parkApprovalSuspension as parkApprovalSuspensionImpl } from "./park-approval-suspension.js";
 export { resumeApprovalAfterUnwindIfNeeded as resumeApprovalAfterUnwindIfNeededImpl } from "./resume-approval-after-unwind.js";
-export { ensureTaskWorktreeForPlanning as ensureTaskWorktreeForPlanningImpl } from "./ensure-task-worktree-for-planning.js";
 export { foreachActiveForTask as foreachActiveForTaskImpl } from "./foreach-active-for-task.js";
 export { buildBranchPersistence as buildBranchPersistenceImpl } from "./build-branch-persistence.js";
 export { sessionRegistryPath as sessionRegistryPathImpl } from "./session-registry-path.js";

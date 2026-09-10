@@ -26,7 +26,6 @@ const facts = (columnId: string, flags: TraitFlags): TransitionColumnFacts => ({
 const WIP: TraitFlags = { countsTowardWip: true };
 const HOLD: TraitFlags = { hold: true };
 const COMPLETE: TraitFlags = { complete: true };
-const ARCHIVED: TraitFlags = { archived: true };
 const HUMAN_REVIEW: TraitFlags = { humanReview: true, mergeBlocker: true };
 
 describe("workflow-transition-policy — merge-blocker on complete-bound entry", () => {
@@ -78,16 +77,6 @@ describe("workflow-transition-policy — terminal → wip re-entry", () => {
     expect(rejection?.retryable).toBe(false);
   });
 
-  it("rejects moving an archived card into a wip column", () => {
-    expect(
-      evaluateTerminalReentryPostcondition({
-        taskId: "T2",
-        from: facts("archived", ARCHIVED),
-        to: facts("in-progress", WIP),
-        mergeBlockerReason: null,
-      })?.code,
-    ).toBe("guard-rejected");
-  });
 
   it("allows a completed card to reopen into a hold column", () => {
     expect(
@@ -156,6 +145,46 @@ describe("workflow-transition-policy — combined invariants + classification", 
     ).toBe(true);
   });
 
+  it.each(["engine", "scheduler"] as const)(
+    "allows the %s review-to-complete advance when the merge blocker is clear",
+    (moveSource) => {
+      expect(evaluateTransitionInvariants({
+        taskId: "FN-221",
+        from: facts("in-review", HUMAN_REVIEW),
+        to: facts("done", COMPLETE),
+        mergeBlockerReason: null,
+        moveSource,
+      })).toEqual({ allow: true });
+    },
+  );
+
+  it("keeps the merge blocker authoritative on the automated review-to-complete boundary", () => {
+    const decision = evaluateTransitionInvariants({
+      taskId: "FN-221",
+      from: facts("in-review", HUMAN_REVIEW),
+      to: facts("done", COMPLETE),
+      mergeBlockerReason: "required review is still pending",
+      moveSource: "engine",
+    });
+
+    expect(decision.allow).toBe(false);
+    if (!decision.allow) expect(decision.rejection.code).toBe("merge-blocked");
+  });
+
+
+  it.each([undefined, "user"] as const)(
+    "preserves the fail-open operator review-to-complete route for moveSource=%s",
+    (moveSource) => {
+      expect(evaluateTransitionInvariants({
+        taskId: "FN-221",
+        from: facts("in-review", HUMAN_REVIEW),
+        to: facts("done", COMPLETE),
+        mergeBlockerReason: null,
+        moveSource,
+      })).toEqual({ allow: true });
+    },
+  );
+
   it("yields byte-identical rejections for identical facts (scenario 7: same verdict for every mover)", () => {
     const input = {
       taskId: "T4",
@@ -172,7 +201,6 @@ describe("workflow-transition-policy — combined invariants + classification", 
   it("classifies wip / terminal columns and the hold→wip seam (KTD-2)", () => {
     expect(isWipColumn(WIP)).toBe(true);
     expect(isTerminalColumn(COMPLETE)).toBe(true);
-    expect(isTerminalColumn(ARCHIVED)).toBe(true);
     expect(isHoldToWipBoundary(HOLD, WIP)).toBe(true);
     expect(isHoldToWipBoundary(WIP, WIP)).toBe(false);
     expect(isHoldToWipBoundary(HOLD, HUMAN_REVIEW)).toBe(false);

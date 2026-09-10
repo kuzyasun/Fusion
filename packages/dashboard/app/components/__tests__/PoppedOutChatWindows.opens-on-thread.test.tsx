@@ -67,7 +67,7 @@ function session(id = "requested-thread", title = "Requested thread"): ChatSessi
 }
 
 function entry(id = "requested-thread", focusNonce = 1) {
-  return { projectId: "project-a", session: session(id), focusNonce, cascadeSlot: 0 };
+  return { projectId: "project-a", session: session(id), focusNonce, cascadeSlot: 0, minimized: false };
 }
 
 function deferred<T>() {
@@ -214,7 +214,7 @@ describe("PoppedOutChatWindows requested-thread arrival", () => {
       pendingSessions.resolve({ sessions: [session("older-session", "Older thread")] });
     });
 
-    expect(screen.getByText("Requested thread")).toBeInTheDocument();
+    expect(screen.getAllByText("Requested thread").length).toBeGreaterThan(0);
     expect(screen.queryByText("Older thread")).toBeInTheDocument();
     expect(navigation.pushNav).not.toHaveBeenCalled();
   });

@@ -1,5 +1,5 @@
-import { TaskStore, COLUMNS, COLUMN_LABELS, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, evaluateArchiveTaskLiveness, describeArchiveLiveness, TaskIsLiveError, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
-import { isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, withWorkspaceMergeDispatchLease, installBaselineArchiveWorktreeDisposer, clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp } from "@fusion/engine";
+import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
+import { isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, withWorkspaceMergeDispatchLease, clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp } from "@fusion/engine";
 import { createInterface } from "node:readline/promises";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
 import { createSession, createTaskFromPlanSession, ensureDurablePlanningSessionStore, getSession as getPlanningSession, submitResponse, validateSession, RateLimitError, SessionNotFoundError, InvalidSessionStateError } from "@fusion/dashboard/planning";
@@ -18,7 +18,12 @@ import { findNodeByNameOrId } from "./node.js";
 import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
 
 const STEP_STATUSES: StepStatus[] = ["pending", "in-progress", "done", "skipped"];
-let archiveForceOverride = false;
+
+/*
+FNXC:TaskMessageLength 2026-08-29-08:02:
+CLI refine, comment, and steer commands must use the same shared upper bound as dashboard routes and
+composers, so pasted operator instructions are admitted consistently on every task-text surface.
+*/
 
 /** #1403: display a column's label, falling back to the raw id for
  *  workflow-defined custom columns that have no legacy label. */
@@ -80,24 +85,9 @@ function getResearchSourceContext(sourceMetadata: unknown): string | undefined {
   return typeof runId === "string" && runId.length > 0 ? runId : undefined;
 }
 
-async function formatTaskDuplicateLineage(task: Awaited<ReturnType<TaskStore["getTask"]>>, store: TaskStore): Promise<string | null> {
+function formatTaskDuplicateLineage(task: Awaited<ReturnType<TaskStore["getTask"]>>): string | null {
   const lineage = getTaskDuplicateLineage(task);
-  if (lineage.length === 0) return null;
-
-  const labels = await Promise.all(lineage.map(async (id) => {
-    try {
-      const linked = await store.getTask(id);
-      /* FNXC:WorkflowLifecycleColumns 2026-08-02-08:10 (fleet: CLI surface): the board's archived column.
-         With the literal, a renamed board's archived duplicates printed with no `(archived)` marker, so the
-         operator could not tell a live duplicate from a filed one in the lineage line. */
-      const linkedLifecycle = await resolveTaskLifecycleColumns(store, id);
-      return linked.column === (linkedLifecycle?.archived ?? "archived") ? `${id} (archived)` : id;
-    } catch {
-      return id;
-    }
-  }));
-
-  return labels.join(", ");
+  return lineage.length > 0 ? lineage.join(", ") : null;
 }
 
 function formatTaskSource(task: {
@@ -186,7 +176,6 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     if (!context) {
       throw new Error(`Project ${projectName} not found`);
     }
-    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings(), allowLiveRemoval: () => archiveForceOverride});
     return context;
   }
 
@@ -195,7 +184,6 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     if (!context) {
       throw new Error("No project context");
     }
-    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings(), allowLiveRemoval: () => archiveForceOverride});
     return context;
   } catch {
     // FNXC:PostgresCutover 2026-07-05-12:00: the cwd fallback must boot through
@@ -203,7 +191,6 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     // resolves to the removed SQLite runtime, which throws on first DB access.
     const store = await createLocalStore(process.cwd());
     const context = asLocalProjectContext(store);
-    installBaselineArchiveWorktreeDisposer(store, {rootDir: context.projectPath, getSettings: () => store.getSettings(), allowLiveRemoval: () => archiveForceOverride});
     return context;
   }
 }
@@ -585,7 +572,7 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
             fingerprint: guard.fingerprint,
           });
           createdOrLinked = reconcileResult.canonical;
-          didLinkExisting = reconcileResult.outcome === "archived";
+          didLinkExisting = reconcileResult.outcome === "removed";
         }
       } finally {
         guard.releaseLock();
@@ -812,7 +799,7 @@ export async function buildTaskListBoardLines(
     /* The "retires with the loop" condition above is now met: `col` can be a custom id, so the terminal
        test is a resolved-lane membership check. DELIBERATE-LITERAL only as the degraded fallback when the
        resolve failed, which is the documented unconverted-caller default. */
-    const dot = (terminalColumns ? terminalColumns.has(col) : col === "done" || col === "archived") ? "○" : "●";
+    const dot = (terminalColumns ? terminalColumns.has(col) : col === "done") ? "○" : "●";
 
     lines.push(`  ${dot} ${label} (${colTasks.length})`);
     for (const t of colTasks) {
@@ -841,7 +828,7 @@ export async function runTaskUpdate(id: string, stepStr: string, status: string,
   // wrap resolution+write in one retryable unit via `withBoardWrite`, closing
   // the resolved store on every attempt.
   await withBoardWrite(projectName, { id, action: "update step" }, async (context) => {
-    const task = await context.store.updateStep(id, stepIndex, status as StepStatus);
+    const task = await context.store.updateStep(id, stepIndex, status as StepStatus, { operatorOverride: true });
 
     const step = task.steps[stepIndex];
     console.log();
@@ -916,6 +903,9 @@ const ANSI = {
   gray: "\x1b[90m",
 };
 
+/** Maximum single-line tool detail length that stays compact beside its header. */
+const CLI_INLINE_DETAIL_MAX = 120;
+
 /**
  * Format a timestamp for display (locale time string)
  */
@@ -923,9 +913,21 @@ function formatTimestamp(timestamp: string): string {
   return new Date(timestamp).toLocaleTimeString();
 }
 
-/**
- * Format a single agent log entry for display
- */
+function formatToolDetail(detail: string | undefined): string {
+  if (!detail) return "";
+  if (!detail.includes("\n") && detail.length <= CLI_INLINE_DETAIL_MAX) {
+    return ` (${detail})`;
+  }
+  const block = detail.split(/\r?\n/).map((line) => `    ${line}`).join("\n");
+  return `\n${ANSI.dim}${ANSI.gray}${block}${ANSI.reset}`;
+}
+
+/*
+FNXC:CliTaskLogs 2026-08-29-04:55:
+FN-253 makes tool arguments and results default-persisted. Keep short single-line details inline,
+but render longer or multiline payloads as one indented, dimmed block so each log entry remains one
+console.log call while terminal readers can scan the complete bounded durable payload.
+*/
 function formatLogEntry(entry: AgentLogEntry): string {
   const ts = formatTimestamp(entry.timestamp);
   const agent = entry.agent ? `[${entry.agent.toUpperCase()}] ` : "";
@@ -936,11 +938,11 @@ function formatLogEntry(entry: AgentLogEntry): string {
     case "thinking":
       return `${ANSI.dim}${ANSI.gray}  ${ts} ${agent}[THINK] ${entry.text}${ANSI.reset}`;
     case "tool":
-      return `  ${ts} ${agent}[TOOL] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}`;
+      return `  ${ts} ${agent}[TOOL] ${entry.text}${formatToolDetail(entry.detail)}`;
     case "tool_result":
-      return `  ${ts} ${agent}[RESULT] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}`;
+      return `  ${ts} ${agent}[RESULT] ${entry.text}${formatToolDetail(entry.detail)}`;
     case "tool_error":
-      return `${ANSI.red}  ${ts} ${agent}[ERROR] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}${ANSI.reset}`;
+      return `${ANSI.red}  ${ts} ${agent}[ERROR] ${entry.text}${formatToolDetail(entry.detail)}${ANSI.reset}`;
     default:
       return `  ${ts} ${agent}${entry.text}`;
   }
@@ -1212,7 +1214,7 @@ async function runTaskShowWithStore(id: string, store: TaskStore) {
   if (sourceSummary) {
     console.log(`  Source: ${sourceSummary}`);
   }
-  const duplicateLineage = await formatTaskDuplicateLineage(task, store);
+  const duplicateLineage = formatTaskDuplicateLineage(task);
   if (duplicateLineage) {
     console.log(`  Duplicate of: ${duplicateLineage}`);
   }
@@ -1468,7 +1470,7 @@ export async function runTaskUnpause(id: string, projectName?: string) {
 }
 
 export async function runTaskMove(id: string, column: string, projectName?: string) {
-  if (!COLUMNS.includes(column as Column)) {
+  if (!COLUMNS.includes(column as (typeof COLUMNS)[number])) {
     console.error(`Invalid column: ${column}`);
     console.error(`Valid columns: ${COLUMNS.join(", ")}`);
     process.exit(1);
@@ -1525,13 +1527,11 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
     process.exit(1);
   }
 
-  // Validate length (matches API validation)
-  if (feedback.length > 2000) {
-    console.error("Feedback must be 2000 characters or less");
+  const trimmedFeedback = feedback.trim();
+  if (trimmedFeedback.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Feedback must be ${MAX_TASK_MESSAGE_LENGTH} characters or less`);
     process.exit(1);
   }
-
-  const trimmedFeedback = feedback.trim();
 
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
   await withBoardWrite(projectName, { id, action: "refine task" }, async (context) => {
@@ -1546,49 +1546,6 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
   });
 }
 
-export async function runTaskArchive(id: string, projectName?: string, options: {force?: boolean} = {}) {
-  /* FNXC:CliBoardMutation 2026-08-15-06:35: force is scoped to this command's disposer lifetime; every other CLI archive stays protective by default. */
-  archiveForceOverride = options.force === true;
-  try {
-    await withBoardWrite(projectName, { id, action: "archive task" }, async (context) => {
-      // Compatibility test/store doubles may expose archiveTask without the advisory reader.
-      const current = typeof (context.store as unknown as {getTask?: unknown}).getTask === "function" ? await context.store.getTask(id) : undefined;
-      const refuseLiveArchive = async (verdict: Parameters<typeof describeArchiveLiveness>[1]) => {
-        /*
-        FNXC:CliBoardMutation 2026-08-15-07:07:
-        A CLI liveness refusal is an operator-facing safety result, not an uncaught stack trace.
-        Exit through the established board-context path so the command is non-zero while its store closes.
-        */
-        console.error(`\n  ✗ ${describeArchiveLiveness(id, verdict, {workspaceWorktreeCount: Object.keys(current?.workspaceWorktrees ?? {}).length})}\n`);
-        await closeBoardContextAndExit(context, 1);
-      };
-      if (current && !options.force) {
-        const verdict = await evaluateArchiveTaskLiveness(context.store, current);
-        if (verdict.live) await refuseLiveArchive(verdict);
-      }
-      try {
-        const task = await context.store.archiveTask(id, {liveExecutionGuard: options.force ? "off" : "refuse"});
-        console.log();
-        console.log(`  ✓ Archived ${task.id} → ${columnLabel(task.column)}`);
-        console.log();
-      } catch (error) {
-        if (error instanceof TaskIsLiveError) await refuseLiveArchive({live: true, reasons: error.reasons});
-        throw error;
-      }
-    });
-  } finally { archiveForceOverride = false; }
-}
-
-export async function runTaskUnarchive(id: string, projectName?: string) {
-  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
-  await withBoardWrite(projectName, { id, action: "unarchive task" }, async (context) => {
-    const task = await context.store.unarchiveTask(id);
-
-    console.log();
-    console.log(`  ✓ Unarchived ${task.id} → ${columnLabel(task.column)}`);
-    console.log();
-  });
-}
 
 export async function runTaskRetry(id: string, projectName?: string) {
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): MULTI-STEP mutation
@@ -2278,8 +2235,8 @@ export async function runTaskComment(id: string, message?: string, author = "use
   }
 
   const trimmed = text.trim();
-  if (trimmed.length > 2000) {
-    console.error("Error: Comment must be between 1 and 2000 characters");
+  if (trimmed.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Error: Comment must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters`);
     process.exit(1);
   }
 
@@ -2336,8 +2293,8 @@ export async function runTaskSteer(id: string, message?: string, projectName?: s
   }
 
   const trimmed = text.trim();
-  if (trimmed.length > 2000) {
-    console.error("Error: Message must be between 1 and 2000 characters");
+  if (trimmed.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Error: Message must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters`);
     process.exit(1);
   }
 

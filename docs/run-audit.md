@@ -2,6 +2,10 @@
 
 The run-audit catalogue for the S4 **Reliability, Durability & Observability** delivery-pipeline theme — a durable, single-source-of-truth reference for *who did what, when, and why after the fact* across the delivery pipeline's reliability/observability event surface.
 
+## Overlap wait release
+
+`task:overlap-wait-released` is emitted after the transactional overlap receipt becomes ready. Metadata is limited to task/predecessor IDs, episode/common-file counts, and fixed decision/freshness enums; paths, diffs, summaries, prompts, and remote URLs remain in the project-scoped receipt. Emission uses the engine bounded best-effort seam, so absent, throwing, rejecting, hanging, or late-settling sinks cannot alter synchronization, start work, or roll back the owner decision. The receipt plus deduplicated task-log row is the durable diagnostic authority; run-audit is not exactly-once and is never re-emitted by every recovery tick.
+
 ## Status / purpose
 
 This document is the **run-audit observability catalogue** for the Core Product Vision & Roadmap mission (Mission **M-MSL4E01A-0001-Y9QC**, Milestone **M2 — Roadmap Definition**, Slice **S4 — Reliability, Durability & Observability roadmap**, feature **F-MSL72J0A-000M-GIJN**), **grounded in the M1 vision theme verbatim**:
@@ -49,11 +53,10 @@ Reconciliation-scoped auto-recover/reclaim events the self-healing sweep surface
 | --- | --- |
 | `task:auto-recover-paused-abort-park` | Self-healing clears a benign pause-abort operator park and requeues the task. |
 | `task:auto-rebound-paused-scope-decay` | Self-healing rebounds a task whose paused scope decayed past its floor, unblocking followers. |
-| `task:auto-archive-failure-budget-exhausted` | Self-healing abandons a repeatedly failing stale-task archive and surfaces it for operator action. |
-| `task:no-progress-no-task-done-requeue` | A zero-progress no-task-done failure consumes one bounded self-healing retry and records its backoff. Metadata is task ID, column, attempt, maximum, delay, and fixed outcome only. |
-| `task:no-progress-no-task-done-requeue-exhausted` | The bounded no-progress requeue budget parks a task once. Metadata is task ID, column, attempt, maximum, and fixed outcome only; bounded best-effort emission never gates the park. |
+| `task:auto-archive-failure-budget-exhausted` | Historical event retained for reading pre-removal logs; current self-healing does not archive tasks. |
 | `task:reclaim-phantom-executor-binding` | Self-healing proves an in-memory executor-active binding is stale and requeues the task. |
 | `task:reconcile-orphaned-pending-step-results` | Self-healing rewrites orphaned `pending` workflow-step results (no live session) to `failed`. |
+| `task:reconcile-unproven-review-approval` | Self-healing rewrites singular content-review approvals without input proof to recoverable `failed` results. |
 | `task:reconcile-stale-duplicate-decision` | Self-healing clears a recurring duplicate-decision pause with no canonical target. |
 | `task:reconcile-stale-agent-assignment` | Self-healing clears stale durable Agent.taskId/state drift while preserving file-scope leases. |
 | `task:reconcile-engine-downtime-active-timing` | Self-healing shifts active-task anchors to exclude proven stopped-engine wall-clock. |
@@ -62,6 +65,7 @@ Reconciliation-scoped auto-recover/reclaim events the self-healing sweep surface
 | `task:reconcile-wedged-active-merge` | Self-healing reclaims a wedged single-flight merge entry. |
 | `task:reconcile-stranded-completed-no-action` | A stranded-completed promoter withholds promotion of an all-steps-done/skipped task with a failure-park provenance (no-action). |
 | `task:reconcile-legacy-adoption` | Self-healing startup adopts a pre-cutover legacy task row through the KTD-8 adoption table. |
+| `task:reconcile-archived-into-done` | Self-healing moves a live historical archive row or restores a cold snapshot into the task's workflow completion lane. Metadata is limited to the task ID, source, counters, and a fixed outcome. |
 
 ## Durable-agent error-state
 
@@ -97,9 +101,21 @@ All `recordRunAuditEventWithinTransaction(tx, ...)` calls and the `recordRunAudi
 
 ### Review convergence events
 
-`task:review-finding-disputed`, `task:review-convergence-escalation`, `task:review-arbitration`, and `task:review-convergence-human-escalation` record review-cycle progression. Their metadata contains only ids, counts, and fixed outcomes; dispute rationales, findings, reviewer feedback, and arbiter output are never recorded. All five emission sites use the FN-9175 bounded best-effort seam, so hostile telemetry cannot alter or block the ladder, arbitration release, or dispute result.
+`task:review-finding-disputed`, `task:review-convergence-escalation`, `task:review-arbitration`, and `task:review-convergence-human-escalation` record review-cycle progression. `task:review-convergence-escalation` includes the fixed `escalationSource` outcome (`dedicated`, `execution-fallback`, or `none`); its `hasModelTarget` flag is true only when a distinct model pair was resolved and persisted. Metadata contains only ids, counts, and fixed outcomes; provider/model identifiers, dispute rationales, findings, reviewer feedback, and arbiter output are never recorded. All five emission sites use the FN-9175 bounded best-effort seam, so hostile telemetry cannot alter or block the ladder, arbitration release, or dispute result.
+
+`task:review-empty-content-parked` records the one-time terminal close for a provably empty Code Review input. Its metadata is limited to task and workflow-step ids, the resting column, and the fixed failed outcome; reviewer prose and findings remain off audit rows. The empty-merge finalize-blocked events also include the fixed `parkedStatus: "failed"` outcome. These writes use bounded best-effort emission and are intentionally outside the curated delivery-pipeline event table.
+
+`task:review-input-recaptured` records a positive review lane that proved its own checkout fast-forwarded and re-bound its identity to the final reviewed content. `task:merge-stale-content-review-rerouted` records a singular stale-content merge refusal, from merge admission or self-healing, that attempted graph-owned review re-entry. Self-healing may recover the bounded-retry rejection, raw merge-door blocker, or retry-exhausted park only after re-seeding the stale lane; metadata uses task and workflow-step ids, fixed reroute reason/source, and fixed park outcome fields (`parkShape`, `parkCleared`, `mergeRetriesReset`) only. Neither event records fingerprints, diffs, paths, findings, or reviewer prose. Both use the FN-9175 bounded best-effort seam.
 
 | Event | Metadata |
 | --- | --- |
 | `review-remediation-appended` | Task id, gate id, wave, and count only. |
 | `review-remediation-parked` | Task id and fixed park outcome only. |
+
+### External block lifecycle
+
+`task:external-block-parked` records a task entering a durable external freeze, and `task:external-block-cleared` records operator Retry publishing its exact resume continuation. Metadata is IDs and fixed classifications only: task id, origin, code, source, column, and resume node id. Raw error prose remains on `Task.externalBlock` and is never copied into run-audit metadata. Both writes use the bounded best-effort emitter and are intentionally outside the curated delivery-pipeline event catalogue.
+
+`task:step-session-abort-contained` records an interrupted step-session repair that retains the current lifecycle lane, checkout, node, and completed step progress. Its metadata is IDs, counts, and fixed outcomes only: task id, current column, abort trigger, recovery outcome, and completed-step count; it never includes failure text or step names. The executor emits it through the bounded best-effort seam, and it is intentionally outside the curated delivery-pipeline event catalogue.
+
+`task:merge-unrun-pre-merge-gate-rerouted` records a merge-admission or self-healing attempt to seed the earliest enabled pre-merge gate that has no result. It uses the FN-9175 bounded best-effort emitter and records only `taskId`, `nodeId`, `workflowStepId`, fixed `reason`, `source`, and `missingGateCount`; it excludes reviewer prose, findings, fingerprints, blocker text, and errors.

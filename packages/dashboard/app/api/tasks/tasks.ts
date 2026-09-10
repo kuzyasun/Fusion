@@ -30,8 +30,20 @@ export interface DeleteTaskOptions {
   allowResurrection?: boolean;
 }
 
-export interface ArchiveTaskOptions {
-  removeLineageReferences?: boolean;
+export interface TaskListPageResponse {
+  tasks: Task[];
+  total: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+}
+
+export function fetchTaskPage(projectId?: string, options?: { limit?: number; cursor?: string; query?: string; signal?: AbortSignal }): Promise<TaskListPageResponse> {
+  const search = new URLSearchParams();
+  if (options?.limit !== undefined) search.set("limit", String(options.limit));
+  if (options?.cursor) search.set("cursor", options.cursor);
+  if (options?.query) search.set("q", options.query);
+  const suffix = search.size > 0 ? `?${search.toString()}` : "";
+  return api<TaskListPageResponse>(withProjectId(`/tasks/page${suffix}`, projectId), { signal: options?.signal });
 }
 
 export function fetchTasks(
@@ -39,37 +51,43 @@ export function fetchTasks(
   offset?: number,
   projectId?: string,
   q?: string,
-  includeArchived?: boolean,
+  excludeDone?: boolean,
 ): Promise<Task[]> {
   const search = new URLSearchParams();
   if (limit !== undefined) search.set("limit", String(limit));
   if (offset !== undefined) search.set("offset", String(offset));
   if (projectId) search.set("projectId", projectId);
   if (q) search.set("q", q);
-  if (includeArchived) search.set("includeArchived", "1");
+  if (excludeDone) search.set("excludeDone", "1");
   const suffix = search.size > 0 ? `?${search.toString()}` : "";
   return api<Task[]>(`/tasks${suffix}`);
 }
 
-/**
- * FNXC:ArchivePagination 2026-07-08-00:00:
- * Dedicated paged read for the Archived board column (FN-7659). Returns
- * one bounded page (default 100) ordered `archivedAt DESC` plus `total`/
- * `hasMore` so the caller can drive a "Show more" affordance without ever
- * fetching the whole archive in one request.
- */
-export function fetchArchivedTasks(
+export interface CompletedTaskPageResponse {
+  tasks: Task[];
+  total: number;
+  hasMore: boolean;
+  nextCursor?: string | null;
+  counts?: {
+    byColumn: Record<string, number>;
+    byWorkflow: Record<string, Record<string, number>>;
+  };
+}
+
+/** One bounded keyset page from the workflow-defined completion lanes. */
+export function fetchCompletedTasks(
   projectId?: string,
   limit?: number,
-  offset?: number,
-  sortMode: TaskColumnSortMode = "completion-date-desc",
-): Promise<{ tasks: Task[]; total: number; hasMore: boolean }> {
+  cursor?: string,
+  sortMode?: TaskColumnSortMode,
+  options?: { signal?: AbortSignal },
+): Promise<CompletedTaskPageResponse> {
   const search = new URLSearchParams();
   if (limit !== undefined) search.set("limit", String(limit));
-  if (offset !== undefined) search.set("offset", String(offset));
-  search.set("sort", sortMode);
+  if (cursor !== undefined) search.set("cursor", cursor);
+  if (sortMode !== undefined) search.set("sort", sortMode);
   const suffix = search.size > 0 ? `?${search.toString()}` : "";
-  return api<{ tasks: Task[]; total: number; hasMore: boolean }>(withProjectId(`/tasks/archived${suffix}`, projectId));
+  return api<CompletedTaskPageResponse>(withProjectId(`/tasks/done${suffix}`, projectId), { signal: options?.signal });
 }
 
 /** Row-paginated recommendation aggregate returned by the Insights triage route. */
@@ -120,8 +138,7 @@ export function fetchSpecLock(id: string, projectId?: string): Promise<SpecLockR
 
 /*
 FNXC:TaskDetailPlan 2026-08-05-04:05:
-Definition polling reads only PROMPT.md. It must not request a TaskDetail because board/SSE/mutation
-snapshots exclusively own lifecycle, workflow, and action state while a detail host is mounted.
+Definition polling reads only PROMPT.md so it cannot roll lifecycle or workflow state backward. Its response is degradable evidence: the mounted detail may adopt usable plan text, while absent or blank text retains the loaded plan until a separate authoritative detail read confirms whether PROMPT.md is genuinely gone.
 */
 export function fetchTaskPrompt(id: string, projectId?: string): Promise<TaskPromptResponse> {
   return api<TaskPromptResponse>(withProjectId(`/tasks/${id}/prompt`, projectId));
@@ -280,6 +297,10 @@ export async function createTask(
   projectId?: string,
   options?: CreateTaskRequestOptions,
 ): Promise<Task> {
+  /*
+  FNXC:PlanApproval 2026-08-28-11:29:
+  The dashboard create API is an explicit whitelist shared by Quick Entry and New Task. Forward the per-task approval override here so an opted-in task reaches planning with its human-review hold intact.
+  */
   const {
     title,
     description,
@@ -316,7 +337,6 @@ export async function createTask(
     sessionAdvisorEnabled,
     acknowledgedDuplicates,
     bypassDuplicateCheck,
-    repositoryScope,
   } = input;
 
   try {
@@ -360,7 +380,6 @@ export async function createTask(
       sessionAdvisorEnabled,
       acknowledgedDuplicates,
       bypassDuplicateCheck,
-      repositoryScope,
     }),
   });
   } catch (error) {
@@ -372,18 +391,6 @@ export async function createTask(
     }
     throw error;
   }
-}
-
-/** Update explicit workspace repository intent before any land intent or landed SHA exists. */
-export function updateTaskRepositoryScope(
-  id: string,
-  input: { repositories: string[]; reason: string; action?: "add" | "remove" | "refuse" },
-  projectId?: string,
-): Promise<Task> {
-  return api<Task>(withProjectId(`/tasks/${encodeURIComponent(id)}/repository-scope`, projectId), {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
 }
 
 export interface TaskOverlapBlockerReport {
@@ -523,7 +530,7 @@ export function moveTask(
   id: string,
   column: ColumnId,
   projectId?: string,
-  optionsOrPosition?: { preserveProgress?: boolean } | number,
+  optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
 ): Promise<Task> {
   return api<Task>(withProjectId(`/tasks/${id}/move`, projectId), {
     method: "POST",
@@ -532,6 +539,11 @@ export function moveTask(
       ...(
         typeof optionsOrPosition === "object" && optionsOrPosition?.preserveProgress
           ? { preserveProgress: true }
+          : {}
+      ),
+      ...(
+        typeof optionsOrPosition === "object" && optionsOrPosition?.expectedColumn !== undefined
+          ? { expectedColumn: optionsOrPosition.expectedColumn }
           : {}
       ),
     }),

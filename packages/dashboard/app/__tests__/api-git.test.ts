@@ -14,8 +14,6 @@ import {
   connectMissionInterviewStream,
   assignTask,
   fetchAgentTasks,
-  archiveTask,
-  unarchiveTask,
   revertTask,
   deleteTask,
   ApiRequestError,
@@ -498,59 +496,7 @@ describe("Git Management API", () => {
     });
   });
 
-  describe("archiveTask", () => {
-    it("sends POST to archive endpoint", async () => {
-      const archivedTask: Task = { ...FAKE_DETAIL, column: "archived" };
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, archivedTask));
 
-      const response = await archiveTask("FN-001");
-
-      expect(response.column).toBe("archived");
-      expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/archive", {
-        headers: API_JSON_HEADERS,
-        method: "POST",
-      });
-    });
-
-    it("sends removeLineageReferences=true when archive lineage unlink is requested", async () => {
-      const archivedTask: Task = { ...FAKE_DETAIL, column: "archived" };
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, archivedTask));
-
-      await archiveTask("FN-001", undefined, { removeLineageReferences: true });
-
-      expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/archive?removeLineageReferences=true", {
-        headers: API_JSON_HEADERS,
-        method: "POST",
-      });
-    });
-
-    it("throws on error", async () => {
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(false, { error: "Task not in done" }, 400));
-
-      await expect(archiveTask("FN-001")).rejects.toThrow("Task not in done");
-    });
-  });
-
-  describe("unarchiveTask", () => {
-    it("sends POST to unarchive endpoint", async () => {
-      const unarchivedTask: Task = { ...FAKE_DETAIL, column: "done" };
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, unarchivedTask));
-
-      const response = await unarchiveTask("FN-001");
-
-      expect(response.column).toBe("done");
-      expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/unarchive", {
-        headers: API_JSON_HEADERS,
-        method: "POST",
-      });
-    });
-
-    it("throws on error", async () => {
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(false, { error: "Task not in archived" }, 400));
-
-      await expect(unarchiveTask("FN-001")).rejects.toThrow("Task not in archived");
-    });
-  });
 
   /*
   FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
@@ -718,6 +664,19 @@ describe("Git Management API", () => {
         headers: API_JSON_HEADERS,
         method: "POST",
         body: JSON.stringify({ column: "todo" }),
+      });
+    });
+
+    it("forwards an expected-column compare-and-set precondition", async () => {
+      const movedTask: Task = { ...FAKE_DETAIL, column: "todo" };
+      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, movedTask));
+
+      await moveTask("FN-001", "todo", undefined, { expectedColumn: "ideas" });
+
+      expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/move", {
+        headers: API_JSON_HEADERS,
+        method: "POST",
+        body: JSON.stringify({ column: "todo", expectedColumn: "ideas" }),
       });
     });
 

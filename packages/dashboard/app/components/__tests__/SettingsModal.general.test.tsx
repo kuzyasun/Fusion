@@ -295,18 +295,10 @@ describe("SettingsModal", () => {
     expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();
   });
 
-  it("renders recommendation mailbox notices enabled by default and persists disabling it", async () => {
+  it("does not render the retired recommendation-mail toggle", async () => {
     renderModal({ initialSection: "general" });
     await waitForSettingsModalReady();
-    const toggle = screen.getByLabelText("Recommendation mailbox notices");
-    expect(toggle).toBeChecked();
-    // FNXC:SettingsModalTests 2026-08-16-03:46: flush the 500ms auto-save debounce on the fake clock instead of a real-timer waitFor (FN-2707); assertions unchanged.
-    vi.useFakeTimers();
-    fireEvent.click(toggle);
-    await flushSettingsAutoSave();
-    vi.useRealTimers();
-    expect(mockUpdateSettings).toHaveBeenCalled();
-    expect(mockUpdateSettings.mock.calls.at(-1)?.[0]).toMatchObject({ recommendationMailboxNoticeEnabled: false });
+    expect(screen.queryByLabelText("Recommendation mailbox notices")).toBeNull();
   });
 
   it.each(["mobile", "desktop"] as const)("shows exactly one default-off required recommendation toggle on %s", async (mode) => {
@@ -1295,10 +1287,13 @@ describe("SettingsModal", () => {
     // Read-only default-render assertions are merged into one rendered
     // instance to avoid re-rendering the full modal per pure-display check.
     it("renders default global logging fields and helper text", async () => {
+      const { persistAgentToolOutput: _omittedToolOutput, ...settingsWithoutToolOutput } = defaultSettings;
+      mockFetchSettings.mockResolvedValue(settingsWithoutToolOutput);
+      mockFetchSettingsByScope.mockResolvedValue({ global: settingsWithoutToolOutput, project: {} });
       renderModal({ initialSection: "global-general" });
       await waitForSettingsModalReady();
 
-      // Global modal outside-dismiss and persistAgentToolOutput default to unchecked; Star-on-GitHub control absent.
+      // Global modal outside-dismiss stays unchecked while unset tool-output persistence uses its enabled default.
       expect(screen.getByRole("checkbox", { name: "Dismiss modals by clicking outside" })).not.toBeChecked();
       /*
       FNXC:SettingsHelp 2026-07-15-22:10:
@@ -1306,7 +1301,7 @@ describe("SettingsModal", () => {
       The assertion's intent is unchanged: this row's help must come from the primitive, not hand-rolled markup.
       */
       expect(screen.getByText(/Default: disabled, to prevent accidental dismissal/i).closest(".settings-help-bubble")).toBeTruthy();
-      expect(screen.getByRole("checkbox", { name: "Save tool output in agent logs" })).not.toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Save tool output in agent logs" })).toBeChecked();
       expect(screen.getByRole("checkbox", { name: "Enable proactive task-chat updates" })).not.toBeChecked();
       expect(screen.queryByRole("checkbox", { name: /Show "Star on GitHub" button in Settings header/i })).toBeNull();
 
@@ -1346,6 +1341,17 @@ describe("SettingsModal", () => {
 
       expect(screen.getByRole("combobox", { name: "Global default tracking repo" })).toBeInTheDocument();
       expect(screen.getByText(/Projects inherit this value when they do not set a project default tracking repo/i)).toBeInTheDocument();
+    });
+
+    it("uses the enabled effective default when fetched global settings omit the key", async () => {
+      const { persistAgentToolOutput: _omittedToolOutput, ...settingsWithoutToolOutput } = defaultSettings;
+      mockFetchSettings.mockResolvedValue(settingsWithoutToolOutput);
+      mockFetchSettingsByScope.mockResolvedValue({ global: settingsWithoutToolOutput, project: {} });
+
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByRole("checkbox", { name: "Save tool output in agent logs" })).toBeChecked();
     });
 
     it("reflects persisted checked value from global settings", async () => {
@@ -1460,6 +1466,26 @@ describe("SettingsModal", () => {
       }
     });
 
+    it("saves chatSubmitOnEnter only via global settings payload", async () => {
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      vi.useFakeTimers();
+      fireEvent.change(screen.getByRole("combobox", { name: "Enter key behavior in conversations" }), {
+        target: { value: "never" },
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(mockUpdateGlobalSettings).toHaveBeenCalled();
+      vi.useRealTimers();
+
+      const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(globalPayload.chatSubmitOnEnter).toBe("never");
+      if (mockUpdateSettings.mock.calls.length > 0) {
+        const projectPayload = mockUpdateSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(projectPayload.chatSubmitOnEnter).toBeUndefined();
+      }
+    });
+
     it("saves persistAgentToolOutput only via global settings payload", async () => {
       renderModal({ initialSection: "global-general" });
       await waitForSettingsModalReady();
@@ -1471,7 +1497,7 @@ describe("SettingsModal", () => {
       vi.useRealTimers();
 
       const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
-      expect(globalPayload.persistAgentToolOutput).toBe(true);
+      expect(globalPayload.persistAgentToolOutput).toBe(false);
       if (mockUpdateSettings.mock.calls.length > 0) {
         const projectPayload = mockUpdateSettings.mock.calls[0]?.[0] as Record<string, unknown>;
         expect(projectPayload.persistAgentToolOutput).toBeUndefined();
@@ -2002,7 +2028,7 @@ describe("SettingsModal", () => {
       expect(payload.maxConcurrent).toBeNull();
       expect(payload.maxRecommendationsPerTask).toBeNull();
       expect(payload.requireTaskRecommendations).toBeNull();
-      expect(payload.recommendationMailboxNoticeEnabled).toBeNull();
+      expect(payload).not.toHaveProperty("recommendationMailboxNoticeEnabled");
       // Global-only key must never appear in a project-scope reset payload.
       expect(payload).not.toHaveProperty("themeMode");
       expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();

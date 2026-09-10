@@ -19,6 +19,7 @@ const pgTest = pgDescribe;
 pgTest("VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL)", () => {
   const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_lifecycle_e2e",
+    projectId: "lifecycle-e2e-test",
   });
 
   beforeAll(h.beforeAll);
@@ -64,25 +65,6 @@ pgTest("VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL)", () => {
       skipMergeBlocker: true,
     });
     expect(done.column).toBe("done");
-  });
-
-  it("archives and lists tasks", async () => {
-    const store = h.store();
-    const task = await store.createTask({ description: "Archive target task" });
-    await store.moveTask(task.id, "todo", { moveSource: "user" });
-    await store.moveTask(task.id, "in-progress", { moveSource: "user" });
-    await store.moveTask(task.id, "in-review", {
-      moveSource: "user",
-      allowDirectInReviewMove: true,
-    });
-    await store.moveTask(task.id, "done", { moveSource: "engine", skipMergeBlocker: true });
-
-    const archived = await store.archiveTask(task.id, { cleanup: false });
-    expect(archived.id).toBe(task.id);
-
-    // FNXC:PostgresArchiveReads 2026-07-14-17:10: Active-only callers opt out of cold storage explicitly; listTasks keeps its backward-compatible includeArchived default.
-    const live = await store.listTasks({ includeArchived: false });
-    expect(live.find((t) => t.id === task.id)).toBeUndefined();
   });
 
   it("updates task fields and they persist", async () => {

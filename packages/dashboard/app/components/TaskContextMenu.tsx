@@ -3,12 +3,12 @@ import type { KeyboardEvent, PointerEvent as ReactPointerEvent, MouseEvent as Re
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TFunction } from "i18next";
 import type { ColumnId, Task, TaskDetail, WorkflowStepResult } from "@fusion/core";
-import { isIntakeColumnRole, isReviewColumnRole } from "../utils/columnRoles";
+import { isReviewColumnRole } from "../utils/columnRoles";
 
 /*
-FNXC:TaskContextMenu 2026-08-27-12:01:
-FN-198 removes manual column relocation from dashboard task menus. Workflow graph ownership
-now decides placement; Reset, Respecify, and Delete remain the operator's replan or removal paths.
+FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
+FN-206 makes dashboard task recovery Retry, Reset, and Delete. Retry repeats the current stage
+in place; Reset abandons task state; Delete removes the card.
 */
 
 /*
@@ -22,9 +22,18 @@ getLatestFailedPreMergeReviewStep. Keep this in lockstep with that function
 and self-healing.ts's latestFailedPreMergeStep (FN-7720): most-recent
 phase!=="post-merge" result with status==="failed".
 */
+/*
+FNXC:ReviewLaneBypass 2026-09-06-00:47:
+Dashboard imports only core types, so this predicate mirrors the core selector. An archived failed
+carrier retains history yet must stay reachable by the audited operator bypass.
+*/
 function hasFailedPreMergeReviewStep(task: Pick<Task, "workflowStepResults">): boolean {
-  return (task.workflowStepResults ?? []).some(
-    (result: WorkflowStepResult) => (result.phase || "pre-merge") === "pre-merge" && result.status === "failed",
+  return (task.workflowStepResults ?? []).some((result: WorkflowStepResult) =>
+    (result.phase || "pre-merge") === "pre-merge"
+    && (result.status === "failed" || (result.remediationArchivedAt != null
+      && (result.remediationArchivedFromStatus === "failed" || result.remediationArchivedFromStatus === "advisory_failure")
+      && !result.bypassedBy
+      && !result.supersededAt)),
   );
 }
 
@@ -35,8 +44,15 @@ export interface TaskMenuActionDescriptor {
   label: string;
   tone?: TaskMenuActionTone;
   disabled?: boolean;
+  testId?: string;
+  pressed?: boolean;
   onSelect?: () => void;
 }
+
+/*
+FNXC:TaskDetailFooterActions 2026-09-05-23:27:
+Task Detail contributes its relocated quick actions as one flat descriptor list. Do not turn those groups into submenus: the desktop footer menu clips horizontal overflow and the mobile menu scrolls vertically, so a lateral flyout would be clipped and difficult to use by touch.
+*/
 
 /**
  * A non-action menu parent whose children are the selectable menu items.
@@ -55,7 +71,6 @@ export type TaskMenuItemDescriptor = TaskMenuActionDescriptor | TaskMenuSubmenuD
 
 export interface TaskContextMenuColumnFlags {
   complete?: boolean;
-  archived?: boolean;
   hiddenFromBoard?: boolean;
   hold?: boolean;
   intake?: boolean;
@@ -92,7 +107,6 @@ export interface BuildTaskActionMenuModelOptions {
   task: Task | TaskDetail;
   t: TFunction<"app">;
   currentColumnFlags?: TaskContextMenuColumnFlags;
-  canRetryTask?: boolean;
   hasDuplicateHandler?: boolean;
   hasRetryHandler?: boolean;
   hasResetHandler?: boolean;
@@ -110,7 +124,6 @@ export interface BuildTaskActionMenuModelOptions {
   */
   onPlan?: () => void;
   onOpenRefine?: () => void;
-  onRespecify?: () => void;
   onRetry?: () => void;
   onReset?: () => void;
   onTogglePause?: () => void;
@@ -161,33 +174,21 @@ reasoning as `isReviewColumn` above — and the same flagged inversion: `column 
 unconditional disjunct ahead of the trait read.
 */
 function isDoneOrReview(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  return column === "done" || isReviewColumn(column, flags) || (flags?.complete === true && flags?.archived !== true);
+  return column === "done" || isReviewColumn(column, flags) || flags?.complete === true;
 }
 
 /*
 FNXC:TaskContextMenu 2026-07-30-04:10 DELIBERATE-LITERAL: the no-metadata fallback only.
 Same rule as `isReviewColumn` above: reached when no resolved flags arrive, where answering
-"mutable" for a done/archived card would offer live-work actions on a terminal one.
+"mutable" for a Done card would offer live-work actions on a terminal row.
 */
 function isMutableLiveColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  if (flags) return flags.complete !== true && flags.archived !== true;
-  return column !== "done" && column !== "archived";
-}
-
-/**
- * A PURE intake lane — intake without hold. A merged Planning column carries both, so it is not
- * "pure intake": cards rest there waiting for capacity and have real actions.
- */
-function isPureIntakeColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  // With traits, "pure" means intake WITHOUT hold — a merged Planning column carries both and is
-  // therefore not pure. Without traits, defer to the shared intake role so the degraded-mode id
-  // list lives in exactly one place.
-  if (flags) return flags.intake === true && flags.hold !== true;
-  return isIntakeColumnRole(undefined, column);
+  if (flags) return flags.complete !== true;
+  return column !== "done";
 }
 
 export function isPreExecutionHoldColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  if (flags?.complete === true || flags?.archived === true) return false;
+  if (flags?.complete === true) return false;
   /*
   FNXC:WorkflowResolvedColumns 2026-07-30-18:35 (Phase B — AUDITED, deliberately NOT consolidated):
   `isPreImplementationColumnRole` in `utils/columnRoles.ts` answers a near-identical question and I
@@ -269,11 +270,9 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
     task,
     t,
     currentColumnFlags,
-    canRetryTask = false,
     hasDuplicateHandler = Boolean(options.onDuplicate),
     hasRetryHandler = Boolean(options.onRetry),
     hasResetHandler = Boolean(options.onReset),
-    hasAssignedAgent = Boolean(task.assignedAgentId),
     hasBypassReviewHandler = Boolean(options.onBypassReview),
   } = options;
   const isTaskPaused = Boolean(task.paused || task.userPaused);
@@ -297,19 +296,12 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
   }
 
   /*
-  FNXC:TaskContextMenu 2026-07-16-12:00:
-  Archived is an unsupported Respecify source: the rebuild route rejects it rather than
-  resurrecting intentionally archived work into a planner lane. Check both the semantic
-  workflow trait and legacy id so every menu host omits this dead affordance.
+  FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
+  Retry is not a failure-only escape hatch: a live intake, implementation, or review card can
+  always repeat its current stage. Terminal columns remain immutable through the shared trait/id
+  predicate, including first paint before workflow metadata is available.
   */
-  /* DELIBERATE-LITERAL — belt-and-braces, and the comment above says so: this checks BOTH the
-     resolved trait and the legacy id on purpose, so a host that supplies no flags still omits the
-     dead affordance. Dropping the literal would re-open it for exactly those hosts. */
-  if (task.column !== "archived" && currentColumnFlags?.archived !== true) {
-    actions.push({ id: "respecify", label: t("taskDetail.respecify.btn", "Respecify"), onSelect: options.onRespecify });
-  }
-
-  if (canRetryTask && hasRetryHandler) {
+  if (hasRetryHandler && isMutableLiveColumn(task.column, currentColumnFlags)) {
     actions.push({ id: "retry", label: t("taskDetail.retry.btn", "Retry"), onSelect: options.onRetry });
   }
 
@@ -325,7 +317,7 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
   /*
   FNXC:WorkflowResolvedColumns 2026-07-30-23:50 (batch-dashboard-app):
   REVIEW role, resolved from `currentColumnFlags` — which this function already receives and already
-  uses for the archived check ~15 lines up. Keyed on the literal, the "Bypass failed review" action
+  uses for other role checks. Keyed on the literal, the "Bypass failed review" action
   never appeared on a renamed board, so an operator with a genuinely failed pre-merge review step had
   no way to clear it from the menu and the card stayed merge-blocked with no affordance.
   */
@@ -382,29 +374,12 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
     actions,
     reviewAction: getTaskReviewAction(task, options),
     /*
-    FNXC:WorkflowResolvedColumns 2026-07-30-15:25 (Phase B — TaskContextMenu.tsx):
-    Was `task.column !== "triage"`. The intent is "a bare card sitting in a pure INTAKE lane has no
-    actions worth showing yet" — `triage` happened to be that lane, and `todo` (hold) always showed
-    the menu because cards waiting for capacity have real actions.
-
-    Post-U11 the literal inverts: a default Planning card is `todo`, so `!== "triage"` is true and
-    the menu shows unconditionally — which is right for the hold half, but the guard has stopped
-    distinguishing anything and would also show a full menu on a bare Coding (Ideas) capture.
-
-    Resolved to `intake AND NOT hold` — a PURE intake lane — which reproduces every shape:
-      legacy `triage`   intake only        -> suppressed (as before)
-      legacy `todo`     hold only          -> shown (as before)
-      merged Planning   intake + hold      -> shown (matches the Todo half, where cards wait)
-      Ideas `ideas`     intake only        -> suppressed (a bare captured idea)
-    Falls back to the legacy id when no flags are supplied, so unwired menu hosts are unchanged.
+    FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
+    A pure intake lane is the planning form of Retry, not a reason to hide recovery. Deriving
+    visibility from the produced action list keeps every host reachable and prevents a live card
+    from showing neither a recovery action nor an explanation.
     */
-    shouldShowActionsMenu:
-      !isPureIntakeColumn(task.column, currentColumnFlags) ||
-      task.status === "awaiting-approval" ||
-      canRetryTask ||
-      isTaskPaused ||
-      hasAssignedAgent ||
-      Boolean(options.onEnableGithubTracking && task.githubTracking?.enabled !== true),
+    shouldShowActionsMenu: actions.length > 0,
     isTaskPaused,
   };
 }
@@ -575,6 +550,8 @@ export function TaskContextMenu({
                         className={classes.join(" ")}
                         role={role === "menu" ? "menuitem" : undefined}
                         disabled={action.disabled}
+                        data-testid={action.testId}
+                        aria-pressed={action.pressed}
                         onPointerUp={(event) => handleActionPointerUp(event, action)}
                         onClick={(event) => handleActionClick(event, action)}
                       >
@@ -592,9 +569,9 @@ export function TaskContextMenu({
         if (action.tone === "danger") classes.push(dangerItemClassName);
         if (action.tone === "note") classes.push(noteItemClassName);
         const defaultNode = action.tone === "note" ? (
-          <span key={action.id} className={classes.join(" ")} role="note">{action.label}</span>
+          <span key={action.id} className={classes.join(" ")} role="note" data-testid={action.testId}>{action.label}</span>
         ) : (
-          <button key={action.id} type="button" className={classes.join(" ")} role={role === "menu" ? "menuitem" : undefined} disabled={action.disabled} onPointerUp={(event) => handleActionPointerUp(event, action)} onClick={(event) => handleActionClick(event, action)}>{action.label}</button>
+          <button key={action.id} type="button" className={classes.join(" ")} role={role === "menu" ? "menuitem" : undefined} disabled={action.disabled} data-testid={action.testId} aria-pressed={action.pressed} onPointerUp={(event) => handleActionPointerUp(event, action)} onClick={(event) => handleActionClick(event, action)}>{action.label}</button>
         );
         return <Fragment key={action.id}>{renderAction ? renderAction(action, defaultNode) : defaultNode}</Fragment>;
       })}

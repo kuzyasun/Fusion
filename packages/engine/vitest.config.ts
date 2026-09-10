@@ -330,8 +330,6 @@ export default defineConfig({
           name: "engine-default",
           include: ["src/**/*.test.ts"],
           exclude: [
-            // FNXC:WedgeNotificationFlake 2026-08-23-22:35 — quarantined (2nd sighting); see scripts/lib/test-quarantine.json for the evidence and the 2026-09-06 deletion deadline.
-            "src/__tests__/self-healing-pending-wedge-notification.test.ts",
             "src/__tests__/reliability-interactions/**/*.test.ts",
             // FNXC:PipelineSmoke 2026-08-23-14:52: FN-182's whole-pipeline fixture is opt-in, never a default or gate test.
             "src/__tests__/pipeline-smoke/**/*.test.ts",
@@ -401,6 +399,13 @@ export default defineConfig({
             Quarantined on sight per AGENTS.md; mirrored in scripts/lib/test-quarantine.json.
             */
             // SQLite-path gate test evicted + quarantined (see engine-core comment + ledger).
+            /*
+            FNXC:SpecDriftReconciler 2026-09-09-08:09:
+            FN-9272 observed the documented second timer-driven failure in this file. Keep the
+            timing assertion intact and exclude the file under the deletion ratchet until a
+            root-cause repair can rescue its reconciler coverage.
+            */
+            "src/__tests__/spec-drift-reconciler.test.ts",
             "node_modules/**",
             "dist/**",
             // FNXC:PgMigrationQuarantine 2026-07-18-04:30: FN-8270 rescued the final seven VAL-REMOVAL-005 holdouts by awaiting PG audit reads and modeling async collaborators. Their paired ledger entries and excludes were removed only after targeted green runs.

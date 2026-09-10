@@ -16,9 +16,12 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { FusionAuthStorage } from "./auth-storage.js";
 import {
   choosePreferredStoredCredential,
+  computeStoredCredentialAccountFingerprint,
   readStoredCredentialsFromAuthFile,
   shouldHydrateStoredCredential,
   DEFAULT_PROVIDER_INSTANCE_ID,
+  isSameStoredCredentialMaterial,
+  mergeStoredCredentialPreservingMetadata,
   type ProviderInstanceRef,
   type StoredAuthCredential,
 } from "@fusion/core";
@@ -90,6 +93,49 @@ export const BUILT_IN_API_KEY_PROVIDERS: ReadonlyArray<{ id: string; name: strin
 
 const CLI_PROVIDER_IDS = new Set(["pi-claude-cli", "droid-cli"]);
 
+/*
+FNXC:ProviderAuth 2026-09-01-07:30:
+An OAuth adapter writes and returns through a provider's mutable default credential slot. Serialize
+instance login's snapshot, login, capture, and restore lifecycle per primary storage/provider so two
+concurrent browser flows cannot capture one another's credential product into different instances.
+*/
+const instanceLoginLocks = new WeakMap<object, Map<string, Promise<void>>>();
+
+async function withProviderInstanceLoginLock<T>(
+  authStorage: FusionAuthStorage,
+  providerId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let locks = instanceLoginLocks.get(authStorage);
+  if (!locks) {
+    locks = new Map();
+    instanceLoginLocks.set(authStorage, locks);
+  }
+
+  const previous = locks.get(providerId);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const queued = (previous ?? Promise.resolve()).catch(() => undefined).then(() => gate);
+  locks.set(providerId, queued);
+  await (previous ?? Promise.resolve()).catch(() => undefined);
+
+  try {
+    if (!authStorage.withProviderInstanceLoginLock) {
+      return await operation();
+    }
+    return await authStorage.withProviderInstanceLoginLock<T>(providerId, async () => {
+      // A separate process may have completed while this one waited for the file-scoped lock.
+      authStorage.reload();
+      return await operation();
+    });
+  } finally {
+    release();
+    if (locks.get(providerId) === queued) {
+      locks.delete(providerId);
+    }
+  }
+}
+
 function toApiKeyStorageProviderId(providerId: string): string {
   return providerId === ANTHROPIC_API_KEY_PROVIDER_ID ? ANTHROPIC_STORAGE_PROVIDER_ID : providerId;
 }
@@ -152,15 +198,43 @@ export function wrapAuthStorageWithApiKeyProviders(
   `ModelRuntime.login` with a storage-only id pi does not register and fails with
   `Unknown provider: anthropic-subscription` (GitHub #3462).
   */
-  const login = async (providerId: string, callbacks: LoginCallbacks): Promise<void> => {
+  /*
+  FNXC:ProviderAuth 2026-09-01-07:15:
+  Instance login must persist the credential this seam produced. Re-reading the provider default
+  cannot distinguish a newly minted account from browser consent re-authorizing the stored account.
+  */
+  const login = async (providerId: string, callbacks: LoginCallbacks): Promise<StoredCredential | undefined> => {
       if (providerId !== ANTHROPIC_STORAGE_PROVIDER_ID && providerId !== ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID) {
+        /*
+        FNXC:ProviderAuth 2026-09-09-14:01:
+        Upstream OAuth login replaces the bare provider row itself, so capture operator metadata before
+        invoking it. The minted credential must replace all stale material while retaining that metadata.
+        */
+        const preLoginCredential = authStorage.get(providerId) as StoredCredential | undefined;
         await mergedAuthStorage.login(
           providerId,
           callbacks,
         );
-        return;
+        const credential = authStorage.get(providerId) as StoredCredential | undefined;
+        if (credential?.type !== "oauth") {
+          return credential;
+        }
+        const stampedCredential = {
+          ...credential,
+          ...(computeStoredCredentialAccountFingerprint(credential) ? {
+            accountFingerprint: computeStoredCredentialAccountFingerprint(credential),
+          } : {}),
+        };
+        await authStorage.set(providerId, mergeStoredCredentialPreservingMetadata(preLoginCredential, stampedCredential));
+        return stampedCredential;
       }
 
+      /*
+      FNXC:ProviderAuth 2026-09-09-14:01:
+      The subscription row survives the upstream Anthropic bare-slot login, so preserve its operator
+      metadata when relocating freshly minted OAuth material back into the subscription storage row.
+      */
+      const preLoginSubscriptionCredential = mergedAuthStorage.get(ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID);
       const existingApiKey = mergedAuthStorage.get(ANTHROPIC_STORAGE_PROVIDER_ID);
       await mergedAuthStorage.login(
         ANTHROPIC_STORAGE_PROVIDER_ID,
@@ -173,13 +247,24 @@ export function wrapAuthStorageWithApiKeyProviders(
         Anthropic subscription OAuth and raw Anthropic API-key auth must be separate UI providers: OAuth stays `anthropic`, while the UI/API key card uses `anthropic-api-key` and maps back to the `anthropic` model credential.
         Store subscription OAuth under an internal key after upstream login because the OAuth library writes through the same `anthropic` id used by model API-key execution.
         */
-        await mergedAuthStorage.set(ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID, oauthCredential as StoredCredential);
+        const stampedCredential = {
+          ...oauthCredential,
+          ...(computeStoredCredentialAccountFingerprint(oauthCredential) ? {
+            accountFingerprint: computeStoredCredentialAccountFingerprint(oauthCredential),
+          } : {}),
+        };
+        await mergedAuthStorage.set(
+          ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID,
+          mergeStoredCredentialPreservingMetadata(preLoginSubscriptionCredential, stampedCredential),
+        );
         if (existingApiKey?.type === "api_key") {
           await mergedAuthStorage.set(ANTHROPIC_STORAGE_PROVIDER_ID, existingApiKey as StoredCredential);
         } else {
           await authStorage.remove(ANTHROPIC_STORAGE_PROVIDER_ID);
         }
+        return stampedCredential;
       }
+      return undefined;
   };
 
   return {
@@ -193,7 +278,7 @@ export function wrapAuthStorageWithApiKeyProviders(
     hasAuth: (provider) => provider === ANTHROPIC_STORAGE_PROVIDER_ID || provider === ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID
       ? Boolean(getAnthropicSubscriptionCredential())
       : mergedAuthStorage.hasAuth(provider),
-    login,
+    login: async (providerId, callbacks) => { await login(providerId, callbacks); },
     logout: async (provider) => {
       if (provider !== ANTHROPIC_STORAGE_PROVIDER_ID && provider !== ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID) {
         await mergedAuthStorage.logout(provider);
@@ -298,39 +383,70 @@ export function wrapAuthStorageWithApiKeyProviders(
       const providerId = ref.providerId === ANTHROPIC_STORAGE_PROVIDER_ID
         ? ANTHROPIC_SUBSCRIPTION_STORAGE_PROVIDER_ID
         : ref.providerId;
-      const target = { providerId, instanceId: ref.instanceId };
-      const previousDefault = mergedAuthStorage.getDefaultInstance(providerId);
-      const previousCredential = previousDefault && mergedAuthStorage.getInstance(previousDefault);
-      /*
-      FNXC:ProviderAuth 2026-08-01-06:48:
-      The runtime OAuth adapter only accepts a bare provider and therefore writes its resolved
-      default slot. Capture and restore that slot around the login before persisting the result to
-      the requested instance, so adding or reauthorizing an account never repoints its credential.
-
-      FNXC:ProviderAuth 2026-08-15-21:46:
-      Instance login must go through the Anthropic-aware `login` seam above, never raw
-      `mergedAuthStorage.login(providerId, ...)`: for the subscription card `providerId` here is the
-      storage row id `anthropic-subscription`, which pi's ModelRuntime does not register as a
-      provider, so the raw call failed every dashboard subscription login with
-      `Unknown provider: anthropic-subscription` (GitHub #3462) once the Authentication cards began
-      passing an explicit credential-instance id.
-      */
-      await login(providerId, callbacks);
-      const credential = mergedAuthStorage.get(providerId);
-      if (!credential) return;
-      await mergedAuthStorage.setInstance(target, { ...credential, ...(label ? { label } : {}) });
-      if (previousDefault && previousCredential && previousDefault.instanceId !== target.instanceId) {
-        await mergedAuthStorage.setInstance(previousDefault, previousCredential);
-      } else if (!previousDefault && target.instanceId !== DEFAULT_PROVIDER_INSTANCE_ID) {
+      return withProviderInstanceLoginLock(authStorage, providerId, async () => {
+        const target = { providerId, instanceId: ref.instanceId };
         /*
-        FNXC:ProviderAuth 2026-08-01-07:20:
-        Bare OAuth adapters materialize their first credential in `default`. When a first login
-        targets another client-generated id, remove that temporary slot and explicitly select the
-        target so no ghost default remains and the requested account becomes the provider default.
+        FNXC:ProviderAuth 2026-09-09-14:01:
+        Re-login must preserve target-row metadata such as the operator's label, but cannot retain any
+        old credential material or account identity. Snapshot it before the bare-slot login may overwrite it.
         */
-        await mergedAuthStorage.removeInstance({ providerId, instanceId: DEFAULT_PROVIDER_INSTANCE_ID });
-        await mergedAuthStorage.setDefaultInstance(target);
-      }
+        const existingTargetCredential = mergedAuthStorage.getInstance(target);
+        const previousDefault = mergedAuthStorage.getDefaultInstance(providerId);
+        const previousCredential = previousDefault && mergedAuthStorage.getInstance(previousDefault);
+        const preLoginInstances = mergedAuthStorage.listInstances(providerId)
+          .map((instanceRef) => ({ ref: instanceRef, credential: mergedAuthStorage.getInstance(instanceRef) }))
+          .filter((entry): entry is { ref: ProviderInstanceRef; credential: StoredCredential } => Boolean(entry.credential));
+        /*
+        FNXC:ProviderAuth 2026-08-01-06:48:
+        The runtime OAuth adapter only accepts a bare provider and therefore writes its resolved
+        default slot. Capture and restore that slot around the login before persisting the result to
+        the requested instance, so adding or reauthorizing an account never repoints its credential.
+
+        FNXC:ProviderAuth 2026-08-15-21:46:
+        Instance login must go through the Anthropic-aware `login` seam above, never raw
+        `mergedAuthStorage.login(providerId, ...)`: for the subscription card `providerId` here is the
+        storage row id `anthropic-subscription`, which pi's ModelRuntime does not register as a
+        provider, so the raw call failed every dashboard subscription login with
+        `Unknown provider: anthropic-subscription` (GitHub #3462) once the Authentication cards began
+        passing an explicit credential-instance id.
+        */
+        const credential = await login(providerId, callbacks);
+        if (!credential) return;
+        /*
+        FNXC:ProviderAuth 2026-09-01-07:15:
+        Compare only pre-login rows. OAuth adapters write through the current default, so a post-login
+        scan sees the login product in its own default row (including a first-login ghost default) and
+        would reject every valid instance login as a duplicate.
+        */
+        const duplicate = preLoginInstances.find((entry) =>
+          entry.ref.instanceId !== target.instanceId && isSameStoredCredentialMaterial(credential, entry.credential),
+        );
+        if (duplicate) {
+          if (previousDefault && previousCredential) {
+            await mergedAuthStorage.setInstance(previousDefault, previousCredential);
+          }
+          const conflictingAccount = duplicate.credential.label || duplicate.ref.instanceId;
+          throw new Error(
+            `This login authorized the account already stored as ${conflictingAccount}. Sign out of the provider in your browser and retry.`,
+          );
+        }
+        await mergedAuthStorage.setInstance(target, {
+          ...mergeStoredCredentialPreservingMetadata(existingTargetCredential, credential),
+          ...(label ? { label } : {}),
+        });
+        if (previousDefault && previousCredential && previousDefault.instanceId !== target.instanceId) {
+          await mergedAuthStorage.setInstance(previousDefault, previousCredential);
+        } else if (!previousDefault && target.instanceId !== DEFAULT_PROVIDER_INSTANCE_ID) {
+          /*
+          FNXC:ProviderAuth 2026-08-01-07:20:
+          Bare OAuth adapters materialize their first credential in `default`. When a first login
+          targets another client-generated id, remove that temporary slot and explicitly select the
+          target so no ghost default remains and the requested account becomes the provider default.
+          */
+          await mergedAuthStorage.removeInstance({ providerId, instanceId: DEFAULT_PROVIDER_INSTANCE_ID });
+          await mergedAuthStorage.setDefaultInstance(target);
+        }
+      });
     },
     logoutInstance: async (ref) => {
       await mergedAuthStorage.removeInstance({

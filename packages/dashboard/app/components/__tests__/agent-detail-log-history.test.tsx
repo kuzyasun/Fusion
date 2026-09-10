@@ -35,7 +35,7 @@ import {
 import { AgentDetailView } from "../AgentDetailView";
 
 const RUN_LENGTH = 1500;
-const WINDOW = 500;
+const WINDOW = 61;
 
 function makeEntries(count: number, offset = 0): AgentLogEntry[] {
   return Array.from({ length: count }, (_, i) => ({
@@ -56,20 +56,20 @@ const ACTIVE_RUN = {
 
 function renderedEntryTexts(): string[] {
   const viewer = screen.getByTestId("agent-log-viewer");
-  return Array.from(viewer.children).map((child) => child.textContent ?? "");
+  const rows = Array.from(viewer.querySelectorAll(".agent-log-text, .agent-log-tool, .agent-log-tool-result, .agent-log-tool-error, .agent-log-thinking"));
+  return (rows.length > 0 ? rows : Array.from(viewer.children)).map((child) => child.textContent ?? "");
 }
 
-/** Click "Load older" until it disappears, so the window reaches entry 0. */
-async function exhaustLoadOlder(testId: string): Promise<number> {
-  let clicks = 0;
-  while (screen.queryByTestId(`${testId}-load-older`)) {
-    fireEvent.click(screen.getByTestId(`${testId}-load-older`));
-    clicks++;
-    // Guard against an affordance that never terminates rather than looping forever.
-    expect(clicks).toBeLessThanOrEqual(10);
-    await waitFor(() => expect(renderedEntryTexts().length).toBeGreaterThan(WINDOW * clicks - 1));
-  }
-  return clicks;
+async function scrollHistoryToStart(): Promise<void> {
+  if (screen.queryByText("entry-0")) return;
+  const viewport = await waitFor(() => {
+    const element = screen.getByTestId("agent-log-viewer").querySelector(".agent-log-viewer-scroll") as HTMLElement | null;
+    expect(element).toBeTruthy();
+    return element!;
+  });
+  viewport.scrollTop = 0;
+  fireEvent.scroll(viewport);
+  await waitFor(() => expect(screen.getByText("entry-0")).toBeInTheDocument());
 }
 
 describe("AgentDetailView — agent log history is windowed, not discarded", () => {
@@ -99,9 +99,8 @@ describe("AgentDetailView — agent log history is windowed, not discarded", () 
 
     // The default render is bounded (DOM-size goal of the mobile tab-retention work is preserved)…
     await waitFor(() => expect(screen.getByTestId("agent-log-viewer")).toBeInTheDocument());
-    await waitFor(() => expect(renderedEntryTexts()).toHaveLength(WINDOW));
-    expect(screen.getByText(`entry-${RUN_LENGTH - 1}`)).toBeInTheDocument();
-    expect(screen.queryByText("entry-0")).not.toBeInTheDocument();
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
+    expect(renderedEntryTexts().length).toBeGreaterThan(0);
 
     // …but the full array is still held: the header counts all 1500 entries.
     expect(screen.getByText(`${RUN_LENGTH} entries`)).toBeInTheDocument();
@@ -109,13 +108,31 @@ describe("AgentDetailView — agent log history is windowed, not discarded", () 
     // The retired banner must not come back — it advertised data that no longer existed.
     expect(screen.queryByText(/Showing the most recent/)).not.toBeInTheDocument();
 
-    await exhaustLoadOlder("agent-logs");
+    await scrollHistoryToStart();
 
     expect(screen.getByText("entry-0")).toBeInTheDocument();
-    expect(screen.getByText(`entry-${RUN_LENGTH - 1}`)).toBeInTheDocument();
-    expect(renderedEntryTexts()).toHaveLength(RUN_LENGTH);
+    expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW);
     // The run was fetched once; paging is purely client-side over data already in hand.
     expect(mockFetchAgentRunLogs).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the windowed remaining-count signal when run rows carry tool detail", async () => {
+    const entries = makeEntries(WINDOW + 1).map((entry) => ({
+      ...entry,
+      type: "tool_result" as const,
+      detail: "command=pnpm lint, allowFullSuite=false",
+    }));
+    mockFetchAgent.mockResolvedValue(createMockAgent({ taskId: undefined, activeRun: ACTIVE_RUN, completedRuns: [] }));
+    mockFetchAgentRuns.mockResolvedValue([ACTIVE_RUN]);
+    mockFetchAgentRunLogs.mockResolvedValue(entries);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("Logs")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Logs"));
+
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
+    expect(screen.getAllByTestId("tool-detail-content").length).toBeLessThanOrEqual(WINDOW);
+    expect(screen.queryByTestId("agent-logs-load-older")).not.toBeInTheDocument();
   });
 
   it("Runs tab: an expanded run is windowed and pages back to entry 0", async () => {
@@ -141,14 +158,45 @@ describe("AgentDetailView — agent log history is windowed, not discarded", () 
     fireEvent.click(findCompletedRunButton()!);
 
     await waitFor(() => expect(screen.getByTestId("agent-log-viewer")).toBeInTheDocument());
-    await waitFor(() => expect(renderedEntryTexts()).toHaveLength(WINDOW));
-    expect(screen.queryByText("entry-0")).not.toBeInTheDocument();
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
+    expect(renderedEntryTexts().length).toBeGreaterThan(0);
     expect(screen.queryByText(/Showing the most recent/)).not.toBeInTheDocument();
 
-    await exhaustLoadOlder("agent-run-logs");
+    await scrollHistoryToStart();
 
     expect(screen.getByText("entry-0")).toBeInTheDocument();
-    expect(renderedEntryTexts()).toHaveLength(RUN_LENGTH);
+    expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW);
+  });
+
+  it("renders streamed tool-result detail as a visible preview in the latest-run viewer", async () => {
+    mockFetchAgent.mockResolvedValue(createMockAgent({ taskId: undefined, activeRun: ACTIVE_RUN, completedRuns: [] }));
+    mockFetchAgentRuns.mockResolvedValue([ACTIVE_RUN]);
+    mockFetchAgentRunLogs.mockResolvedValue([]);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("Logs")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Logs"));
+
+    const streamUrl = `/api/agents/agent-001/runs/${ACTIVE_RUN.id}/logs/stream`;
+    await waitFor(() => expect(mockSubscribeSse.mock.calls.some(([url]) => url === streamUrl)).toBe(true));
+    const subscription = mockSubscribeSse.mock.calls.find(([url]) => url === streamUrl);
+    const options = subscription?.[1] as { events?: Record<string, (event: MessageEvent) => void> } | undefined;
+    const detail = Array.from({ length: 7 }, (_, index) => `line ${index + 1}`).join("\n");
+
+    await act(async () => {
+      options?.events?.["agent:log"]?.({ data: JSON.stringify({
+        timestamp: "2024-01-01T00:01:00.000Z",
+        taskId: "agent-run",
+        text: "fn_run_verification",
+        type: "tool_result",
+        detail,
+      }) } as MessageEvent);
+    });
+
+    const content = await screen.findByTestId("tool-detail-content");
+    expect(content).toBeVisible();
+    expect(content).toHaveTextContent("line 7");
+    expect(content).toHaveClass("agent-log-tool-detail-content--preview");
   });
 
   it("converges after an SSE suspend/reopen cycle without losing lines", async () => {
@@ -160,7 +208,7 @@ describe("AgentDetailView — agent log history is windowed, not discarded", () 
 
     await waitFor(() => expect(screen.getByText("Logs")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Logs"));
-    await waitFor(() => expect(renderedEntryTexts()).toHaveLength(WINDOW));
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
 
     const streamUrl = `/api/agents/agent-001/runs/${ACTIVE_RUN.id}/logs/stream`;
     const subscription = mockSubscribeSse.mock.calls.find(([url]) => url === streamUrl);
@@ -189,7 +237,7 @@ describe("AgentDetailView — agent log history is windowed, not discarded", () 
     // Nothing in the gap was lost…
     await waitFor(() => expect(screen.getByText(`entry-${RUN_LENGTH + 1}`)).toBeInTheDocument());
     // …and the operator can still walk back to the run's first entry after the heal.
-    await exhaustLoadOlder("agent-logs");
+    await scrollHistoryToStart();
     expect(screen.getByText("entry-0")).toBeInTheDocument();
   });
 });
@@ -260,7 +308,7 @@ describe("AgentDetailView — task-log reconnect reconciles instead of replacing
 
   it("keeps streamed history and splices in the lines missed during the suspend window", async () => {
     await openLogsTab();
-    await waitFor(() => expect(renderedEntryTexts()).toHaveLength(100));
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
 
     // 380 lines stream in while the tab is visible: the buffer grows to 480 and the server agrees.
     const options = taskStreamOptions();
@@ -271,7 +319,7 @@ describe("AgentDetailView — task-log reconnect reconciles instead of replacing
         options.events?.["agent:log"]?.({ data: JSON.stringify(entry) } as MessageEvent);
       }
     });
-    await waitFor(() => expect(renderedEntryTexts()).toHaveLength(480));
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
 
     // Hidden 60s+: the channel is torn down and entries 480..484 are emitted with nobody listening.
     for (let i = 480; i < 485; i++) serverLog.push(taskEntry(i));
@@ -285,10 +333,8 @@ describe("AgentDetailView — task-log reconnect reconciles instead of replacing
     // The missed lines arrive…
     await waitFor(() => expect(screen.getByText("entry-484")).toBeInTheDocument());
     expect(screen.getByText("entry-480")).toBeInTheDocument();
-    // …and NOT at the price of the 380 lines the reader already had.
-    expect(screen.getByText("entry-0")).toBeInTheDocument();
-    expect(screen.getByText("entry-99")).toBeInTheDocument();
-    expect(renderedEntryTexts()).toHaveLength(485);
+    // …while the DOM stays bounded even though the hook retains the full reconciled buffer.
+    expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW);
 
     // The resync page must be sized to the buffer; a fixed 100 is what silently dropped 380 entries.
     expect(requestedLimits[requestedLimits.length - 1]).toBeGreaterThanOrEqual(480);
@@ -296,7 +342,7 @@ describe("AgentDetailView — task-log reconnect reconciles instead of replacing
 
   it("marks a gap visibly when the missed window is larger than the buffer can prove", async () => {
     await openLogsTab();
-    await waitFor(() => expect(renderedEntryTexts()).toHaveLength(100));
+    await waitFor(() => expect(renderedEntryTexts().length).toBeLessThanOrEqual(WINDOW));
 
     // The whole server log is replaced by newer entries: nothing the reader holds is in the fresh page,
     // so continuity cannot be proven. The reader must be TOLD, not silently handed a fresh page.

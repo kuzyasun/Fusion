@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Agent, TaskStore, Task, TaskDetail, Settings } from "@fusion/core";
-import { applyOriginalDescription, builtinSeamPrompt, buildBootstrapPrompt, computePlanApprovalFingerprint, deriveFallbackTaskTitle, MAX_TASK_LIST_TEXT_CHARS, renderTriagePolicyPlaceholders, resolveAgentPrompt } from "@fusion/core";
+import { applyOriginalDescription, builtinSeamPrompt, buildBootstrapPrompt, computePlanApprovalFingerprint, createCurrentPlanEvidence, deriveFallbackTaskTitle, MAX_TASK_LIST_TEXT_CHARS, renderTriagePolicyPlaceholders, resolveAgentPrompt, UnavailablePlanLockError } from "@fusion/core";
 import {
   TriageProcessor,
   buildSpecificationPrompt,
@@ -375,6 +375,46 @@ describe("buildSpecificationPrompt", () => {
     expect(prompt).toContain("Project Commands");
     expect(prompt).toContain("pnpm test");
     expect(prompt).toContain("pnpm build");
+  });
+
+  it("includes a healthy environment capability inventory for planning", () => {
+    const prompt = buildSpecificationPrompt(
+      baseTask,
+      ".fusion/tasks/KB-001/PROMPT.md",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        environmentCapabilities: {
+          capabilities: [
+            { name: "node", available: true },
+            { name: "python3", available: false },
+          ],
+          degraded: false,
+        },
+      },
+    );
+
+    expect(prompt).toContain("## Environment Capabilities");
+    expect(prompt).toContain("Unavailable commands: python3");
+    expect(prompt).toContain("## Environment Constraints");
+  });
+
+  it("omits environment capabilities when the probe is degraded or absent", () => {
+    const degraded = buildSpecificationPrompt(
+      baseTask,
+      ".fusion/tasks/KB-001/PROMPT.md",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { environmentCapabilities: { capabilities: [], degraded: true } },
+    );
+    const absent = buildSpecificationPrompt(baseTask, ".fusion/tasks/KB-001/PROMPT.md");
+
+    expect(degraded).not.toContain("## Environment Capabilities");
+    expect(absent).not.toContain("## Environment Capabilities");
   });
 
   describe("completionDocumentationMode setting", () => {
@@ -1067,20 +1107,17 @@ describe("FN-5893 invariant regression wording", () => {
   });
 });
 
-describe("fast-mode triage", () => {
-  it("exports a lean FAST_PLANNING_PROMPT", () => {
+describe("lean-planning and Fast admission", () => {
+  it("keeps the lean planning prompt available independently of Fast task execution", () => {
     expect(typeof FAST_PLANNING_PROMPT).toBe("string");
     expect(FAST_PLANNING_PROMPT.length).toBeGreaterThan(0);
-    expect(FAST_PLANNING_PROMPT).toContain("This task is running in **fast mode**");
-    expect(FAST_PLANNING_PROMPT).toContain("workflow Plan Review");
-    expect(FAST_PLANNING_PROMPT).toContain("Do not call `fn_review_spec()`");
     expect(FAST_PLANNING_PROMPT).not.toContain("## Review Level");
     expect(FAST_PLANNING_PROMPT).not.toContain("## Triage subtask breakdown");
     expect(FAST_PLANNING_PROMPT).not.toContain("## Proactive Subtask Breakdown");
     expect(FAST_PLANNING_PROMPT).not.toContain("Frontend UX Criteria");
   });
 
-  it("documents explicit-request-only workflow routing in standard and fast prompts", () => {
+  it("documents explicit-request-only workflow routing in standard and lean prompts", () => {
     const required = ["## Workflow Routing", "Keep the project default workflow", "unless the user explicitly requested a specific workflow", "or you created that task yourself", "When you create a task via `fn_task_create`", "do not move a task you did not create unless the user asked", "Do NOT call `fn_workflow_select` or pass `workflow_id`", "If the user explicitly", "fn_workflow_list", "fn_workflow_select", "workflow_id", "**No commits expected:** true", "builtin:coding"];
     const forbidden = ["use workflow descriptions as the routing signal", "select an appropriate lightweight workflow", "prefer `builtin:quick-fix` or a custom investigation workflow", "Match the task nature to the workflow description", "descriptions are authoritative for routing decisions"];
     for (const prompt of [RENDERED_TRIAGE_POLICY_PROMPT, FAST_PLANNING_PROMPT]) {
@@ -1100,10 +1137,11 @@ describe("fast-mode triage", () => {
     expect(FAST_PLANNING_PROMPT).toContain("forensic");
   });
 
-  it("selects FAST_PLANNING_PROMPT for fast tasks", async () => {
-    const task = createTriageTask({ id: "FN-FAST-001", executionMode: "fast" });
+  it("selects FAST_PLANNING_PROMPT when leanPlanning is enabled", async () => {
+    const task = createTriageTask({ id: "FN-LEAN-001", executionMode: "standard" });
     const store = createMockStore({
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+      getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4, pollIntervalMs: 10_000, autoMerge: true, leanPlanning: true } as Settings),
     });
 
     let capturedSystemPrompt = "";
@@ -1123,7 +1161,7 @@ describe("fast-mode triage", () => {
     const processor = new TriageProcessor(store, "/tmp/root");
     await processor.specifyTask(task);
 
-    expect(capturedSystemPrompt).toContain("This task is running in **fast mode**");
+    expect(capturedSystemPrompt).toContain("Do not call `fn_review_spec()`");
     expect(capturedSystemPrompt).not.toContain("## Review Level");
   });
 
@@ -1285,10 +1323,11 @@ describe("fast-mode triage", () => {
     expect(capturedSystemPrompt).not.toContain("## Plugin:");
   });
 
-  it("applies triage plugin contributions in fast mode too", async () => {
-    const task = createTriageTask({ id: "FN-FAST-PLUGIN-003", executionMode: "fast" });
+  it("applies triage plugin contributions in lean planning", async () => {
+    const task = createTriageTask({ id: "FN-LEAN-PLUGIN-003", executionMode: "standard" });
     const store = createMockStore({
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+      getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4, pollIntervalMs: 10_000, autoMerge: true, leanPlanning: true } as Settings),
     });
     const pluginRunner = {
       getPromptContributionsForSurface: vi.fn().mockReturnValue([
@@ -1314,69 +1353,22 @@ describe("fast-mode triage", () => {
     const processor = new TriageProcessor(store, "/tmp/root", { pluginRunner: pluginRunner as any });
     await processor.specifyTask(task);
 
-    expect(capturedSystemPrompt).toContain("This task is running in **fast mode**");
     expect(capturedSystemPrompt).toContain("## Plugin: plugin-fast");
   });
 
-  it("finalizes fast planning without exposing a separate spec-review tool", async () => {
-    const rootDir = await createTriageFixtureRoot("fusion-triage-fast-gate-");
-    try {
-      const task = createTriageTask({ id: "FN-FAST-004", executionMode: "fast" });
-      const promptPath = join(rootDir, ".fusion", "tasks", task.id, "PROMPT.md");
-      await mkdir(join(rootDir, ".fusion", "tasks", task.id), { recursive: true });
+  it("does not start a planning session for a Fast task", async () => {
+    mockCreateFnAgent.mockClear();
+    const task = createTriageTask({ id: "FN-FAST-004", executionMode: "fast" });
+    const store = createMockStore();
 
-      const store = createMockStore({
-        getSettings: vi.fn().mockResolvedValue({
-          maxConcurrent: 2,
-          maxWorktrees: 4,
-          pollIntervalMs: 10000,
-          groupOverlappingFiles: false,
-          autoMerge: true,
-          experimentalFeatures: { researchView: true },
-        } as Settings),
-        getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
-        parseDependenciesFromPrompt: vi.fn().mockResolvedValue([]),
-        parseStepsFromPrompt: vi.fn().mockResolvedValue([]),
-        parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
-      });
+    await new TriageProcessor(store, "/tmp/root").specifyTask(task);
 
-      let capturedTools: any[] = [];
-      mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
-        capturedTools = opts.customTools;
-        return {
-          session: {
-            state: {},
-            sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
-            prompt: vi.fn().mockResolvedValue(undefined),
-            dispose: vi.fn(),
-            navigateTree: vi.fn(),
-          },
-        };
-      });
-
-      const { promptWithFallback } = await import("../pi.js");
-      (promptWithFallback as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_run")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_list")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_get")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_cancel")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_retry")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_review_spec")).toBe(false);
-        await writeFile(promptPath, "# Task: FN-FAST-004 - Fast\n\n## Mission\n\nShip it.");
-      });
-
-      const processor = new TriageProcessor(store, rootDir);
-      await processor.specifyTask(task);
-
-      expect(mockReviewStep).not.toHaveBeenCalled();
-      expect(store.moveTask).toHaveBeenCalledWith("FN-FAST-004", "todo");
-    } finally {
-      await cleanupTriageFixtureRoot(rootDir);
-    }
+    expect(mockCreateFnAgent).not.toHaveBeenCalled();
+    expect(store.logEntry).toHaveBeenCalledWith(task.id, "Fast mode intentionally skips specification planning");
   });
 
   it("omits research tools and prompt guidance when researchView experimental flag is disabled", async () => {
-    const task = createTriageTask({ id: "FN-FAST-005", executionMode: "fast" });
+    const task = createTriageTask({ id: "FN-LEAN-005", executionMode: "standard" });
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({
         maxConcurrent: 2,
@@ -1384,6 +1376,7 @@ describe("fast-mode triage", () => {
         pollIntervalMs: 10000,
         groupOverlappingFiles: false,
         autoMerge: true,
+        leanPlanning: true,
         experimentalFeatures: { researchView: false },
       } as Settings),
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
@@ -1417,7 +1410,7 @@ describe("fast-mode triage", () => {
   });
 
   it("includes research prompt guidance when researchView experimental flag is enabled", async () => {
-    const task = createTriageTask({ id: "FN-FAST-006", executionMode: "fast" });
+    const task = createTriageTask({ id: "FN-LEAN-006", executionMode: "standard" });
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({
         maxConcurrent: 2,
@@ -1425,6 +1418,7 @@ describe("fast-mode triage", () => {
         pollIntervalMs: 10000,
         groupOverlappingFiles: false,
         autoMerge: true,
+        leanPlanning: true,
         experimentalFeatures: { researchView: true },
       } as Settings),
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
@@ -1697,7 +1691,7 @@ Planner rewrote mission without the raw request.
 
 ## Steps
 
-### Step 1: Implement
+### Step 0: Implement
 
 - [ ] Do the work
 `;
@@ -1735,7 +1729,7 @@ Planner rewrote mission without the raw request.
     try {
       const taskDir = join(tempRoot, ".fusion", "tasks", task.id);
       await mkdir(taskDir, { recursive: true });
-      const written = `# Task: ${task.id} - Missing release artifact\n\n## Steps\n\n### Step 1: Implement\n\n- [ ] Do the work\n`;
+      const written = `# Task: ${task.id} - Missing release artifact\n\n## Steps\n\n### Step 0: Implement\n\n- [ ] Do the work\n`;
       await writeFile(join(taskDir, "PROMPT.md"), written, "utf-8");
       const localStore = createMockStore({
         getTask: vi.fn().mockResolvedValue({ ...task, prompt: "" }),
@@ -1878,6 +1872,7 @@ Planner rewrote mission without the raw request.
 
     expect(projectAdmissionCoordinator.inspectProjectStateForTests(projectId)).toEqual({
       reservedCount: 0,
+      reservedWorktreeCount: 0,
       draining: false,
       providerIds: [],
     });
@@ -2635,8 +2630,8 @@ describe("requirePlanApproval setting", () => {
    * awaiting-approval a second time; the fix must move straight to todo instead.
    */
   describe("FN-7569: plan approval fingerprint idempotency", () => {
-    const planText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing.\n\n## File Scope\n\n- a.ts\n\n## Steps\n\n### Step 1: Implement\n\nDo the thing.\n";
-    const changedPlanText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing, differently.\n\n## File Scope\n\n- a.ts\n- b.ts\n\n## Steps\n\n### Step 1: Implement differently\n\nDo the changed thing.\n";
+    const planText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing.\n\n## File Scope\n\n- a.ts\n\n## Steps\n\n### Step 0: Implement\n\nDo the thing.\n";
+    const changedPlanText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing, differently.\n\n## File Scope\n\n- a.ts\n- b.ts\n\n## Steps\n\n### Step 0: Implement differently\n\nDo the changed thing.\n";
 
     /*
     FNXC:PlanApproval 2026-07-15-14:05:
@@ -3020,7 +3015,7 @@ describe("requirePlanApproval setting", () => {
       finalizeApprovedTask(task: Task, writtenInput: string, settings: Settings): Promise<void>;
     }).finalizeApprovedTask(
       task,
-      "# Task: FN-7224 - Rebuilt plan task\n\n## Steps\n\n### Step 1: Fresh step\n- Execute the fresh plan.\n",
+      "# Task: FN-7224 - Rebuilt plan task\n\n## Steps\n\n### Step 0: Fresh step\n- Execute the fresh plan.\n",
       { requirePlanApproval: false } as Settings,
     );
 
@@ -3174,7 +3169,7 @@ describe("specified triage recovery", () => {
   it("recovers a structured implementation plan without a no-commits marker", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-001 - Implement change\n\n**Size:** M\n\n## Steps\n\n### Step 1: Implement\n\nMake the change.\n",
+      "# Task: FN-001 - Implement change\n\n**Size:** M\n\n## Steps\n\n### Step 0: Implement\n\nMake the change.\n",
     );
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({
@@ -3543,7 +3538,7 @@ Forbidden paths / non-goals:
 
 ## Steps
 
-### Step 1: Fix poisoned scope
+### Step 0: Fix poisoned scope
 
 Apply the scoped implementation changes.
 `,
@@ -3620,7 +3615,7 @@ Apply the scoped implementation changes.
 
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      `# Task: FN-001 - ${fallbackTitle}\n\n**Size:** M\n\n## Steps\n\n### Step 1: Preserve the title\n\nKeep the planned title.`,
+      `# Task: FN-001 - ${fallbackTitle}\n\n**Size:** M\n\n## Steps\n\n### Step 0: Preserve the title\n\nKeep the planned title.`,
     );
 
     const store = createMockStore({
@@ -3655,7 +3650,7 @@ Apply the scoped implementation changes.
   it("updates malformed metadata title from prompt heading when task ID matches", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-001 - Experimental AI Agent Onboarding Flow\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 1: Implement onboarding flow\n\nMake the change.",
+      "# Task: FN-001 - Experimental AI Agent Onboarding Flow\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 0: Implement onboarding flow\n\nMake the change.",
     );
 
     const store = createMockStore({
@@ -3694,7 +3689,7 @@ Apply the scoped implementation changes.
   it("does not overwrite title when heading task ID does not match", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-999 - Wrong Task\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 1: Implement change\n\nMake the change.",
+      "# Task: FN-999 - Wrong Task\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 0: Implement change\n\nMake the change.",
     );
 
     const store = createMockStore({
@@ -3744,7 +3739,7 @@ Apply the scoped implementation changes.
   it("preserves imported GitHub issue titles during planning recovery", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-001 - Different AI-generated planning title\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 1: Implement issue fix\n\nMake the change.",
+      "# Task: FN-001 - Different AI-generated planning title\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 0: Implement issue fix\n\nMake the change.",
     );
 
     const store = createMockStore({
@@ -4031,6 +4026,103 @@ describe("taskCreate tool model inheritance", () => {
       (promptWithFallback as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     });
 
+    it("records deterministic spec-lock evidence across real planner finalization attempts", async () => {
+      const task = createTriageTask({ id: "FN-SPEC-LOCK-RETRY" });
+      const root = await createTriageFixtureRoot("fusion-triage-spec-lock-retry-");
+      const promptPath = join(root, ".fusion", "tasks", task.id, "PROMPT.md");
+      await mkdir(join(root, ".fusion", "tasks", task.id), { recursive: true });
+      const liveTask = { ...task, attachments: [], comments: [] } as Task;
+      const initialPrompt = "## Mission\n\nPlanner-authored initial plan\n";
+      const changedPrompt = "## Mission\n\nPlanner-authored changed plan\n";
+      const replanInputPrompt = "## Mission\n\nPlanner-authored replan input\n";
+      const successfulPrompt = "## Mission\n\nPlanner-authored successful plan\n";
+      const sourceHashFor = (prompt: string) => createCurrentPlanEvidence({
+        version: 1,
+        sourceRevision: 1,
+        capturedAt: "2026-09-07T00:00:00.000Z",
+        prompt,
+      }).sourceHash;
+      let plannerCalls = 0;
+      let lockFailure = true;
+      const updateTask = vi.fn(async (_id: string, patch: Partial<Task>) => {
+        Object.assign(liveTask, patch);
+        return liveTask;
+      });
+      const store = createMockStore({
+        getTask: vi.fn(async () => liveTask),
+        updateTask,
+        isBackendMode: vi.fn(() => true),
+        captureCurrentPlanEvidenceWhilePlanningLocked: vi.fn(async () => undefined),
+        lockCurrentPlanWhilePlanningLocked: vi.fn(async () => {
+          if (!lockFailure) return;
+          const lockedPrompt = readFileSync(promptPath, "utf8");
+          throw new UnavailablePlanLockError("section-duplicate", ["mission"], sourceHashFor(lockedPrompt));
+        }),
+        reconcileSpecDriftWhilePlanningLocked: vi.fn(async () => undefined),
+      });
+      mockCreateFnAgent.mockResolvedValue({
+        session: { prompt: vi.fn(), dispose: vi.fn(), sessionManager: {}, navigateTree: vi.fn() },
+      });
+      const { promptWithFallback } = await import("../pi.js");
+      (promptWithFallback as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        plannerCalls += 1;
+        const plannerPrompt = plannerCalls <= 2
+          ? initialPrompt
+          : plannerCalls === 3
+            ? changedPrompt
+            : successfulPrompt;
+        await writeFile(promptPath, plannerPrompt, "utf8");
+      });
+
+      try {
+        const processor = new TriageProcessor(store, root, { pollIntervalMs: 100_000 });
+
+        await processor.specifyTask({ ...liveTask });
+        expect(liveTask).toMatchObject({ status: "needs-replan", recoveryRetryCount: 1 });
+        const initialSourceHash = sourceHashFor(readFileSync(promptPath, "utf8"));
+        expect(liveTask.planningFailure?.specLockUnavailable).toMatchObject({
+          sourceHash: initialSourceHash, reason: "section-duplicate", sections: ["mission"], attempt: 1,
+        });
+
+        await processor.specifyTask({ ...liveTask });
+        expect(sourceHashFor(readFileSync(promptPath, "utf8"))).toBe(initialSourceHash);
+        expect(liveTask).toMatchObject({
+          status: "failed",
+          error: "PLANNING_FAILED_SPEC_LOCK_UNAVAILABLE: section-duplicate (mission)",
+          recoveryRetryCount: null,
+          nextRecoveryAt: null,
+        });
+        expect(liveTask.planningFailure?.specLockUnavailable).toBeUndefined();
+
+        Object.assign(liveTask, {
+          status: "needs-replan",
+          error: null,
+          recoveryRetryCount: 1,
+          nextRecoveryAt: null,
+          planningFailure: {
+            specLockUnavailable: {
+              sourceHash: initialSourceHash, reason: "section-duplicate", sections: ["mission"], at: new Date().toISOString(), attempt: 1,
+            },
+          },
+        });
+        await writeFile(promptPath, replanInputPrompt, "utf8");
+        expect(readFileSync(promptPath, "utf8")).toBe(replanInputPrompt);
+        await processor.specifyTask({ ...liveTask });
+        const changedSourceHash = sourceHashFor(readFileSync(promptPath, "utf8"));
+        expect(changedSourceHash).not.toBe(initialSourceHash);
+        expect(liveTask).toMatchObject({ status: "needs-replan", recoveryRetryCount: 2 });
+        expect(liveTask.planningFailure?.specLockUnavailable).toMatchObject({ sourceHash: changedSourceHash });
+
+        lockFailure = false;
+        Object.assign(liveTask, { status: "needs-replan", recoveryRetryCount: null, nextRecoveryAt: null });
+        await processor.specifyTask({ ...liveTask });
+        expect(liveTask.planningFailure?.specLockUnavailable).toBeUndefined();
+        expect(store.lockCurrentPlanWhilePlanningLocked).toHaveBeenCalledTimes(4);
+      } finally {
+        await cleanupTriageFixtureRoot(root);
+      }
+    });
+
     it("requeues triage with backoff when the agent exits without writing PROMPT.md", async () => {
       const task = {
         id: "FN-202",
@@ -4119,7 +4211,7 @@ describe("taskCreate tool model inheritance", () => {
       try {
         await new TriageProcessor(store, root, { onSpecifyComplete }).specifyTask(task);
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: null,
+          status: "needs-replan",
           recoveryRetryCount: 1,
           nextRecoveryAt: expect.any(String),
         }));
@@ -4162,7 +4254,7 @@ describe("taskCreate tool model inheritance", () => {
       try {
         await new TriageProcessor(store, root, { onSpecifyComplete }).specifyTask(task);
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: null,
+          status: "needs-replan",
           recoveryRetryCount: 1,
         }));
         expect(onSpecifyComplete).not.toHaveBeenCalled();
@@ -4188,7 +4280,7 @@ describe("taskCreate tool model inheritance", () => {
       try {
         await new TriageProcessor(store, root, { onSpecifyComplete }).specifyTask(task);
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: null,
+          status: "needs-replan",
           recoveryRetryCount: 1,
           nextRecoveryAt: expect.any(String),
         }));
@@ -4247,7 +4339,7 @@ describe("taskCreate tool model inheritance", () => {
       try {
         await new TriageProcessor(store, root, { onSpecifyComplete }).specifyTask(task);
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: null,
+          status: "needs-replan",
           recoveryRetryCount: 1,
         }));
         expect(onSpecifyComplete).not.toHaveBeenCalled();
@@ -4331,7 +4423,7 @@ describe("taskCreate tool model inheritance", () => {
         expect(pluginRunner.getRuntimeById).toHaveBeenCalledWith("deferred-planner");
         expect(pluginRuntime.createSession).toHaveBeenCalledTimes(1);
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: null,
+          status: "needs-replan",
           recoveryRetryCount: 1,
           nextRecoveryAt: expect.any(String),
         }));
@@ -7544,7 +7636,7 @@ describe("FN-4774 regression: triage duplicate detection over done/archived task
   }
 
   // Regression: FN-4774 (FN-4827 recovery; supersedes FN-4815) — see docs/triage-duplicate-detection-postmortem.md
-  it("fn_task_search tool is registered with includeDone and includeArchived parameters", () => {
+  it("fn_task_search exposes the Done history opt-in without an Archived filter", () => {
     const store = createMockStore();
     const processor = new TriageProcessor(store as any, "/tmp/root");
 
@@ -7557,41 +7649,27 @@ describe("FN-4774 regression: triage duplicate detection over done/archived task
     expect(taskSearchTool).toBeDefined();
     expect(taskSearchTool.name).toBe("fn_task_search");
 
-    // Verify includeDone and includeArchived are present in the parameter schema
     const props = taskSearchTool.parameters.properties;
     expect(props).toHaveProperty("includeDone");
-    expect(props).toHaveProperty("includeArchived");
+    expect(props).not.toHaveProperty("includeArchived");
   });
 
   // Regression: FN-4774 (FN-4827 recovery; supersedes FN-4815) — see docs/triage-duplicate-detection-postmortem.md
-  it("canonical triage policy prompt guides agents to exclude done/archived duplicates", () => {
+  it("canonical triage policy prompt guides agents to exclude completed duplicates", () => {
     // Standard prompt mentions fn_task_search in duplicate-check guidance
     expect(TRIAGE_POLICY_PROMPT).toContain("fn_task_search");
     expect(TRIAGE_POLICY_PROMPT).toContain("includeDone: false");
-    expect(TRIAGE_POLICY_PROMPT).toContain("includeArchived: false");
-    // Duplicate-check section co-locates fn_task_search with done/archived references
-    expect(TRIAGE_POLICY_PROMPT).toContain("done");
-    expect(TRIAGE_POLICY_PROMPT).toContain("archived");
-    // Defensive regex: duplicate-check guidance must cross-reference fn_task_search with done/archived
-    expect(
-      /Duplicate check[\s\S]{0,600}fn_task_search[\s\S]{0,400}(done|archived)/i.test(
-        TRIAGE_POLICY_PROMPT,
-      ),
-    ).toBe(true);
+    expect(TRIAGE_POLICY_PROMPT).not.toContain("includeArchived");
+    expect(/Duplicate check[\s\S]{0,600}fn_task_search[\s\S]{0,400}(done|completed)/i.test(TRIAGE_POLICY_PROMPT)).toBe(true);
   });
 
   // Regression: FN-4774 (FN-4827 recovery; supersedes FN-4815) — see docs/triage-duplicate-detection-postmortem.md
-  it("FAST_PLANNING_PROMPT guides agents to exclude done/archived duplicates", () => {
+  it("FAST_PLANNING_PROMPT guides agents to exclude completed duplicates", () => {
     // Fast prompt mentions fn_task_search
     expect(FAST_PLANNING_PROMPT).toContain("fn_task_search");
     expect(FAST_PLANNING_PROMPT).toContain("includeDone: false");
-    expect(FAST_PLANNING_PROMPT).toContain("includeArchived: false");
-    // Defensive regex: duplicate-check guidance must cross-reference fn_task_search with done/archived
-    expect(
-      /Duplicate check[\s\S]{0,600}fn_task_search[\s\S]{0,400}(done|archived)/i.test(
-        FAST_PLANNING_PROMPT,
-      ),
-    ).toBe(true);
+    expect(FAST_PLANNING_PROMPT).not.toContain("includeArchived");
+    expect(/Duplicate check[\s\S]{0,600}fn_task_search[\s\S]{0,400}(done|completed)/i.test(FAST_PLANNING_PROMPT)).toBe(true);
   });
 
   // Regression: FN-4774 (FN-4827 recovery; supersedes FN-4815) — see docs/triage-duplicate-detection-postmortem.md

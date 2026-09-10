@@ -45,7 +45,7 @@ import type { UpdateChannel } from "../../i18n/app-version.js";
 import type { ModelPricing } from "../../ai/model-pricing.js";
 import type { SecretScope } from "../../secrets/secrets-store.js";
 // Structural deps still defined in types.ts — import type-only (cycle is type-only).
-import type { AgentPromptsConfig, ArchiveAgentLogMode, TaskTokenBudget } from "../../types.js";
+import type { AgentPromptsConfig, TaskTokenBudget } from "../../types.js";
 
 // ── Settings Scope Types ────────────────────────────────────────────────
 //
@@ -306,6 +306,11 @@ export interface VoiceInputSettings {
   language?: string;
 }
 
+export interface ChatSnippet {
+  name: string;
+  prompt: string;
+}
+
 export interface GlobalSettings {
   /** Maximum PostgreSQL server connections for Fusion's embedded database. Applied on the next Fusion restart. */
   embeddedPostgresMaxConnections?: number;
@@ -358,6 +363,16 @@ export interface GlobalSettings {
    * This global-only operator keyboard preference defaults to true to preserve Enter-submits behavior. When disabled, Enter inserts a newline and Cmd/Ctrl+Enter submits; shared projects must never change an operator's keyboard behavior.
    */
   quickAddSubmitOnEnter?: boolean;
+  /**
+   * FNXC:ChatComposer 2026-09-06-01:54:
+   * Cette préférence clavier reste globale uniquement afin qu’un projet partagé ne puisse jamais imposer le comportement d’un opérateur. Le mode `auto` insère un saut de ligne lorsque le pointeur primaire est tactile et envoie sinon ; le pointeur, plutôt que la largeur, préserve l’envoi par Entrée dans une fenêtre de bureau étroite pilotée à la souris. Le réglage gouverne uniquement Entrée sans Cmd/Ctrl ni Shift, après les branches d’autocomplétion, la garde Shift et, dans TaskChatTab, la garde de composition IME ; Cmd/Ctrl+Enter sans Shift ne le consulte jamais.
+   */
+  chatSubmitOnEnter?: "auto" | "always" | "never";
+  /**
+   * FNXC:ChatSnippets 2026-09-03-15:56:
+   * Reusable dashboard-chat prompts are a global operator preference because direct and task chats span projects. They use the existing global settings transport and need neither project persistence nor a dedicated route.
+   */
+  chatSnippets?: ChatSnippet[];
   /** Active UI locale (e.g. `"en"`, `"zh-CN"`, `"fr"`). One of `SUPPORTED_LOCALES`.
    *  When unset, each surface resolves the locale at runtime (browser/env
    *  detection) and falls back to `DEFAULT_LOCALE` ("en"). */
@@ -789,6 +804,18 @@ export interface GlobalSettings {
   importTranslateGlobalModelId?: string;
   /** Optional global translate-lane thinking override. Inherits `defaultThinkingLevel` when unset. */
   importTranslateGlobalThinkingLevel?: ThinkingLevel;
+  /*
+  FNXC:FastCheapModelLane 2026-08-29-02:43:
+  Fast & Cheap execution is a dedicated route, so its model selection must not reuse the normal execution lane. A complete pair is optional and falls through to the execution lane when unset.
+  */
+  /** Global baseline provider for Fast & Cheap task execution. Must be paired with `fastCheapGlobalModelId`. */
+  fastCheapGlobalProvider?: string;
+  /** Optional credential instance for `fastCheapGlobalProvider`. */
+  fastCheapGlobalCredentialInstanceId?: string;
+  /** Global baseline model ID for Fast & Cheap task execution. Must be paired with `fastCheapGlobalProvider`. */
+  fastCheapGlobalModelId?: string;
+  /** Optional global Fast & Cheap thinking override. Inherits execution/default thinking when unset. */
+  fastCheapGlobalThinkingLevel?: ThinkingLevel;
   /** Optional global execution-lane thinking override. Inherits `defaultThinkingLevel` when unset. */
   executionGlobalThinkingLevel?: ThinkingLevel;
   /** Optional global planning-lane thinking override. Inherits `defaultThinkingLevel` when unset. */
@@ -845,12 +872,11 @@ export interface GlobalSettings {
    *  triggers a vitest auto-kill. Clamped to [50, 99] in the UI.
    *  Default: 90. */
   vitestKillThresholdPct?: number;
-  /** When true (default), persist tool argument/result payloads in task agent
-   *  logs for `tool`, `tool_result`, and `tool_error` entries. Very large tool
-   *  payloads may still be clipped server-side to keep dashboard log reads
-   *  responsive. When false, tool timeline rows are still stored, but their
-   *  verbose `detail` payload is omitted to reduce log size/noise. Distinct
-   *  from `persistAgentThinkingLog`, which controls `thinking` rows. */
+  /** When true (default), persist tool arguments and successful result payloads
+   *  in task agent logs. Failed `tool_error` detail remains a bounded diagnostic
+   *  signal even when false; tool timeline rows remain stored either way. Very
+   *  large payloads may still be clipped server-side. Distinct from
+   *  `persistAgentThinkingLog`, which controls `thinking` rows. */
   persistAgentToolOutput?: boolean;
   /** Per-result engine-injected tool-output budget. Unset/null uses 16,000 characters;
    * positive integers set a custom cap; 0 disables the shared clamp; invalid values
@@ -1079,12 +1105,6 @@ export interface ProjectSettings {
    * grounded candidates do not qualify; this setting never authorizes filler.
    */
   requireTaskRecommendations?: boolean;
-  /**
-   * FNXC:TaskRecommendations 2026-08-13-03:56:
-   * The operator requested an on/off switch for recommendation mailbox notices. This controls
-   * best-effort observability only; disabling it never changes recommendation capture or storage.
-   */
-  recommendationMailboxNoticeEnabled?: boolean;
   /** Hard stop: when true, all automated agent activity is **immediately**
    *  terminated — active triage, execution, and merge agent sessions are
    *  killed, and the scheduler stops dispatching new work. Acts as a
@@ -1191,8 +1211,9 @@ export interface ProjectSettings {
    * positive integers set a custom cap; 0 disables the shared clamp; invalid values
    * fall back to the finite default. */
   agentToolOutputMaxChars?: number | null;
-  /** Maximum number of concurrent AI agents across all activity types
-   *  (triage specification, task execution, and merge operations). */
+  /** Maximum number of concurrent AI-active tasks across planning, execution,
+   *  review, and merge. This provider/LLM-load limit is independent of the
+   *  execution-worktree limit. */
   maxConcurrent: number;
   /**
    * FNXC:ExecutorToolFailureRetry 2026-08-06-14:56:
@@ -1227,15 +1248,14 @@ export interface ProjectSettings {
    * Max concurrent verification subprocesses (fn_run_verification / merge testCommand builds) across all tasks in this process. Caps stacked monorepo typecheck/build pegging CPU when many tasks are in-progress. Default 1. Raise only on high-core hosts.
    */
   maxConcurrentVerifications?: number;
+  /** Maximum number of live tasks that hold, or are entering, an execution
+   *  checkout. This host CPU/RAM/disk limit does not include checkout-free planning. */
   maxWorktrees: number;
   /**
-   * FNXC:CapacityModel 2026-07-28-22:15 (PR #2502 review):
-   * Whether Max Worktrees GATES DISPATCH for this project. Default true.
-   *
-   * Renamed from `worktreesEnabled`, which two reviewers read as "run tasks
-   * without worktrees" — it never meant that. Tasks always execute in their own
-   * git worktree; this only decides whether the worktree COUNT is a second limit
-   * alongside the agent count.
+   * FNXC:CapacityModel 2026-09-01-14:49:
+   * Whether Max Worktrees gates execution-checkout admission for this project.
+   * Default true. This is independent of the agent/provider limit: planning runs
+   * read-only on the project root and does not consume a worktree slot.
    *
    * When false the operator asked to "limit via total agents only": `maxWorktrees`
    * stops gating dispatch entirely — not raised, not skipped by convention, but
@@ -1244,12 +1264,8 @@ export interface ProjectSettings {
    * "maxWorktrees"). See `resolveWorktreeCapacityLimit` in workflow-capacity.ts
    * for why this is a boolean rather than `maxWorktrees: 0`.
    *
-   * SCOPE: this is a statement about COUNTING, not about isolation or execution.
-   * Both scheduler dispatch paths still allocate a worktree per task with this
-   * off, and planning still runs in the task's own worktree. It does not make
-   * concurrent agents safe to share one checkout — the non-worktree paths that
-   * exist today are fallbacks to the operator's own tree, one of which caused
-   * FN-8600. Turning this off does not grant shared-checkout concurrency.
+   * SCOPE: this is a statement about COUNTING, not execution isolation. Write-capable
+   * task execution still uses a private checkout even when this limit is disabled.
    */
   worktreeLimitEnabled?: boolean;
   pollIntervalMs: number;
@@ -1440,10 +1456,6 @@ export interface ProjectSettings {
   testCommand?: string;
   /** Custom build command for the project (e.g. "pnpm build") */
   buildCommand?: string;
-  /** When true, completed task worktrees are returned to an idle pool instead
-   *  of being deleted. New tasks acquire a warm worktree from the pool,
-   *  preserving build caches (node_modules, target/, dist/). Default: false. */
-  recycleWorktrees?: boolean;
   /**
    * Controls whether the board shows worktree grouping and worktree-name labels in WIP/processing columns.
    *
@@ -1491,32 +1503,14 @@ export interface ProjectSettings {
    *  branches like `fusion/FN-123-2` when the canonical task branch is already
    *  checked out elsewhere. Default: false. */
   executorAllowSiblingBranchRename?: boolean;
-  /** Controls how worktree directory names are generated when creating fresh worktrees.
-   *  - "random": Human-friendly adjective-noun names (e.g., swift-falcon) — default
-   *  - "task-id": Use the task ID (e.g., fn-042) — ALSO enables task-pinned worktrees (see below)
-   *  - "task-title": Use a slugified version of the task title (e.g., fix-login-bug)
-   *  Default: "random".
-   *
-   *  For "random" and "task-title", this only affects the generated name and applies when
-   *  recycleWorktrees is NOT enabled (pooled worktrees retain their existing names).
-   *
-   *  FNXC:TaskPinnedWorktrees 2026-07-16-00:00:
-   *  "task-id" additionally enables the TASK-PINNED invariant: a task lives in exactly one derivable
-   *  directory `<worktreesDir>/<lowercased-task-id>` for its whole lifecycle. Acquisition
-   *  derives→validates→reuses-or-recreates at that same path (never suffixed), and `task.worktree` becomes a
-   *  self-correcting cache. Task pinning and `recycleWorktrees` are MUTUALLY EXCLUSIVE — enabling both is
-   *  rejected at the settings-write boundary (see `assertWorktreeNamingRecycleExclusive`), because pinning
-   *  each task to its own directory is incompatible with the cross-task recycle pool. Pinning therefore only
-   *  applies when `recycleWorktrees` is off; the runtime also degrades a legacy config that carries both back
-   *  to recycling. Worktrunk-managed layouts own their own path derivation, so pinning is bypassed when that
-   *  backend is on. */
-  worktreeNaming?: "random" | "task-id" | "task-title";
   /** Project-level worktrunk integration overrides.
    *  Merged with global `worktrunk` field-by-field so partial project values
    *  override only specified fields and inherit the rest. */
   worktrunk?: WorktrunkSettings;
   /** Optional container directory for task worktrees.
-   *  When unset, worktrees default to `<projectRoot>/.worktrees`.
+   *  When unset, worktrees default to `<projectRoot>/.fusion/worktrees`.
+   *  While unset, a pre-existing `<projectRoot>/.worktrees` root remains honored
+   *  for containment and cleanup sweeps so historic checkouts are not stranded.
    *  Supports leading `~` expansion and the `{repo}` token (basename of the project root).
    *  Accepts absolute paths or paths relative to the project root.
    *  Affects newly-created worktrees and pool/self-healing directory scans only;
@@ -1704,21 +1698,27 @@ export interface ProjectSettings {
    * remain published surface to avoid a breaking @runfusion/fusion type change.
    */
   /**
-   * @deprecated Inert under master-plan U0; consumed only by soft-deprecated
-   * aiMergeTask. Retained as published surface. Legacy full opt-out switch.
-   * Default: true.
+   * FNXC:MergerUnification 2026-09-09-07:46:
+   * Master-plan U0 retains these published settings without letting their
+   * legacy semantics imply a live merge safeguard. Their sole consumer is the
+   * soft-deprecated aiMergeTask call site in merger.ts; runAiMerge reads none.
+   */
+  /**
+   * @deprecated Inert under master-plan U0. Legacy aiMergeTask treated only
+   * `=== false` as disabled after the worktrunk-deferred short-circuit; it was
+   * the sole opt-out from the any-divergence safety fallback. Default: true.
    */
   prerebaseAutoEnabled?: boolean;
   /**
-   * @deprecated Inert under master-plan U0; consumed only by soft-deprecated
-   * aiMergeTask. Retained as published surface. Legacy hot-file trigger list.
+   * @deprecated Inert under master-plan U0. Legacy aiMergeTask compared exact
+   * hot-file paths from the base commit to the resolved integration ref tip.
    * Default: curated project hot-file list.
    */
   prerebaseHotFiles?: string[];
   /**
-   * @deprecated Inert under master-plan U0; consumed only by soft-deprecated
-   * aiMergeTask. Retained as published surface. Legacy divergence trigger.
-   * Default: 50.
+   * @deprecated Inert under master-plan U0. Legacy aiMergeTask checked this
+   * positive threshold after hot files, with an absent value falling back to 1;
+   * zero did not suppress the any-divergence safety fallback. Default: 50.
    */
   prerebaseDivergenceThreshold?: number;
   /** Strategy used when a merge conflict can't be resolved by AI. See
@@ -1898,9 +1898,10 @@ export interface ProjectSettings {
    *  time-based stuck/stalled/stale signal may fire after activation.
    *  Default: 300000 (5 minutes). Set to 0 to disable the grace period. */
   engineActivationGraceMs?: number;
-  /** Minimum number of identical consecutive in-review stall log entries (same code + reason)
+  /** Minimum number of identical consecutive in-review stall observations in one unchanged episode
    *  before the task is auto-disposed with `pausedReason='in-review-stall-deadlock'`.
-   *  Default: 3. Set to 0 to disable. */
+   *  Proven progress from a fresh failed pre-merge gate starts a new episode.
+   *  Default: 10. Set to 0 to disable. */
   inReviewStallDeadlockThreshold?: number;
   /** Threshold in milliseconds for surfacing paused in-review tasks as stale.
    *  Age is measured from columnMovedAt when present, otherwise updatedAt.
@@ -2028,35 +2029,12 @@ export interface ProjectSettings {
   /** Interval in milliseconds for periodic maintenance (worktree pruning, WAL checkpoint,
    *  orphan cleanup). 0 disables. Default: 900000 (15 min). */
   maintenanceIntervalMs?: number;
-  /** When true, periodic maintenance archives done tasks after the configured age. Default: true. */
-  autoArchiveDoneTasksEnabled?: boolean;
-  /** Age in milliseconds after a task enters done before auto-archive. Default: 172800000 (48h). */
-  autoArchiveDoneAfterMs?: number;
-  /** Retention in integer days before done tasks are auto-archived.
-   *  0 disables this days-based override. When > 0, takes precedence over autoArchiveDoneAfterMs. */
-  doneAutoArchiveDays?: number;
-  /**
-   * FNXC:DuplicateIntake 2026-07-07-00:00 (FN-7658):
-   * Operators do not want same-agent duplicate tasks silently archived on
-   * creation (FN-4892 intake heuristic) — they want visibility and a chance
-   * to decide. When `true`, `_maybeAutoArchiveSameAgentDuplicate` archives the
-   * later task as before. When `false` (the default), the heuristic still
-   * detects the duplicate but flags it in place via the existing near-duplicate
-   * marker (`nearDuplicateOf`/`nearDuplicateScore`) instead of moving it to
-   * `archived`, so the dashboard's yellow "Duplicate" chip with Keep/Archive
-   * actions surfaces it for a human decision. Default: false. */
-  autoArchiveDuplicateTasksEnabled?: boolean;
   /**
    * FNXC:DuplicateIntake 2026-07-16-13:00:
    * Issue #2225 requires triage marker duplicates to stay visible by default: `prompt`
    * blocks for Keep/Delete, `keep` replans, and `delete` restores legacy deletion.
    */
   triageDuplicateResolution?: "prompt" | "keep" | "delete";
-  /** How much agent log content to preserve when a task is moved to cold archive storage.
-   *  - "compact": deterministic summary plus a small recent-entry snapshot (default)
-   *  - "full": copy the full agent.log into archive.db
-   *  - "none": do not copy agent.log content */
-  archiveAgentLogMode?: ArchiveAgentLogMode;
   /** When true, automatically poll and update PR status badges for tasks linked to GitHub PRs.
    *  Default: false. */
   autoUpdatePrStatus?: boolean;
@@ -2255,6 +2233,14 @@ export interface ProjectSettings {
   importTranslateModelId?: string;
   /** Optional project translate-lane thinking override. Inherits through global translate thinking then default thinking when unset. */
   importTranslateThinkingLevel?: ThinkingLevel;
+  /** Project provider for Fast & Cheap task execution. Must be paired with `fastCheapModelId`; unset falls through to the global Fast & Cheap lane, then execution. */
+  fastCheapProvider?: string;
+  /** Optional credential instance for `fastCheapProvider`. */
+  fastCheapCredentialInstanceId?: string;
+  /** Project model ID for Fast & Cheap task execution. Must be paired with `fastCheapProvider`. */
+  fastCheapModelId?: string;
+  /** Optional project Fast & Cheap thinking override. Inherits through global Fast & Cheap then execution/default thinking. */
+  fastCheapThinkingLevel?: ThinkingLevel;
   /*
   FNXC:GitHubImportTranslate 2026-07-15-09:30:
   Auto-translation is OFF by default. This reverses the original opt-in-only stance (PR #2128) at operator request: import panels routinely list issues in languages the operator cannot read, so translation may now run automatically — but only when explicitly enabled, so import provenance stays faithful for operators who never opt in.
@@ -2293,6 +2279,9 @@ export interface ProjectSettings {
   /** Named scripts that can be referenced by setupScript or other automation.
    *  A map of script name to shell command. */
   scripts?: Record<string, string>;
+  /** Optional display metadata keyed by the same stable script name. Legacy
+   *  settings omit this map and continue to execute through `scripts`. */
+  scriptMetadata?: Record<string, { description?: string }>;
   /** Reference to a named script in the scripts map that runs before task execution.
    *  Used for pre-task setup like environment preparation. */
   setupScript?: string;
@@ -2517,7 +2506,7 @@ export interface ProjectSettings {
   /** ISO timestamp after the one-time post-migration system inbox message was durably inserted. */
   postgresMigrationInboxMessageSentAt?: string;
   /** Number of days to retain per-task agent-log JSONL files for soft-deleted
-   *  and archived tasks. Only affects tasks that are no longer active. Entries
+   *  and historical-sentinel tasks. Only affects tasks that are no longer active. Entries
    *  older than this window are removed from the JSONL file during periodic
    *  maintenance. Default: 0 (disabled). Set to a positive integer (e.g. 90)
    *  to enable pruning. */
@@ -2599,6 +2588,13 @@ export {
   resolvePersistAgentThinkingLog,
   sanitizeCliAgentSettings,
   sanitizeCliAgentsSettings,
+  normalizeChatSnippetName,
+  normalizeChatSnippets,
+  readChatSnippets,
+  CHAT_SNIPPET_RESERVED_NAMES,
+  CHAT_SNIPPET_MAX_ENTRIES,
+  CHAT_SNIPPET_MAX_NAME_LENGTH,
+  CHAT_SNIPPET_MAX_PROMPT_LENGTH,
   sanitizeMcpServers,
   CLI_AGENT_ADAPTER_IDS,
   CLI_AGENT_AUTONOMY_MODES,

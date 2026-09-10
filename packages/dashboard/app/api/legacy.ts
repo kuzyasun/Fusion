@@ -34,7 +34,8 @@ export type {
 
 export {
   fetchTasks,
-  fetchArchivedTasks,
+  fetchTaskPage,
+  fetchCompletedTasks,
   fetchTaskRecommendations,
   fetchTaskDetail,
   fetchTaskPrompt,
@@ -51,7 +52,7 @@ export {
 } from "./tasks/tasks.js";
 import type {
   DeleteTaskOptions,
-  ArchiveTaskOptions,
+  CompletedTaskPageResponse,
   TaskRecommendationsResponse,
   TaskRuntimeFallbackResponse,
   TaskPromptResponse,
@@ -70,7 +71,7 @@ import type {
 } from "./tasks/tasks.js";
 export type {
   DeleteTaskOptions,
-  ArchiveTaskOptions,
+  CompletedTaskPageResponse,
   TaskRecommendationsResponse,
   TaskRuntimeFallbackResponse,
   TaskPromptResponse,
@@ -114,10 +115,7 @@ export {
   stopOverseer,
   explainOverseer,
   fetchPlannerInterventionTimeline,
-  archiveTask,
-  unarchiveTask,
   revertTask,
-  archiveAllDone,
   approvePlan,
   rejectPlan,
 } from "./tasks/tasks-lifecycle.js";
@@ -758,6 +756,7 @@ export {
   fetchWorkflowStepTemplates,
   fetchWorkflows,
   importWorkflow,
+  normalizeScriptCatalog,
   removeScript,
   runScript,
   selectTaskWorkflow,
@@ -1395,6 +1394,7 @@ export {
   unarchiveInsight,
   updateInsight,
 } from "./system/insights.js";
+export { fetchPatchnode } from "./system/patchnode.js";
 export type {
   InsightsListResponse,
   RunsListResponse,
@@ -1416,6 +1416,7 @@ export {
   startFnBinaryLinkLocal,
   startFnBinaryUseGlobal,
   startSystemRebuild,
+  startSystemSourceUpdate,
 } from "./system/system-panel.js";
 export type {
   ResearchFindingPromotionInput,

@@ -771,6 +771,16 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       if (workflowId !== undefined && workflowId !== null && typeof workflowId !== "string") {
         throw badRequest("workflowId must be a string or null");
       }
+      /*
+      FNXC:PlanningMode 2026-08-28-04:16:
+      `workflowId: null` is the store's explicit No Workflow opt-out, but Planning Mode has no such
+      operator choice. A missing, blank, or aggregate board lane must therefore omit the field so
+      task creation materializes the workflow configured as the project default in Settings.
+      */
+      const normalizedWorkflowId = typeof workflowId === "string" ? workflowId.trim() : undefined;
+      const resolvedWorkflowId = normalizedWorkflowId && normalizedWorkflowId !== "__all_workflows__"
+        ? normalizedWorkflowId
+        : undefined;
       if (previousTaskId !== undefined && (typeof previousTaskId !== "string" || !previousTaskId.trim())) {
         throw badRequest("previousTaskId must be a non-empty string");
       }
@@ -931,7 +941,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       let claimEpoch = session?.taskCreationEpoch ?? 0;
       const currentProposalClaimId = () => planningProposalClaimId(sessionId, claimEpoch);
       const findCreatedTask = async () =>
-        (await scopedStore.listTasks({ includeArchived: true })).find((candidate) => candidate.proposalClaimId === currentProposalClaimId());
+        (await scopedStore.listTasks({ includeArchived: false })).find((candidate) => candidate.proposalClaimId === currentProposalClaimId());
       /*
       FNXC:PlanningMode 2026-07-23-12:10 (updated FNXC:PlanningMultiTask 2026-07-24-01:40):
       The claim model allows exactly one task per creation EPOCH — a session can produce
@@ -967,12 +977,12 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         Reported bug: deleting the task created from a plan left the session permanently
         dead-ended on PLANNING_CREATED_TASK_MISSING — Retry create replayed the same 409
         forever. Distinguish "task deleted" from "transient read failure" using the
-        include-archived task scan (the same crash-window authority findCreatedTask uses):
-        if the linked id is still LISTED but getTask failed, keep failing closed (never fork
+        live task scan (the same crash-window authority findCreatedTask uses): if the linked id is
+        still LISTED but getTask failed, keep failing closed (never fork
         on a flaky read); if it is absent from the full list, the linkage is stale — clear it
         so this request falls through and creates a fresh task under the current epoch key.
         */
-        const allTasks = await scopedStore.listTasks({ includeArchived: true }).catch(() => null);
+        const allTasks = await scopedStore.listTasks({ includeArchived: false }).catch(() => null);
         const stillListed = allTasks === null || allTasks.some((task) => task.id === candidate.createdTaskId);
         if (stillListed) throw conflict("PLANNING_CREATED_TASK_MISSING");
         const staleTaskId = candidate.createdTaskId;
@@ -1077,7 +1087,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         FNXC:WorkflowSelection 2026-06-20-16:48:
         Planning Mode creates tasks from the board context, so an active workflow lane must be materialized at create time when the client supplies it.
         */
-        ...(workflowId !== undefined ? { workflowId: workflowId as string | null } : {}),
+        ...(resolvedWorkflowId ? { workflowId: resolvedWorkflowId } : {}),
         proposalClaimId: currentProposalClaimId(),
       });
 

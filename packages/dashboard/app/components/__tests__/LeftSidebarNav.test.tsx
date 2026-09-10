@@ -125,6 +125,26 @@ describe("LeftSidebarNav", () => {
     window.localStorage.clear();
   });
 
+  it("renders Whiteboard and its Alpha badge only when explicitly enabled", () => {
+    const disabled = renderSidebar({ experimentalFeatures: {} });
+    expect(screen.queryByTestId("sidebar-nav-whiteboard")).toBeNull();
+    disabled.unmount();
+    const { onChangeView } = renderSidebar({ experimentalFeatures: { whiteboardView: true } });
+    const entry = screen.getByTestId("sidebar-nav-whiteboard");
+    expect(within(entry).getByText("Alpha")).toBeInTheDocument();
+    fireEvent.click(entry);
+    expect(onChangeView).toHaveBeenCalledWith("whiteboard");
+  });
+
+  it("removes the general History entry only while Alpha is enabled", () => {
+    const legacy = renderSidebar();
+    expect(screen.getByTestId("sidebar-nav-patchnode")).toBeInTheDocument();
+    legacy.unmount();
+
+    renderSidebar({ alphaUpdatesEnabled: true });
+    expect(screen.queryByTestId("sidebar-nav-patchnode")).toBeNull();
+  });
+
   it("documents and asserts the sidebar New Task surface enumeration", () => {
     expect(newTaskSurfaceEnumeration).toHaveLength(6);
     for (const item of newTaskSurfaceEnumeration) {
@@ -204,6 +224,12 @@ describe("LeftSidebarNav", () => {
     expect(hoverRule).not.toMatch(/#|rgb\(/i);
   });
 
+  it("omits standalone recommendations and artifacts destinations", () => {
+    renderSidebar();
+    expect(screen.queryByTestId("sidebar-nav-recommendations")).toBeNull();
+    expect(screen.queryByTestId("sidebar-nav-documents")).toBeNull();
+  });
+
   it("renders core destinations, enabled overflow destinations, plugins, and bottom settings", () => {
     const { container } = renderSidebar();
 
@@ -212,13 +238,13 @@ describe("LeftSidebarNav", () => {
     for (const testId of [
       "sidebar-nav-board",
       "sidebar-nav-list",
+      "sidebar-nav-patchnode",
       "sidebar-nav-command-center",
       "sidebar-nav-agents",
       "sidebar-nav-chat",
       "sidebar-nav-mailbox",
       "sidebar-nav-planning",
       "sidebar-nav-missions",
-      "sidebar-nav-documents",
       "sidebar-nav-goals",
       "sidebar-nav-automations",
       "sidebar-nav-import-tasks",
@@ -236,7 +262,7 @@ describe("LeftSidebarNav", () => {
       expect(screen.getByTestId(testId)).toBeDefined();
     }
 
-    expect(screen.getByTestId("sidebar-nav-documents")).toHaveTextContent("Artifacts");
+    expect(screen.getByTestId("sidebar-nav-skills")).toHaveTextContent("Skills & Snippets");
     expect(screen.getByTestId("sidebar-nav-planning")).toHaveTextContent("Planning");
     expect(screen.getByTestId("sidebar-nav-import-tasks")).toHaveTextContent("Import Tasks");
     expect(screen.queryByTestId("sidebar-nav-stash-recovery")).toBeNull();
@@ -268,13 +294,14 @@ describe("LeftSidebarNav", () => {
     /*
     FNXC:Navigation 2026-06-22-12:00:
     Assert the intentional single-list order (top to bottom) for the entries present under the default render flags.
-    command-center precedes agents; skills/memory (flag-gated) sit immediately after mailbox and before planning; documents (Artifacts) follows missions; automations -> import-tasks -> workflows are contiguous after compound/goals.
+    command-center precedes agents; Mailbox is followed by skills/memory (flag-gated); automations -> import-tasks -> workflows remain contiguous.
     */
     const primaryButtons = within(primaryNav).getAllByRole("button");
     const orderedTestIds = [
       "sidebar-nav-command-center",
       "sidebar-nav-board",
       "sidebar-nav-list",
+      "sidebar-nav-patchnode",
       "sidebar-nav-planning",
       "sidebar-nav-missions",
       "sidebar-nav-agents",
@@ -282,7 +309,6 @@ describe("LeftSidebarNav", () => {
       "sidebar-nav-mailbox",
       "sidebar-nav-skills",
       "sidebar-nav-memory",
-      "sidebar-nav-documents",
       "sidebar-nav-goals",
       "sidebar-nav-automations",
       "sidebar-nav-import-tasks",
@@ -296,12 +322,10 @@ describe("LeftSidebarNav", () => {
     expect(orderedIndices).toEqual([...orderedIndices].sort((a, b) => a - b));
     expect(orderedIndices.every((index) => index >= 0)).toBe(true);
     expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-command-center"))).toBeLessThan(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-agents")));
-    // FNXC:Navigation 2026-06-23-01:30: Planning + Missions now sit directly after List and before Agents; Documents (Artifacts) follows Memory.
-    expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-planning"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-list")) + 1);
+    expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-patchnode"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-list")) + 1);
+    expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-planning"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-patchnode")) + 1);
     expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-missions"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-planning")) + 1);
     expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-agents"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-missions")) + 1);
-    expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-documents"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-memory")) + 1);
-    // Skills and Memory sit immediately after Mailbox.
     expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-skills"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-mailbox")) + 1);
     expect(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-memory"))).toBe(primaryButtons.indexOf(screen.getByTestId("sidebar-nav-skills")) + 1);
 

@@ -70,7 +70,7 @@ describe("settings key parity", () => {
     expect(isGlobalSettingsKey("chatMessageLayout")).toBe(false);
     expect(PROJECT_SETTINGS_KEYS).toContain("chatMessageLayout");
     expect(GLOBAL_SETTINGS_KEYS).not.toContain("chatMessageLayout");
-    expect(isProjectSettingsKey("recommendationMailboxNoticeEnabled")).toBe(true);
+    expect(isProjectSettingsKey("recommendationMailboxNoticeEnabled")).toBe(false);
     expect(isGlobalSettingsKey("recommendationMailboxNoticeEnabled")).toBe(false);
     expect(isProjectSettingsKey("heartbeatMultiplier")).toBe(true);
     expect(isProjectSettingsKey("completionDocumentationMode")).toBe(true);
@@ -661,6 +661,8 @@ describe("model lane key parity regression (FN-1729)", () => {
     { provider: "mergerProvider", modelId: "mergerModelId", expectedScope: "project" },
     { provider: "mergerFallbackProvider", modelId: "mergerFallbackModelId", expectedScope: "project" },
     { provider: "mergerGlobalProvider", modelId: "mergerGlobalModelId", expectedScope: "global" },
+    { provider: "fastCheapProvider", modelId: "fastCheapModelId", expectedScope: "project" },
+    { provider: "fastCheapGlobalProvider", modelId: "fastCheapGlobalModelId", expectedScope: "global" },
   ] as const;
 
   it.each(allModelLanePairs)(

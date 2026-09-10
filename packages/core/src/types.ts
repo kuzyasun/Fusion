@@ -56,9 +56,9 @@ export type { IngestedCheckState, IngestedCheckStateValue, MergeablePrCheck } fr
 /*
  * FNXC:WorkflowDeprecation 2026-07-15-16:35:
  * Keep deprecated IDs browser-safe because Settings loads the management list
- * (including disabled built-ins) but must not re-offer retired workflows for new
- * selection. FN-7970 and FN-7969 preserve direct resolution for pre-existing
- * Brainstorming and Coding (Ideas) task selections while hiding them elsewhere.
+ * (including disabled built-ins) but must not re-offer deprecated workflows for new
+ * work. FN-7970 preserves direct resolution for pre-existing Brainstorming selections
+ * while hiding that definition from ordinary selection lists.
  */
 /*
 FNXC:WorkflowDeprecation 2026-08-25-14:40:
@@ -74,6 +74,14 @@ never reach.
 */
 export const DEPRECATED_BUILTIN_WORKFLOW_IDS: ReadonlySet<string> = new Set([
   "builtin:brainstorming",
+]);
+
+/*
+FNXC:WorkflowSuccession 2026-09-06-02:15:
+FN-297 removes builtin:coding-ideas from the catalog instead of deprecating it and names builtin:coding-ideas-v2 as its successor. The project default lacks the Ideas column and manual intake, so falling back to it would move existing cards onto a different board. The retired id is read-tolerant and requestable, never offered and never written for task selections or project defaults; enabledBuiltinWorkflowIds is the explicit exception because operator-owned activation lists are understood without being rewritten. Read/write normalization carries this succession without a schema migration, keeping SCHEMA_BASELINE_VERSION unchanged so older Fusion binaries can still open the database.
+*/
+export const RETIRED_BUILTIN_WORKFLOW_SUCCESSORS: ReadonlyMap<string, string> = new Map([
+  ["builtin:coding-ideas", "builtin:coding-ideas-v2"],
 ]);
 
 
@@ -103,6 +111,13 @@ export {
   DEFAULT_TASK_PRIORITY,
 };
 export type { ThinkingLevel, Column, ColumnId, TaskPriority };
+export type {
+  PatchnodeEntryKind,
+  PatchnodeEntry,
+  PatchnodeDay,
+  PatchnodeFeed,
+  PatchnodeQuery,
+} from "./types/task/patchnode.js";
 
 import {
   MERGE_REQUEST_STATES,
@@ -394,6 +409,7 @@ import type {
   AgentLogType,
   ArchiveAgentLogMode,
   TaskStep,
+  TaskStepReport,
   RunMutationContext,
   TaskLogEntry,
   WorkflowTransitionNotificationMarker,
@@ -412,6 +428,7 @@ export type {
   AgentLogType,
   ArchiveAgentLogMode,
   TaskStep,
+  TaskStepReport,
   RunMutationContext,
   TaskLogEntry,
   WorkflowTransitionNotificationMarker,
@@ -519,8 +536,6 @@ import type {
   TaskDocument,
   TaskDocumentRevision,
   TaskDocumentCreateInput,
-  ArchivedTaskDocumentAdditionInput,
-  ArchivedTaskDocumentAdditionResult,
   TaskDocumentWithTask,
   Artifact,
   ArtifactCreateInput,
@@ -542,8 +557,6 @@ export type {
   TaskDocument,
   TaskDocumentRevision,
   TaskDocumentCreateInput,
-  ArchivedTaskDocumentAdditionInput,
-  ArchivedTaskDocumentAdditionResult,
   TaskDocumentWithTask,
   Artifact,
   ArtifactCreateInput,
@@ -557,6 +570,18 @@ export type {
   GoalCitation,
   GoalCitationFilter,
 };
+
+export {
+  EXTERNAL_BLOCK_STATUS,
+  EXTERNAL_BLOCK_PAUSE_REASON,
+  isTaskExternallyBlocked,
+  buildTaskExternalBlockPatch,
+  buildTaskExternalBlockClearPatch,
+  formatTaskExternalBlockReason,
+} from "./tasks/task-external-block.js";
+export type { TaskExternalBlock, TaskExternalBlockOrigin } from "./tasks/task-external-block.js";
+
+export type { OverlapWaitPhase, OverlapWaitDecision, OverlapWaitFreshness, OverlapWaitLandedPath, OverlapWaitDeliverySnapshot, OverlapWaitDeliveryProof, OverlapWaitReceipt, TaskOverlapWait, OverlapWaitClaim, OverlapWaitExecutionIdentity } from "./types/task/task-overlap-wait.js";
 
 // ── task-core ──────────────────────────────────────────────────────────
 // FNXC:CodeOrganization 2026-07-22-14:00: Peels live in types/task-core.ts
@@ -620,6 +645,7 @@ import type {
   WorkspaceLandFailure,
   WorkspaceWorktreeEntry,
   TaskRepositoryScope,
+  TaskPlanningFailureState,
   Task,
   TaskReleaseGateVerdict,
   TaskVerificationResultSummary,
@@ -670,6 +696,7 @@ export type {
   WorkspaceLandFailure,
   WorkspaceWorktreeEntry,
   TaskRepositoryScope,
+  TaskPlanningFailureState,
   Task,
   TaskReleaseGateVerdict,
   TaskVerificationResultSummary,
@@ -728,6 +755,13 @@ import {
   resolvePersistAgentThinkingLog,
   sanitizeCliAgentSettings,
   sanitizeCliAgentsSettings,
+  normalizeChatSnippetName,
+  normalizeChatSnippets,
+  readChatSnippets,
+  CHAT_SNIPPET_RESERVED_NAMES,
+  CHAT_SNIPPET_MAX_ENTRIES,
+  CHAT_SNIPPET_MAX_NAME_LENGTH,
+  CHAT_SNIPPET_MAX_PROMPT_LENGTH,
   sanitizeMcpServers,
   CLI_AGENT_ADAPTER_IDS,
   CLI_AGENT_AUTONOMY_MODES,
@@ -749,6 +783,13 @@ export {
   resolvePersistAgentThinkingLog,
   sanitizeCliAgentSettings,
   sanitizeCliAgentsSettings,
+  normalizeChatSnippetName,
+  normalizeChatSnippets,
+  readChatSnippets,
+  CHAT_SNIPPET_RESERVED_NAMES,
+  CHAT_SNIPPET_MAX_ENTRIES,
+  CHAT_SNIPPET_MAX_NAME_LENGTH,
+  CHAT_SNIPPET_MAX_PROMPT_LENGTH,
   sanitizeMcpServers,
   CLI_AGENT_ADAPTER_IDS,
   CLI_AGENT_AUTONOMY_MODES,
@@ -794,6 +835,7 @@ import type {
   DashboardKeyboardShortcuts,
   BackupSettingsMigrationCandidate,
   BackupSettingsMigrationConflict,
+  ChatSnippet,
   GlobalSettings,
   CliAgentSettings,
   RemoteAccessProvidersConfig,
@@ -845,6 +887,7 @@ export type {
   DashboardKeyboardShortcuts,
   BackupSettingsMigrationCandidate,
   BackupSettingsMigrationConflict,
+  ChatSnippet,
   GlobalSettings,
   CliAgentSettings,
   RemoteAccessProvidersConfig,
@@ -1110,6 +1153,12 @@ FNXC:AutomationTools 2026-06-26-00:00:
 Dashboard source-checkout builds alias @fusion/core to this frontend-safe module, so mirror the automation AI-step tool catalog here as a runtime export for UI selectors.
 */
 export const AUTOMATION_SELECTABLE_TOOLS = ["Read", "Bash", "Edit", "Write", "Grep", "Find", "Ls"] as const;
+
+/*
+FNXC:TaskMessageLength 2026-08-29-08:02:
+Operator-authored task text for steering comments, task comments, refinement, and spec-revision feedback must not be capped below direct chat, which has no character limit and is bounded by its 2 MiB JSON envelope. This 100,000-character limit matches the task-document content cap and stays inside that envelope even for worst-case multibyte, JSON-escaped input.
+*/
+export const MAX_TASK_MESSAGE_LENGTH = 100_000;
 
 /** Snapshot of the last blocked state for a task, used for dedup comparison. */
 export interface BlockedStateSnapshot {
@@ -1421,11 +1470,24 @@ import {
   normalizeMessageParticipant,
   resolveEphemeralTaskCreationPolicy,
 } from "./types/messaging/messages.js";
+import {
+  ARTIFACT_NOTICE_METADATA_KEY,
+  DASHBOARD_INBOX_CATEGORIES,
+  TASK_RECOMMENDATION_NOTICE_KIND,
+  classifyDashboardInboxMessage,
+  isDashboardInboxCategory,
+} from "./messaging/inbox-categories.js";
 export {
   DASHBOARD_USER_ID,
   normalizeMessageParticipant,
   resolveEphemeralTaskCreationPolicy,
+  ARTIFACT_NOTICE_METADATA_KEY,
+  DASHBOARD_INBOX_CATEGORIES,
+  TASK_RECOMMENDATION_NOTICE_KIND,
+  classifyDashboardInboxMessage,
+  isDashboardInboxCategory,
 };
+import type { DashboardInboxCategory } from "./messaging/inbox-categories.js";
 import type {
   ParticipantType,
   MessageType,
@@ -1442,6 +1504,7 @@ import type {
   MessageFilter,
 } from "./types/messaging/messages.js";
 export type {
+  DashboardInboxCategory,
   ParticipantType,
   MessageType,
   MessageReplyReference,
@@ -1570,7 +1633,9 @@ FNXC:ChatMemoryFocus 2026-08-24-04:21:
 Dashboard client imports resolve @fusion/core to this browser-safe leaf, so expose the pure
 experimental flag reader here. Its Settings dependency is type-only and introduces no browser runtime cycle.
 */
-export { isExperimentalFeatureEnabled, CHAT_FOCUS_FLAG } from "./config/experimental-features.js";
+export { isExperimentalFeatureEnabled, CHAT_FOCUS_FLAG, ALPHA_UPDATES_FLAG, WHITEBOARD_VIEW_FLAG } from "./config/experimental-features.js";
+export { createEmptyWhiteboardDocument, validateWhiteboardDocument, validateWhiteboardTitle, WhiteboardValidationError, WhiteboardRevisionConflictError, WhiteboardNotFoundError } from "./whiteboards/whiteboard-types.js";
+export type { WhiteboardDocumentV1, WhiteboardDocument, WhiteboardFrame, WhiteboardText, WhiteboardRelation, WhiteboardRelationBranch, ProjectWhiteboard, ProjectWhiteboardSummary, WhiteboardRevision } from "./whiteboards/whiteboard-types.js";
 export {
   resolveExecutionSettingsModel,
   resolvePlanningSettingsModel,
