@@ -44,7 +44,8 @@ restore the deprecated Pi OAuth providers (`antigravity` / `google-antigravity` 
 agy [--dangerously-skip-permissions | --sandbox]
     [--continue]
     [--model <label>]
-    [--print-timeout <duration>]
+    --output-format stream-json
+    --print-timeout <duration>
     -p <prompt>
 ```
 
@@ -55,6 +56,8 @@ agy [--dangerously-skip-permissions | --sandbox]
 - First session turn prepends Fusion system/runtime context; later turns pass `--continue`.
 - AbortSignal / `dispose()` kill the live PTY/process.
 - Partial PTY chunks may stream via `onText`; final cleaned body is always available at exit.
+- FNXC:AntigravityCli 2026-09-11-01:21: Print turns always pass `--output-format stream-json` and settle on the `event:result` NDJSON record (then kill the PTY). This stops stdio MCP children (for example chrome-devtools) from holding print-mode open after the agent turn finishes — the HIVE-001 failure mode where Fusion hit the old 300s wall clock despite partial worktree writes.
+- Default Fusion wall clock is **30 minutes** (`cliTimeoutMs` / `AGY_CLI_TIMEOUT_MS`). `--print-timeout` is always passed as a Go duration with a unit (for example `30m`) aligned to that value. Bare millisecond integers are invalid on agy 1.2.0+.
 - **Large prompts (Windows ENAMETOOLONG):** `agy` has no `--prompt-file`. When the fused prompt exceeds ~2KiB, Fusion writes it to a temp file and passes a short pointer as `-p` (same pattern as Cursor CLI print-mode) so CreateProcess argv stays under the OS limit.
 
 ## Usage / quota
@@ -65,7 +68,7 @@ agy [--dangerously-skip-permissions | --sandbox]
 
 - No ACP `session/update` tool-call stream (unlike Grok ACP).
 - No Fusion `fn_*` MCP bridge — the Antigravity agent uses only its own tools.
-- Best fit: small non-interactive tasks that can complete under the subscription without host coordination tools.
+- Best fit: non-interactive tasks that can finish under the subscription without host coordination tools, within the configured `cliTimeoutMs` (default 30m).
 
 ## Enable path
 

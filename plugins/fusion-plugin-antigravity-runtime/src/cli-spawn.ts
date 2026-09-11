@@ -112,27 +112,236 @@ export function parseAgyPrintOutput(raw: string): string {
  * FNXC:AntigravityCli 2026-07-18-18:10:
  * Lane pickers store `antigravity-cli/<label>`; the CLI expects the discovered
  * label (e.g. `Gemini 3.5 Flash (Medium)`), not the Fusion provider-qualified id.
+ *
+ * FNXC:AntigravityCli 2026-09-11-00:44:
+ * Also drop a trailing `\\tHuman Label` suffix left by pre-fix discovery of
+ * agy 1.2.0 tab-separated `models` rows — otherwise `--model` rejects the id.
  */
 export function stripAntigravityModelPrefix(modelId: string | undefined): string | undefined {
   if (!modelId) return undefined;
-  const trimmed = modelId.trim();
+  let trimmed = modelId.trim();
   if (!trimmed) return undefined;
   for (const prefix of ["antigravity-cli/", "antigravity/"]) {
     if (trimmed.startsWith(prefix)) {
       const rest = trimmed.slice(prefix.length).trim();
-      return rest.length > 0 ? rest : undefined;
+      trimmed = rest;
+      break;
     }
   }
-  return trimmed;
+  if (!trimmed) return undefined;
+  const tab = trimmed.indexOf("\t");
+  if (tab >= 0) {
+    trimmed = trimmed.slice(0, tab).trim();
+  }
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 export type AntigravityPermissionMode = "skip" | "sandbox" | "prompt";
+
+
+/*
+FNXC:AntigravityCli 2026-09-11-01:21:
+HIVE-001 timed out at Fusion's 300s wall clock while agy was still writing worktree
+artifacts (and chrome-devtools MCP kept the PTY alive after the turn). agy 1.2.0
+`--print-timeout` requires a Go duration unit (bare ms is rejected), defaults to 5m,
+and emits a definitive `event:result` on `--output-format stream-json`. Always pass a
+unitized `--print-timeout` aligned to cliTimeoutMs, default the Fusion kill to 30m for
+executor-scale turns, and settle the print promise on stream-json `result` (then kill)
+so MCP grandchildren cannot hold the turn open until the wall clock.
+*/
+/** Default Fusion-side print wall clock (executor-scale research/coding turns). */
+export const DEFAULT_AGY_CLI_TIMEOUT_MS = 1_800_000;
+
+/** Format milliseconds as a Go duration string accepted by `agy --print-timeout`. */
+export function formatAgyDurationMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "5m";
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1_000 === 0) return `${ms / 1_000}s`;
+  return `${Math.ceil(ms)}ms`;
+}
+
+/** Ensure operator/env print-timeout values carry a duration unit for agy 1.2.0+. */
+export function normalizeAgyPrintTimeout(value: string): string {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return `${trimmed}ms`;
+  return trimmed;
+}
+
+export interface AgyStreamJsonResult {
+  status: string;
+  response?: string;
+  error?: string;
+}
+
+export interface AgyStreamJsonUpdate {
+  textDelta?: string;
+  result?: AgyStreamJsonResult;
+}
+
+/** Parse one NDJSON line from `agy --output-format stream-json`. */
+export function parseAgyStreamJsonLine(line: string): AgyStreamJsonUpdate | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    if (obj.event === "result" && obj.result && typeof obj.result === "object") {
+      const result = obj.result as Record<string, unknown>;
+      const status = typeof result.status === "string" ? result.status : "UNKNOWN";
+      return {
+        result: {
+          status,
+          response: typeof result.response === "string" ? result.response : undefined,
+          error: typeof result.error === "string" ? result.error : undefined,
+        },
+      };
+    }
+    if (obj.event === "step_update" && obj.step_update && typeof obj.step_update === "object") {
+      const step = obj.step_update as Record<string, unknown>;
+      if (typeof step.text_delta === "string" && step.text_delta.length > 0) {
+        return { textDelta: step.text_delta };
+      }
+      return {};
+    }
+    // `--output-format json` single envelope (no event wrapper).
+    if (typeof obj.status === "string" && obj.event === undefined) {
+      return {
+        result: {
+          status: obj.status,
+          response: typeof obj.response === "string" ? obj.response : undefined,
+          error: typeof obj.error === "string" ? obj.error : undefined,
+        },
+      };
+    }
+    return {};
+  } catch {
+    return null;
+  }
+}
+
+/*
+FNXC:AntigravityCli 2026-09-11-07:32:
+When MCP keeps the PTY open after the turn, `event:result` may sit in the hold
+buffer without a trailing newline. Detect a brace-balanced, parseable JSON object
+at the buffer head so early settle can fire without waiting for `\n` or process exit.
+*/
+/** Return end index (exclusive) of a complete `{...}` object at `text` start, or -1. */
+export function findCompleteJsonObjectEnd(text: string): number {
+  const start = text.search(/\S/);
+  if (start < 0 || text[start] !== "{") return -1;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+      if (depth < 0) return -1;
+    }
+  }
+  return -1;
+}
+
+/** Incremental NDJSON reader for agy stream-json print mode. */
+export class AgyStreamJsonReader {
+  private buffer = "";
+  private assembledText = "";
+  /** True once any valid stream-json NDJSON line has been parsed. */
+  sawStreamEvent = false;
+  result?: AgyStreamJsonResult;
+
+  private applyUpdate(update: AgyStreamJsonUpdate | null, deltas: string[]): void {
+    if (update) {
+      this.sawStreamEvent = true;
+    }
+    if (update?.textDelta) {
+      this.assembledText += update.textDelta;
+      deltas.push(update.textDelta);
+    }
+    if (update?.result) {
+      this.result = update.result;
+    }
+  }
+
+  /**
+   * After newline-delimited parse, try a trailing complete JSON object that
+   * arrived without `\n` (MCP-held PTY / partial flush).
+   */
+  private tryParseHeldCompleteObject(deltas: string[]): void {
+    if (this.result) return;
+    const end = findCompleteJsonObjectEnd(this.buffer);
+    if (end < 0) return;
+    const candidate = this.buffer.slice(0, end);
+    const update = parseAgyStreamJsonLine(candidate);
+    if (!update) return;
+    this.buffer = this.buffer.slice(end);
+    this.applyUpdate(update, deltas);
+  }
+
+  push(chunk: string): string[] {
+    this.buffer += chunk;
+    const deltas: string[] = [];
+    let newline = this.buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      this.applyUpdate(parseAgyStreamJsonLine(line), deltas);
+      newline = this.buffer.indexOf("\n");
+    }
+    /*
+    FNXC:AntigravityCli 2026-09-11-07:32:
+    Harden early settle: if the held buffer is a complete JSON object, parse it
+    without waiting for a trailing newline or process exit. Preserve settle-once
+    by only setting `result` when parse succeeds (callers still gate on it once).
+    */
+    this.tryParseHeldCompleteObject(deltas);
+    return deltas;
+  }
+
+  flush(): void {
+    if (!this.buffer.trim()) {
+      this.buffer = "";
+      return;
+    }
+    const update = parseAgyStreamJsonLine(this.buffer);
+    this.buffer = "";
+    const deltas: string[] = [];
+    this.applyUpdate(update, deltas);
+  }
+
+  bodyFromResultOrText(): string {
+    if (typeof this.result?.response === "string") {
+      return this.result.response.trim();
+    }
+    return this.assembledText.trim();
+  }
+}
 
 /** Settings resolved from plugin ctx.settings + env-var fallbacks. */
 export interface AntigravityCliSettings {
   binaryPath: string;
   model?: string;
-  /** Value passed as `--print-timeout` (CLI accepts duration like `5m` or ms). */
+  /** Value passed as `--print-timeout` (Go duration with unit, e.g. `30m` / `45000ms`). Always set by resolveCliSettings. */
   printTimeout?: string;
   cliTimeoutMs: number;
   /**
@@ -180,10 +389,20 @@ export function resolveCliSettings(settings?: Record<string, unknown>): Antigrav
       : "skip";
 
   const printTimeoutMs = num(settings?.printTimeoutMs, "AGY_PRINT_TIMEOUT_MS", 0);
-  const printTimeout =
+  const cliTimeoutMs = num(settings?.cliTimeoutMs, "AGY_CLI_TIMEOUT_MS", DEFAULT_AGY_CLI_TIMEOUT_MS);
+  /*
+  FNXC:AntigravityCli 2026-09-11-01:21:
+  Always supply `--print-timeout` with a Go duration unit. Prefer explicit operator/
+  env values; otherwise mirror cliTimeoutMs so agy's internal wait and Fusion's kill
+  stay aligned (bare ms strings are invalid on agy 1.2.0).
+  */
+  const explicitPrintTimeout =
     str(settings?.printTimeout) ??
     str(process.env.AGY_PRINT_TIMEOUT) ??
-    (printTimeoutMs > 0 ? String(printTimeoutMs) : undefined);
+    (printTimeoutMs > 0 ? formatAgyDurationMs(printTimeoutMs) : undefined);
+  const printTimeout = normalizeAgyPrintTimeout(
+    explicitPrintTimeout ?? formatAgyDurationMs(cliTimeoutMs),
+  );
 
   return {
     binaryPath:
@@ -193,7 +412,7 @@ export function resolveCliSettings(settings?: Record<string, unknown>): Antigrav
       "agy",
     model: stripAntigravityModelPrefix(str(settings?.model) ?? str(process.env.AGY_MODEL_ID)),
     printTimeout,
-    cliTimeoutMs: num(settings?.cliTimeoutMs, "AGY_CLI_TIMEOUT_MS", 300_000),
+    cliTimeoutMs,
     permissionMode,
   };
 }
@@ -203,18 +422,44 @@ function formatSpawnError(error: Error & { code?: unknown }): string {
   return `spawn error: ${code}${error.message}`.trim();
 }
 
+/*
+FNXC:AntigravityCli 2026-09-11-07:32:
+On Windows, `child.kill("SIGKILL")` before `taskkill /T /F` can orphan MCP
+grandchildren (the direct child dies while the tree stays). Run taskkill first
+when pid is known, then kill the child handle. On Unix, try process-group kill
+(`process.kill(-pid)`) when pid is known — safe no-op if the child is not a
+group leader — then fall back to child.kill. Missing pid stays best-effort kill only.
+*/
 export function killProcessTree(child: { pid?: number; kill?: (...args: any[]) => void | boolean }): void {
+  const pid = typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
+
+  if (process.platform === "win32") {
+    if (pid !== undefined) {
+      try {
+        spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+      } catch {
+        // best effort
+      }
+    }
+    try {
+      child.kill?.("SIGKILL");
+    } catch {
+      // best effort
+    }
+    return;
+  }
+
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // Not a process-group leader, or already gone — fall through to child.kill.
+    }
+  }
   try {
     child.kill?.("SIGKILL");
   } catch {
     // best effort
-  }
-  if (process.platform === "win32" && typeof child.pid === "number" && child.pid > 0) {
-    try {
-      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-    } catch {
-      // best effort
-    }
   }
 }
 
@@ -298,6 +543,13 @@ export function buildAgyPrintArgs(
   if (settings.model) {
     args.push("--model", settings.model);
   }
+  /*
+  FNXC:AntigravityCli 2026-09-11-01:21:
+  stream-json yields `event:result` when the agent turn completes. Fusion settles on
+  that event and kills the PTY so stdio MCP children (e.g. chrome-devtools) cannot
+  hold print-mode open past completion.
+  */
+  args.push("--output-format", "stream-json");
   if (settings.printTimeout) {
     args.push("--print-timeout", settings.printTimeout);
   }
@@ -408,6 +660,25 @@ export interface InvokeAgyPrintOptions {
   spawnFallback?: typeof spawn;
 }
 
+
+function isAgyStreamSuccess(status: string): boolean {
+  return status.toUpperCase() === "SUCCESS";
+}
+
+function settleFromAgyStreamResult(
+  reader: AgyStreamJsonReader,
+  exitCode: number,
+  usedFallback: boolean,
+): AgyPrintResult {
+  reader.flush();
+  const body = reader.bodyFromResultOrText();
+  if (reader.result && !isAgyStreamSuccess(reader.result.status)) {
+    const detail = reader.result.error?.trim() || body || reader.result.status;
+    throw new Error(`agy: print-mode stream-json result status ${reader.result.status}: ${detail}`);
+  }
+  return { body, exitCode, usedFallback };
+}
+
 export async function invokeAgyPrint(
   prompt: string,
   settings: AntigravityCliSettings,
@@ -510,37 +781,97 @@ export async function invokeAgyPrint(
     keeping a small holdback buffer for incomplete CSI sequences at chunk boundaries.
     Previous approach re-ran stripAnsi on the entire accumulated output per chunk,
     which was O(N²) for large responses.
+
+    FNXC:AntigravityCli 2026-09-11-01:21:
+    After ANSI strip, feed cleaned bytes into AgyStreamJsonReader. Surface text_delta
+    via onChunk (not raw NDJSON) and complete as soon as `event:result` arrives so
+    stdio MCP grandchildren cannot hold the PTY open past turn completion.
     */
     let pendingRaw = "";
+    const streamReader = new AgyStreamJsonReader();
+
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn();
+    };
+
+    const settleFromStreamResult = (): void => {
+      settle(() => {
+        try {
+          const result = settleFromAgyStreamResult(streamReader, 0, false);
+          killProcessTree(child);
+          resolve(result);
+        } catch (err) {
+          killProcessTree(child);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+    };
+
     child.onData((data: string) => {
       output += data;
+      pendingRaw += data;
+      // Hold back a trailing incomplete CSI so a split escape sequence cannot
+      // leak ESC crumbs into the stream-json reader / onChunk.
+      const holdMatch = pendingRaw.match(INCOMPLETE_CSI_RE);
+      const stable = holdMatch ? pendingRaw.slice(0, -holdMatch[0].length) : pendingRaw;
+      if (stable.length === 0) return;
+      const cleaned = stripAnsi(stable);
+      pendingRaw = holdMatch ? holdMatch[0] : "";
+      if (!cleaned) return;
+      const deltas = streamReader.push(cleaned);
       if (opts?.onChunk) {
-        pendingRaw += data;
-        // Hold back a trailing incomplete CSI so a split escape sequence cannot
-        // leak ESC crumbs into onChunk.
-        const holdMatch = pendingRaw.match(INCOMPLETE_CSI_RE);
-        const stable = holdMatch ? pendingRaw.slice(0, -holdMatch[0].length) : pendingRaw;
-        if (stable.length > 0) {
-          const cleaned = stripAnsi(stable);
-          pendingRaw = holdMatch ? holdMatch[0] : "";
-          if (cleaned) opts.onChunk(cleaned);
+        if (deltas.length > 0) {
+          for (const delta of deltas) opts.onChunk(delta);
+        } else if (!streamReader.sawStreamEvent && !/^\s*\{/.test(cleaned)) {
+          // Legacy text print-mode: surface ANSI-cleaned PTY bytes directly.
+          opts.onChunk(cleaned);
         }
+      }
+      if (streamReader.result) {
+        settleFromStreamResult();
       }
     });
 
     child.onExit(({ exitCode }: { exitCode: number }) => {
       if (settled) return;
-      settled = true;
-      cleanup();
-      if (exitCode !== 0) {
-        reject(
-          new Error(
-            `agy: print-mode process exited with code ${String(exitCode)} (PTY).\n${parseAgyPrintOutput(output)}`,
-          ),
-        );
-        return;
-      }
-      resolve({ body: parseAgyPrintOutput(output), exitCode, usedFallback: false });
+      settle(() => {
+        if (pendingRaw) {
+          const cleaned = stripAnsi(pendingRaw);
+          pendingRaw = "";
+          if (cleaned) {
+            const deltas = streamReader.push(cleaned);
+            if (opts?.onChunk) {
+              if (deltas.length > 0) {
+                for (const delta of deltas) opts.onChunk(delta);
+              } else if (!streamReader.sawStreamEvent && !/^\s*\{/.test(cleaned)) {
+                opts.onChunk(cleaned);
+              }
+            }
+          }
+        }
+        streamReader.flush();
+        if (streamReader.result) {
+          try {
+            resolve(settleFromAgyStreamResult(streamReader, exitCode, false));
+          } catch (err) {
+            reject(err instanceof Error ? err : new Error(String(err)));
+          }
+          return;
+        }
+        if (exitCode !== 0) {
+          reject(
+            new Error(
+              `agy: print-mode process exited with code ${String(exitCode)} (PTY).\n${parseAgyPrintOutput(output)}`,
+            ),
+          );
+          return;
+        }
+        // Fallback for older agy builds / unexpected non-stream-json output.
+        resolve({ body: parseAgyPrintOutput(output), exitCode, usedFallback: false });
+      });
     });
   });
 }
@@ -561,6 +892,7 @@ async function invokeAgyPrintViaSpawn(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    const streamReader = new AgyStreamJsonReader();
 
     const ptyNote = `node-pty unavailable (${ctx.ptyLoadError}); used plain spawn without a TTY — agy may hang or truncate in print mode`;
 
@@ -605,23 +937,48 @@ async function invokeAgyPrintViaSpawn(
     }
 
     let pendingRaw = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf-8");
-      stdout += text;
+    const handleStdoutChunk = (raw: string): void => {
+      pendingRaw += raw;
+      const holdMatch = pendingRaw.match(INCOMPLETE_CSI_RE);
+      const stable = holdMatch ? pendingRaw.slice(0, -holdMatch[0].length) : pendingRaw;
+      if (stable.length === 0) return;
+      const cleaned = stripAnsi(stable);
+      pendingRaw = holdMatch ? holdMatch[0] : "";
+      if (!cleaned) return;
+      const deltas = streamReader.push(cleaned);
       if (ctx.onChunk) {
-        /*
-        FNXC:AntigravityCli 2026-07-18-18:25:
-        Same incremental ANSI strip + incomplete-CSI holdback as the PTY path.
-        */
-        pendingRaw += text;
-        const holdMatch = pendingRaw.match(INCOMPLETE_CSI_RE);
-        const stable = holdMatch ? pendingRaw.slice(0, -holdMatch[0].length) : pendingRaw;
-        if (stable.length > 0) {
-          const cleaned = stripAnsi(stable);
-          pendingRaw = holdMatch ? holdMatch[0] : "";
-          if (cleaned) ctx.onChunk(cleaned);
+        if (deltas.length > 0) {
+          for (const delta of deltas) ctx.onChunk(delta);
+        } else if (!streamReader.sawStreamEvent && !/^\s*\{/.test(cleaned)) {
+          ctx.onChunk(cleaned);
         }
       }
+      /*
+      FNXC:AntigravityCli 2026-09-11-01:21:
+      Same stream-json early-complete path as PTY — kill once result arrives so MCP
+      children cannot keep the fallback spawn open after the turn finishes.
+      */
+      if (streamReader.result && !settled) {
+        settled = true;
+        cleanup();
+        try {
+          const result = settleFromAgyStreamResult(streamReader, 0, true);
+          killProcessTree(child);
+          resolve(result);
+        } catch (err) {
+          killProcessTree(child);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+    };
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const textChunk = chunk.toString("utf-8");
+      stdout += textChunk;
+      /*
+      FNXC:AntigravityCli 2026-07-18-18:25:
+      Same incremental ANSI strip + incomplete-CSI holdback as the PTY path.
+      */
+      handleStdoutChunk(textChunk);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf-8");
@@ -645,6 +1002,25 @@ async function invokeAgyPrintViaSpawn(
       if (settled) return;
       settled = true;
       cleanup();
+      /*
+      FNXC:AntigravityCli 2026-09-11-07:32:
+      Clear holdback before re-entry. Passing `pendingRaw` into handleStdoutChunk
+      while it still holds the same string would double-append (`pendingRaw += raw`).
+      */
+      if (pendingRaw) {
+        const leftover = pendingRaw;
+        pendingRaw = "";
+        handleStdoutChunk(leftover);
+      }
+      streamReader.flush();
+      if (streamReader.result) {
+        try {
+          resolve(settleFromAgyStreamResult(streamReader, code ?? 0, true));
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+        return;
+      }
       if (code !== 0) {
         const combined = [stdout, stderr].filter(Boolean).join("\n");
         reject(

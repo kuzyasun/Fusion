@@ -30,7 +30,15 @@ export async function discoverAntigravityProviderModels(options?: unknown): Prom
   }
   const result = await discoverAntigravityModels(probe.binaryPath ?? probe.binaryName);
   return {
-    models: result.models.map((id) => ({ id, label: id })),
+    /*
+    FNXC:AntigravityCli 2026-09-11-00:44:
+    Pair machine ids with human labels from agy 1.2.0 `id\\tlabel` discovery so
+    pickers show the friendly name while `--model` receives the bare id.
+    */
+    models: result.models.map((id, index) => ({
+      id,
+      label: result.labels[index] ?? id,
+    })),
     source: result.source,
     fallbackUsed: result.fallbackUsed,
     reason: result.reason,

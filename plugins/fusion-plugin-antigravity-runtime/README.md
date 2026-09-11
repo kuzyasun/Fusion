@@ -19,9 +19,9 @@ See the full contract: [`docs/antigravity-cli-contract.md`](../../docs/antigravi
 - Binary probe: `agy --version`
 - Auth: CLI owns Antigravity subscription (no Fusion OAuth)
 - Models: `agy models` (full labels with spaces/tiers)
-- Prompt: PTY print-mode with optional `--model`, `--sandbox` / `--dangerously-skip-permissions`, AbortSignal cancel
+- Prompt: PTY print-mode with `--output-format stream-json`, aligned `--print-timeout` (default 30m), optional `--model`, `--sandbox` / `--dangerously-skip-permissions`, AbortSignal cancel; settles on stream-json `result` so MCP children cannot hang the turn
 - Permission mode: Settings → Authentication → Permission mode (`skip` default / `sandbox` / `prompt`)
-- Limitation: no `fn_*` MCP / ACP tool stream — small non-interactive tasks
+- Limitation: no `fn_*` MCP / ACP tool stream — non-interactive tasks within `cliTimeoutMs`
 - Usage/quota: not exposed by `agy` 1.1.4 yet; check Antigravity account UI
 
 ## Enable
